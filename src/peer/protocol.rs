@@ -9,7 +9,7 @@ use crate::Hash;
 
 use super::{
     Access, PeerError, Result,
-    effects::{GraphJob, GraphMetrics, Remote},
+    effects::{GraphBudget, GraphJob, GraphMetrics},
 };
 
 const MAGIC: &[u8; 4] = b"PPN1";
@@ -43,9 +43,44 @@ pub(super) enum Request {
         access: Access,
         program: Option<Hash>,
     },
+    LegacyRun,
+    LegacySubprocess,
     Run(GraphJob),
-    // A child may request effects only through the live connection that invoked it.
-    Subprocess(GraphJob),
+    Forward(Forward),
+    Submit(Submission),
+    JobStatus(Hash),
+    CancelJob(Hash),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct Submission {
+    pub id: Hash,
+    pub graph: GraphJob,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) enum JobState {
+    Pending,
+    Running,
+    Completed {
+        revision: u64,
+        value: Vec<u8>,
+        graph: GraphMetrics,
+    },
+    Failed(Failure),
+    Cancelled,
+    Expired,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct Forward {
+    pub grant: Hash,
+    pub delegated_by: Option<Hash>,
+    pub holder: Hash,
+    pub access: Access,
+    pub program: Hash,
+    pub limit: GraphBudget,
+    pub expires_at_ms: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -64,7 +99,7 @@ pub(super) enum Reply {
         value: Vec<u8>,
         metrics: GraphMetrics,
     },
-    Callback(Remote),
+    Job(JobState),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -89,7 +124,7 @@ pub(super) struct Metrics {
     pub elapsed_ms: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) enum Failure {
     Denied,
     Missing(Hash),
@@ -146,6 +181,15 @@ pub(super) fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
     postcard::to_allocvec(value).map_err(|err| PeerError::Protocol(err.to_string()))
 }
 
+pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    let (value, rest) =
+        postcard::take_from_bytes(bytes).map_err(|err| PeerError::Protocol(err.to_string()))?;
+    if !rest.is_empty() {
+        return Err(PeerError::Protocol("trailing bytes".into()));
+    }
+    Ok(value)
+}
+
 /// The counter reports application framing bytes, including the eight-byte header.
 pub(super) fn send(out: &mut impl Write, value: &impl Serialize) -> Result<u64> {
     let payload = encode(value)?;
@@ -173,12 +217,7 @@ pub(super) fn receive<T: DeserializeOwned>(input: &mut impl Read) -> Result<(T, 
     }
     let mut bytes = vec![0; len];
     input.read_exact(&mut bytes)?;
-    let (value, rest) =
-        postcard::take_from_bytes(&bytes).map_err(|err| PeerError::Protocol(err.to_string()))?;
-    if !rest.is_empty() {
-        return Err(PeerError::Protocol("trailing bytes".into()));
-    }
-    Ok((value, (8 + len) as u64))
+    Ok((decode(&bytes)?, (8 + len) as u64))
 }
 
 pub(super) fn elapsed_ms(start: Instant) -> u64 {

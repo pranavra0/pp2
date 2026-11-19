@@ -10,8 +10,13 @@ use crate::{Block, Data, Hash};
 use super::{
     PeerError, Result,
     content::{self, Kind},
-    effects::{Effect, MAX_EFFECT_BYTES, Scan},
+    effects::{Effect, GraphBudget, GraphMetrics, MAX_EFFECT_BYTES, Scan},
+    protocol::{self, Forward, JobState},
+    unix_ms,
 };
+
+mod jobs;
+pub(super) use jobs::{JobKey, JobOutcome, QueuedJob};
 
 const MAX_DELEGATION_DEPTH: u8 = 8;
 const MAX_GRANTS_PER_REF: u32 = 1024;
@@ -49,6 +54,43 @@ CREATE TABLE entries (ref TEXT REFERENCES collections(ref), key BLOB,
 PRAGMA user_version = 2;
 ";
 
+const AUTONOMOUS: &str = "
+CREATE TABLE graph_grants (
+    id BLOB PRIMARY KEY REFERENCES grants(id) ON DELETE CASCADE,
+    expires INTEGER NOT NULL,
+    timeout INTEGER NOT NULL,
+    calls INTEGER NOT NULL,
+    depth INTEGER NOT NULL,
+    presenter BLOB NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX graph_grant_expiry ON graph_grants(expires);
+CREATE TABLE graph_forward_replays (
+    request BLOB PRIMARY KEY,
+    grant_id BLOB REFERENCES grants(id) ON DELETE SET NULL,
+    expires INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX graph_forward_expiry ON graph_forward_replays(expires);
+CREATE TABLE jobs (
+    holder BLOB, id BLOB, request BLOB NOT NULL, program BLOB NOT NULL, input BLOB NOT NULL, expires INTEGER NOT NULL,
+    ready INTEGER NOT NULL, state INTEGER NOT NULL, spec BLOB, result BLOB,
+    PRIMARY KEY(holder, id)
+) WITHOUT ROWID;
+CREATE INDEX jobs_pending ON jobs(ready, holder, id) WHERE state=0;
+CREATE INDEX jobs_active ON jobs(expires) WHERE state<2;
+CREATE TABLE job_blocks (
+    holder BLOB, id BLOB, hash BLOB REFERENCES blocks(hash),
+    PRIMARY KEY(holder, id, hash),
+    FOREIGN KEY(holder, id) REFERENCES jobs(holder, id)
+) WITHOUT ROWID;
+CREATE INDEX job_blocks_hash ON job_blocks(hash);
+CREATE TABLE job_effects (
+    holder BLOB, id BLOB, ordinal INTEGER, request BLOB NOT NULL, expires INTEGER NOT NULL,
+    child BLOB, result BLOB, PRIMARY KEY(holder, id, ordinal),
+    FOREIGN KEY(holder, id) REFERENCES jobs(holder, id)
+) WITHOUT ROWID;
+PRAGMA user_version = 3;
+";
+
 /// Read permits evaluation against a reference. Write also permits atomic updates.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum Access {
@@ -73,6 +115,14 @@ pub(super) struct Authority {
     access: Access,
     program: Option<Hash>,
     depth: u8,
+    graph: Option<GraphAccess>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct GraphAccess {
+    pub(super) budget: GraphBudget,
+    pub(super) expires_at_ms: u64,
+    pub(super) delegated_by: Option<Hash>,
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +131,7 @@ pub(super) struct Call {
     pub(super) grant: Hash,
     pub(super) program: Hash,
     pub(super) update: Option<Update>,
+    pub(super) graph: Option<GraphAccess>,
 }
 
 #[derive(Clone, Copy)]
@@ -132,7 +183,7 @@ impl PeerStore {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // Bound the main database. Short transactions keep WAL readers from pinning old pages.
         conn.pragma_update(None, "max_page_count", 65_536)?;
-        if version < 2 {
+        if version < 3 {
             let tx = conn.transaction_with_behavior(Immediate)?;
             let version = database_version(&tx)?;
             if version == 0 {
@@ -140,6 +191,9 @@ impl PeerStore {
             }
             if version < 2 {
                 tx.execute_batch(COLLECTIONS)?;
+            }
+            if version < 3 {
+                tx.execute_batch(AUTONOMOUS)?;
             }
             tx.commit()?;
         }
@@ -300,6 +354,7 @@ impl PeerStore {
         program: Option<Hash>,
     ) -> Result<Hash> {
         let tx = self.0.transaction_with_behavior(Immediate)?;
+        prune_graph_grants(&tx, unix_ms())?;
         let id = insert_grant(
             &tx,
             holder,
@@ -308,6 +363,7 @@ impl PeerStore {
                 access,
                 program,
                 depth: 0,
+                graph: None,
             },
             None,
         )?;
@@ -333,7 +389,7 @@ impl PeerStore {
     ) -> Result<Hash> {
         let tx = self.0.transaction_with_behavior(Immediate)?;
         let mut scope = authority(&tx, caller, grant)?;
-        if access > scope.access || scope.depth >= MAX_DELEGATION_DEPTH {
+        if access > scope.access || scope.depth >= MAX_DELEGATION_DEPTH || scope.graph.is_some() {
             return Err(PeerError::Denied);
         }
         if let (Some(parent), Some(child)) = (scope.program, program)
@@ -344,7 +400,71 @@ impl PeerStore {
         scope.program = scope.program.or(program);
         scope.access = access;
         scope.depth += 1;
+        prune_graph_grants(&tx, unix_ms())?;
         let id = insert_grant(&tx, holder, &scope, Some(grant))?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub(super) fn forward(&mut self, caller: Hash, forwarded: Forward) -> Result<Hash> {
+        let now = unix_ms();
+        forwarded.limit.validate()?;
+        if forwarded.expires_at_ms <= now
+            || forwarded.expires_at_ms - now > super::effects::MAX_JOB_LIFETIME_MS
+        {
+            return Err(PeerError::Timeout);
+        }
+        let tx = self.0.transaction_with_behavior(Immediate)?;
+        let mut scope = authority(&tx, caller, forwarded.grant)?;
+        require_kind(&tx, &scope.reference, true)?;
+        if forwarded.access > scope.access
+            || scope
+                .program
+                .is_some_and(|program| program != forwarded.program)
+            || scope.depth >= MAX_DELEGATION_DEPTH
+            || forwarded.delegated_by != scope.graph.and_then(|parent| parent.delegated_by)
+            || scope.graph.is_some_and(|parent| {
+                !forwarded.limit.fits(parent.budget)
+                    || forwarded.expires_at_ms > parent.expires_at_ms
+            })
+        {
+            return Err(PeerError::Denied);
+        }
+        let request = Hash::digest(&protocol::encode(&forwarded)?);
+        if let Some(id) = tx
+            .query_row(
+                "SELECT grant_id FROM graph_forward_replays WHERE request=?1",
+                [&request.0[..]],
+                |row| Ok(row.get::<_, Option<[u8; 32]>>(0)?.map(Hash)),
+            )
+            .optional()?
+        {
+            return id.ok_or(PeerError::Denied);
+        }
+        let now = unix_ms();
+        if forwarded.expires_at_ms <= now {
+            return Err(PeerError::Timeout);
+        }
+        prune_graph_grants(&tx, now)?;
+        scope.program = Some(forwarded.program);
+        scope.access = forwarded.access;
+        scope.depth += 1;
+        let id = insert_grant(&tx, forwarded.holder, &scope, Some(forwarded.grant))?;
+        tx.execute(
+            "INSERT INTO graph_grants VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &id.0[..],
+                forwarded.expires_at_ms as i64,
+                forwarded.limit.timeout_ms,
+                forwarded.limit.calls,
+                forwarded.limit.depth,
+                &caller.0[..],
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO graph_forward_replays VALUES (?1, ?2, ?3)",
+            params![&request.0[..], &id.0[..], forwarded.expires_at_ms as i64],
+        )?;
         tx.commit()?;
         Ok(id)
     }
@@ -400,7 +520,14 @@ impl PeerStore {
             return Err(PeerError::Conflict(current.number));
         }
         let revision = replace(&tx, &scope.reference, current, next)?;
-        save_receipt(&tx, call, &scope.reference, update, revision.number, &value)?;
+        save_receipt(
+            &tx,
+            call.grant,
+            &scope.reference,
+            update,
+            revision.number,
+            &value,
+        )?;
         tx.commit()?;
         Ok(Receipt {
             revision: revision.number,
@@ -480,7 +607,8 @@ impl PeerStore {
             tx,
             reference: scope.reference,
             revision: revision.number,
-            call,
+            grant: call.grant,
+            update: call.update,
         }))
     }
 
@@ -494,6 +622,7 @@ impl PeerStore {
         Ok(self.0.execute(
             "WITH RECURSIVE live(hash) AS (
             SELECT hash FROM refs UNION SELECT hash FROM blocks WHERE published=1
+            UNION SELECT hash FROM job_blocks
             UNION SELECT edges.child FROM edges JOIN live ON edges.parent=live.hash
         ) DELETE FROM blocks WHERE hash NOT IN (SELECT hash FROM live)",
             [],
@@ -510,7 +639,8 @@ pub(super) struct Collection<'a> {
     tx: Transaction<'a>,
     reference: String,
     revision: u64,
-    call: Call,
+    grant: Hash,
+    update: Option<Update>,
 }
 
 impl Collection<'_> {
@@ -533,7 +663,7 @@ impl Collection<'_> {
             }
             Effect::Scan(scan) => return self.scan(scan),
             Effect::Put(key, bytes) => {
-                self.call.update.ok_or(PeerError::Denied)?;
+                self.update.ok_or(PeerError::Denied)?;
                 check_entry(&key, &bytes)?;
                 self.tx.execute(
                     "INSERT INTO entries VALUES (?1, ?2, ?3)
@@ -543,7 +673,7 @@ impl Collection<'_> {
                 json!(null)
             }
             Effect::Delete(key) => {
-                self.call.update.ok_or(PeerError::Denied)?;
+                self.update.ok_or(PeerError::Denied)?;
                 let deleted = self.tx.execute(
                     "DELETE FROM entries WHERE ref=?1 AND key=?2",
                     params![self.reference, key.as_bytes()],
@@ -591,9 +721,14 @@ impl Collection<'_> {
             .map_err(Into::into)
     }
 
-    pub(super) fn finish(self, value: Vec<u8>, check: impl Fn() -> Result<()>) -> Result<Receipt> {
+    pub(super) fn finish(
+        self,
+        value: Vec<u8>,
+        check: impl Fn() -> Result<()>,
+        durable: Option<(JobKey, GraphMetrics)>,
+    ) -> Result<Receipt> {
         let mut number = self.revision;
-        if let Some(update) = self.call.update {
+        if let Some(update) = self.update {
             number += 1;
             let revision =
                 i64::try_from(number).map_err(|_| PeerError::Limit("reference revisions"))?;
@@ -601,7 +736,26 @@ impl Collection<'_> {
                 "UPDATE refs SET revision=?1 WHERE name=?2",
                 params![revision, self.reference],
             )?;
-            save_receipt(&self.tx, self.call, &self.reference, update, number, &value)?;
+            save_receipt(
+                &self.tx,
+                self.grant,
+                &self.reference,
+                update,
+                number,
+                &value,
+            )?;
+            if let Some((key, graph)) = durable {
+                jobs::check_running(&self.tx, key)?;
+                jobs::end(
+                    &self.tx,
+                    key,
+                    &JobState::Completed {
+                        revision: number,
+                        value: value.clone(),
+                        graph,
+                    },
+                )?;
+            }
         }
         check()?;
         self.tx.commit()?;
@@ -643,7 +797,7 @@ fn require_kind(conn: &Connection, name: &str, scoped: bool) -> Result<()> {
 
 fn save_receipt(
     conn: &Connection,
-    call: Call,
+    grant: Hash,
     reference: &str,
     update: Update,
     revision: u64,
@@ -653,7 +807,7 @@ fn save_receipt(
     conn.execute(
         "INSERT INTO receipts VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
-            &call.grant.0[..],
+            &grant.0[..],
             &update.operation.0[..],
             reference,
             &update.fingerprint.0[..],
@@ -697,7 +851,7 @@ fn database_version(conn: &Connection) -> Result<i64> {
     )?;
     match (application, version, entries) {
         (0, 0, 0) => Ok(0),
-        (APPLICATION_ID, 1 | 2, _) => Ok(version),
+        (APPLICATION_ID, 1..=3, _) => Ok(version),
         (APPLICATION_ID, _, _) => Err(PeerError::Unsupported("peer database version")),
         _ => Err(PeerError::Unsupported(
             "expected a pp2 database or an empty file",
@@ -805,10 +959,24 @@ fn insert_grant(
     Ok(Hash(id))
 }
 
+fn prune_graph_grants(conn: &Connection, now: u64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM graph_forward_replays WHERE expires<=?1",
+        [now as i64],
+    )?;
+    conn.execute(
+        "DELETE FROM grants WHERE id IN (SELECT id FROM graph_grants WHERE expires<=?1)",
+        [now as i64],
+    )?;
+    Ok(())
+}
+
 fn authority(conn: &Connection, holder: Hash, grant: Hash) -> Result<Authority> {
     conn.query_row(
-        "SELECT ref, access, program, depth FROM grants WHERE id=?1 AND holder=?2",
-        params![&grant.0[..], &holder.0[..]],
+        "SELECT ref, access, program, grants.depth, expires, timeout, calls, graph_grants.depth, presenter
+         FROM grants LEFT JOIN graph_grants USING(id)
+         WHERE id=?1 AND holder=?2 AND (expires IS NULL OR expires>?3)",
+        params![&grant.0[..], &holder.0[..], unix_ms() as i64],
         |row| {
             Ok(Authority {
                 reference: row.get(0)?,
@@ -819,6 +987,18 @@ fn authority(conn: &Connection, holder: Hash, grant: Hash) -> Result<Authority> 
                 },
                 program: row.get::<_, Option<[u8; 32]>>(2)?.map(Hash),
                 depth: row.get(3)?,
+                graph: match row.get::<_, Option<i64>>(4)? {
+                    Some(expires_at_ms) => Some(GraphAccess {
+                        expires_at_ms: expires_at_ms as u64,
+                        delegated_by: Some(Hash(row.get(8)?)),
+                        budget: GraphBudget {
+                            timeout_ms: row.get(5)?,
+                            calls: row.get(6)?,
+                            depth: row.get(7)?,
+                        },
+                    }),
+                    None => None,
+                },
             })
         },
     )
@@ -830,6 +1010,13 @@ fn authorize(conn: &Connection, call: Call) -> Result<Authority> {
     let scope = authority(conn, call.holder, call.grant)?;
     if scope.program.is_some_and(|allowed| allowed != call.program)
         || (call.update.is_some() && scope.access != Access::Write)
+        || call.graph.and_then(|graph| graph.delegated_by)
+            != scope.graph.and_then(|limit| limit.delegated_by)
+        || scope.graph.is_some_and(|limit| {
+            call.graph.is_none_or(|graph| {
+                !graph.budget.fits(limit.budget) || graph.expires_at_ms > limit.expires_at_ms
+            })
+        })
     {
         return Err(PeerError::Denied);
     }

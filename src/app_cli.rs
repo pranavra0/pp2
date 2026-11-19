@@ -11,8 +11,8 @@ use pp2::{
     Data, Hash,
     peer::{
         Access, Binding, BindingSet, Client, Credentials, Evaluation, EvaluationMode, GraphBudget,
-        GraphEvaluation, JavaScript, PeerError, PeerStore, Server, compile_typescript,
-        data_from_json,
+        GraphEvaluation, JavaScript, PeerEndpoint, PeerError, PeerStore, Server,
+        compile_typescript, data_from_json,
     },
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -83,13 +83,18 @@ struct PeerProfile {
     holder: Option<Hash>,
     grant: Option<Hash>,
     program: Option<Hash>,
-    brokers: BTreeSet<Hash>,
+    directory: BTreeMap<String, PeerIdentity>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PeerIdentity {
+    address: Option<SocketAddr>,
+    fingerprint: Hash,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Route {
     peer: String,
-    address: Option<SocketAddr>,
     grant: Hash,
     program: Hash,
     access: Access,
@@ -116,17 +121,13 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
         ["run", directory, rest @ ..] if rest.len() <= 1 => {
             run_local(Path::new(directory), rest.first().copied())?;
         }
-        ["serve", directory] => serve(Path::new(directory), None, BTreeMap::new())?,
+        ["serve", directory] => serve(Path::new(directory), false, BTreeMap::new())?,
         ["invoke", directory, rest @ ..] if rest.len() <= 1 => {
             invoke(Path::new(directory), rest.first().copied(), None)?;
         }
         ["__serve", directory, addresses, parent] => {
             local_lifetime(parent.parse()?)?;
-            serve(
-                Path::new(directory),
-                Some("127.0.0.1:0".parse()?),
-                serde_json::from_str(addresses)?,
-            )?;
+            serve(Path::new(directory), true, serde_json::from_str(addresses)?)?;
         }
         _ => return Err(USAGE.into()),
     }
@@ -232,7 +233,21 @@ fn init(path: &Path, directory: &Path) -> Result<()> {
             identity(&admin, &dir, peer, true)?;
         }
         let holder = Credentials::fingerprint(client_dir.join("peer.pem"))?;
-        let broker = Credentials::fingerprint(directory.join(&root.peer).join("peer.pem"))?;
+        let directory_entries = peers
+            .iter()
+            .map(|(peer, spec)| {
+                Ok((
+                    peer.clone(),
+                    PeerIdentity {
+                        address: spec.address,
+                        fingerprint: Credentials::fingerprint(
+                            directory.join(peer).join("peer.pem"),
+                        )?,
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let executor = directory_entries[&root.peer].fingerprint;
         for (peer, spec) in &peers {
             let mut store = PeerStore::open(directory.join(peer).join("peer.db"))?;
             for (collection, file) in &spec.collections {
@@ -242,15 +257,33 @@ fn init(path: &Path, directory: &Path) -> Result<()> {
                     .transpose()?;
                 seed(&mut store, collection, file)?;
             }
+            let mut required = BTreeSet::new();
+            if peer == &root.peer {
+                required.extend(modules.keys());
+            } else {
+                let mut pending: Vec<_> = root
+                    .capabilities
+                    .values()
+                    .filter(|target| &target.peer == peer)
+                    .map(|target| &target.module)
+                    .collect();
+                while let Some(name) = pending.pop() {
+                    if required.insert(name) {
+                        pending.extend(modules[name].imports.values());
+                    }
+                }
+            }
+            for name in &required {
+                let (hash, bytes) = &packaged[*name];
+                store.import(*hash, bytes)?;
+            }
+            for name in required {
+                let hash = packaged[name].0;
+                Client::fetch_program(&mut store, &[], hash)?;
+                store.publish(hash)?;
+            }
         }
         let mut store = PeerStore::open(directory.join(&root.peer).join("peer.db"))?;
-        for (hash, bytes) in packaged.values() {
-            store.import(*hash, bytes)?;
-        }
-        for (hash, _) in packaged.values() {
-            Client::fetch_program(&mut store, &[], *hash)?;
-            store.publish(*hash)?;
-        }
         let program = packaged[&root.module].0;
         let grant = store.issue(&root.collection, holder, Access::Read, Some(program))?;
         let mut routes = BTreeMap::new();
@@ -263,14 +296,13 @@ fn init(path: &Path, directory: &Path) -> Result<()> {
             };
             let grant = PeerStore::open(directory.join(&target.peer).join("peer.db"))?.issue(
                 &target.collection,
-                broker,
+                executor,
                 access,
                 Some(program),
             )?;
             routes.insert(
                 name,
                 Route {
-                    address: peers[&target.peer].address,
                     peer: target.peer,
                     grant,
                     program,
@@ -304,7 +336,7 @@ fn init(path: &Path, directory: &Path) -> Result<()> {
                     holder: is_root.then_some(holder),
                     grant: is_root.then_some(grant),
                     program: is_root.then_some(program),
-                    brokers: [broker].into_iter().collect(),
+                    directory: directory_entries.clone(),
                 },
             )?;
         }
@@ -461,36 +493,50 @@ fn credentials(dir: &Path) -> Credentials {
     }
 }
 
-fn serve(
-    dir: &Path,
-    bind: Option<SocketAddr>,
-    mut addresses: BTreeMap<String, SocketAddr>,
-) -> Result<()> {
+fn serve(dir: &Path, local: bool, mut addresses: BTreeMap<String, SocketAddr>) -> Result<()> {
     let profile: PeerProfile = read_json(&dir.join("profile.json"))?;
-    let listener = TcpListener::bind(
-        bind.or(profile.address)
-            .ok_or("missing deployment address")?,
-    )?;
-    if bind.is_some() {
-        addresses.insert(profile.peer, listener.local_addr()?);
+    let bind = if local {
+        addresses
+            .get(&profile.peer)
+            .copied()
+            .unwrap_or("127.0.0.1:0".parse()?)
+    } else {
+        profile.address.ok_or("missing deployment address")?
+    };
+    let listener = TcpListener::bind(bind)?;
+    if local {
+        addresses.insert(profile.peer.clone(), listener.local_addr()?);
     }
     let credentials = credentials(dir);
+    let endpoints = profile
+        .directory
+        .iter()
+        .filter_map(|(name, peer)| {
+            addresses
+                .get(name)
+                .copied()
+                .or(peer.address)
+                .map(|address| PeerEndpoint {
+                    address,
+                    name: format!("pp2-{name}"),
+                    fingerprint: peer.fingerprint,
+                })
+        })
+        .collect();
     let mut sets = Vec::new();
     if let (Some(holder), Some(grant), Some(program)) =
         (profile.holder, profile.grant, profile.program)
     {
         let mut capabilities = BTreeMap::new();
         for (name, route) in profile.routes {
-            let address = addresses
+            let peer = profile
+                .directory
                 .get(&route.peer)
-                .copied()
-                .or(route.address)
-                .ok_or_else(|| format!("missing deployment address for {}", route.peer))?;
+                .ok_or_else(|| format!("missing directory entry for {}", route.peer))?;
             capabilities.insert(
                 name,
                 Binding {
-                    address,
-                    name: format!("pp2-{}", route.peer),
+                    peer: peer.fingerprint,
                     grant: route.grant,
                     program: route.program,
                     access: route.access,
@@ -505,7 +551,7 @@ fn serve(
         });
     }
     let server = Server::new(dir.join("peer.db"), std::env::current_exe()?, &credentials)?
-        .with_graph(&credentials, sets, profile.brokers)?;
+        .with_graph(&credentials, sets, endpoints)?;
     println!("{}", listener.local_addr()?);
     server.serve(listener)?;
     Ok(())
@@ -548,19 +594,25 @@ impl Drop for Daemon {
 
 fn run_local(dir: &Path, input: Option<&str>) -> Result<()> {
     let deployment: Deployment = read_json(&dir.join("deployment.json"))?;
-    let mut peers = Vec::new();
-    let mut addresses = BTreeMap::new();
-    for peer in deployment
+    let sockets = deployment
         .peers
         .iter()
-        .filter(|name| **name != deployment.root)
-    {
-        let (process, address) = Daemon::start(&dir.join(peer), &addresses)?;
-        peers.push(process);
-        addresses.insert(peer.to_owned(), address);
+        .map(|peer| Ok((peer.clone(), TcpListener::bind("127.0.0.1:0")?)))
+        .collect::<Result<Vec<_>>>()?;
+    let addresses = sockets
+        .iter()
+        .map(|(name, socket)| Ok((name.clone(), socket.local_addr()?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let mut peers = Vec::new();
+    for (peer, socket) in sockets {
+        drop(socket);
+        peers.push(Daemon::start(&dir.join(peer), &addresses)?.0);
     }
-    let (_root, address) = Daemon::start(&dir.join(deployment.root), &addresses)?;
-    invoke(&dir.join("client"), input, Some(address))
+    invoke(
+        &dir.join("client"),
+        input,
+        Some(addresses[&deployment.root]),
+    )
 }
 
 fn invoke(dir: &Path, input: Option<&str>, address: Option<SocketAddr>) -> Result<()> {

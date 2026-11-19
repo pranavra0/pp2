@@ -4,9 +4,10 @@ use std::{
     io::{self, BufReader, Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -24,9 +25,10 @@ pub use super::protocol::EvaluationMode;
 use super::{
     Access, PeerError, PeerStore, Result,
     content::{self, Kind, MAX_CODE, MAX_MODULES},
-    effects::BindingSet,
+    effects::{BindingSet, PeerEndpoint},
     protocol::{self, Job, Reply, Request},
-    storage::{Call, EvaluationStart, Update},
+    storage::{self, Call, EvaluationStart, Update},
+    unix_ms,
     worker::{self, Work, WorkContext},
 };
 
@@ -35,7 +37,9 @@ const DEADLINE: Duration = Duration::from_secs(8);
 const MAX_CONNECTIONS: usize = 16;
 
 mod graph;
+mod jobs;
 pub use graph::{GraphEvaluation, GraphReport};
+pub use jobs::{DurableEvaluation, JobStatus};
 
 /// TLS root certificates and one peer certificate with its private key.
 #[derive(Clone, Debug)]
@@ -82,6 +86,7 @@ fn tls(error: impl std::fmt::Display) -> PeerError {
 struct Activity {
     deadline: Instant,
     sockets: Vec<Arc<TcpStream>>,
+    job: Option<Rc<jobs::Attempt>>,
 }
 
 impl Activity {
@@ -89,6 +94,7 @@ impl Activity {
         Self {
             deadline,
             sockets: Vec::new(),
+            job: None,
         }
     }
 
@@ -107,6 +113,9 @@ impl Activity {
         self.remaining()?;
         for tcp in &self.sockets {
             check_connected(tcp)?;
+        }
+        if let Some(job) = &self.job {
+            job.check()?;
         }
         Ok(())
     }
@@ -149,9 +158,10 @@ impl Socket {
     }
 
     fn io<T>(&self, mut operation: impl FnMut(Duration) -> io::Result<T>) -> io::Result<T> {
+        let watch = !self.activity.sockets.is_empty() || self.activity.job.is_some();
         loop {
             let mut timeout = self.activity.remaining()?;
-            if !self.activity.sockets.is_empty() {
+            if watch {
                 self.activity.check().map_err(|err| match err {
                     PeerError::Timeout => io::Error::from(io::ErrorKind::TimedOut),
                     _ => io::Error::from(io::ErrorKind::ConnectionAborted),
@@ -160,7 +170,7 @@ impl Socket {
             }
             match operation(timeout) {
                 Err(error)
-                    if !self.activity.sockets.is_empty()
+                    if watch
                         && matches!(
                             error.kind(),
                             io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
@@ -200,6 +210,7 @@ pub struct Client {
     endpoint: SocketAddr,
     name: ServerName<'static>,
     tls: Arc<ClientConfig>,
+    fingerprint: Option<Hash>,
 }
 
 /// A cancellation handle for one evaluation at a time. Once cancelled it stays cancelled.
@@ -291,6 +302,7 @@ impl Client {
             endpoint,
             name,
             tls: Arc::new(config),
+            fingerprint: None,
         })
     }
 
@@ -313,6 +325,13 @@ impl Client {
         conn.complete_io(&mut socket)?;
         if conn.alpn_protocol() != Some(ALPN) {
             return Err(PeerError::Protocol("peer did not negotiate pp2/1".into()));
+        }
+        if self.fingerprint.is_some_and(|expected| {
+            conn.peer_certificates()
+                .and_then(|certs| certs.first())
+                .is_none_or(|cert| Hash::digest(cert) != expected)
+        }) {
+            return Err(PeerError::Denied);
         }
         Ok(StreamOwned::new(conn, socket))
     }
@@ -509,19 +528,39 @@ impl Server {
         })
     }
 
-    /// Configures outgoing capabilities and the authenticated brokers allowed to forward them.
+    /// Configures named capabilities and the local directory of trusted peer endpoints.
     pub fn with_graph(
         mut self,
         creds: &Credentials,
         bindings: Vec<BindingSet>,
-        brokers: BTreeSet<Hash>,
+        endpoints: Vec<PeerEndpoint>,
     ) -> Result<Self> {
-        self.graph = graph::Configuration::new(creds, bindings, brokers)?;
+        self.graph = graph::Configuration::new(creds, bindings, endpoints)?;
         Ok(self)
     }
 
     pub fn serve(self, listener: TcpListener) -> Result<()> {
+        // Separate from SQLite's record locks. Only one daemon can reclaim this queue.
+        let database = File::open(&self.database)?;
+        database.try_lock().map_err(|error| {
+            io::Error::other(format!(
+                "could not lock the peer database for serving: {error}"
+            ))
+        })?;
+        PeerStore::open(&self.database)?.recover_jobs()?;
         let server = Arc::new(self);
+        let stop = AtomicBool::new(false);
+        thread::scope(|scope| {
+            for _ in 0..jobs::WORKERS {
+                scope.spawn(|| server.work_jobs(&stop));
+            }
+            let result = server.serve_connections(listener);
+            stop.store(true, Ordering::Relaxed);
+            result
+        })
+    }
+
+    fn serve_connections(self: &Arc<Self>, listener: TcpListener) -> Result<()> {
         let active = Arc::new(AtomicUsize::new(0));
         for tcp in listener.incoming() {
             let tcp = tcp?;
@@ -534,7 +573,7 @@ impl Server {
                 continue;
             }
             let slot = Slot(active.clone());
-            let server = server.clone();
+            let server = self.clone();
             thread::Builder::new()
                 .name("pp2-peer".into())
                 .spawn(move || {
@@ -562,15 +601,19 @@ impl Server {
             .ok_or(PeerError::Denied)?;
         let holder = Hash::digest(cert);
         let mut stream = StreamOwned::new(conn, socket);
-        let (request, _) = protocol::receive(&mut stream)?;
+        let (mut request, _) = protocol::receive(&mut stream)?;
         let outcome = (|| {
-            let mut store = if let Request::Run(job) | Request::Subprocess(job) = &request {
+            let mut store = if let Request::Run(job) = &mut request {
                 job.budget.validate()?;
-                stream.sock.activity.deadline = stream
-                    .sock
-                    .activity
-                    .deadline
-                    .min(Instant::now() + Duration::from_millis(job.budget.timeout_ms.into()));
+                let now = unix_ms();
+                job.expires_at_ms = job
+                    .expires_at_ms
+                    .min(now + u64::from(job.budget.timeout_ms));
+                let remaining = job.expires_at_ms.saturating_sub(now);
+                stream.sock.activity.deadline = stream.sock.activity.deadline.min(
+                    Instant::now()
+                        + Duration::from_millis(remaining.min(job.budget.timeout_ms.into())),
+                );
                 stream.sock.check_active()?;
                 PeerStore::open_with_timeout(&self.database, stream.sock.activity.storage_wait()?)?
             } else {
@@ -590,10 +633,18 @@ impl Server {
                     .delegate(holder, grant, delegate, access, program)
                     .map(Reply::Delegated),
                 Request::Evaluate(job) => self.evaluate(&mut stream, &mut store, holder, job),
-                Request::Run(job) => self.run_graph(&mut stream, &mut store, holder, job, false),
-                Request::Subprocess(job) => {
-                    self.run_graph(&mut stream, &mut store, holder, job, true)
+                Request::Run(job) => self.run_graph(&mut stream, &mut store, holder, job),
+                Request::Forward(request) => store.forward(holder, request).map(Reply::Delegated),
+                Request::Submit(submission) => {
+                    self.submit_job(&mut stream, &mut store, holder, submission)
                 }
+                Request::JobStatus(id) => store
+                    .job_status(storage::JobKey { holder, id })
+                    .map(Reply::Job),
+                Request::CancelJob(id) => store
+                    .cancel_job(storage::JobKey { holder, id })
+                    .map(Reply::Job),
+                Request::LegacyRun | Request::LegacySubprocess => Err(unexpected_reply()),
             }
         })();
         let reply = outcome.unwrap_or_else(|err| Reply::Failed(err.into()));
@@ -629,6 +680,7 @@ impl Server {
             grant: job.grant,
             program: job.program,
             update,
+            graph: None,
         };
         let mut snapshot = match store.begin(call)? {
             EvaluationStart::Replayed(receipt) => {

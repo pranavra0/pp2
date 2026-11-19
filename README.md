@@ -26,7 +26,22 @@ pp2 app run ./stock-deployment '{"sku":"lamp","viaWest":true}'
 
 Both invocations return 10 lamps, with 7 at the west warehouse and 3 at the east warehouse. The second invocation explicitly passes the east capability and one descendant call to the west computation. `app run` starts three independent peer processes with separate databases and authenticated loopback connections. The deployment directory persists across invocations.
 
-To deploy the same application across hosts, set a reachable IP address and port in each manifest peer's `address` field before running `app init`. For example, set `"address": "192.0.2.11:7340"` on the office peer. Copy each generated peer directory to its corresponding host and start `pp2 app serve PEER_DIRECTORY` there. Copy the `client` directory to the invocation machine and run `pp2 app invoke CLIENT_DIRECTORY '{"sku":"lamp"}'`. Keep peer and client directories private to their operators. The `admin` directory contains the development CA signing key. The office broker needs TCP reachability to both warehouses. [Stock program](examples/federated-stock/stock.mjs), [warehouse program](examples/federated-stock/warehouse.mjs), [application manifest](examples/federated-stock/app.json)
+To deploy the same application across hosts, set a reachable IP address and port in each manifest peer's `address` field before running `app init`. For example, set `"address": "192.0.2.11:7340"` on the office peer. Copy each generated peer directory to its corresponding host and start `pp2 app serve PEER_DIRECTORY` there. Copy the `client` directory to the invocation machine and run `pp2 app invoke CLIENT_DIRECTORY '{"sku":"lamp"}'`. Keep peer and client directories private to their operators. The `admin` directory contains the development CA signing key. The office needs TCP reachability to both warehouses. The delegated invocation also requires west to reach east directly. [Stock program](examples/federated-stock/stock.mjs), [warehouse program](examples/federated-stock/warehouse.mjs), [application manifest](examples/federated-stock/app.json)
+
+## Run a computation that survives disconnection
+
+~~~sh
+cargo build --release --locked --bin pp2
+scripts/demo-autonomous.py
+~~~
+
+The demo starts three peer processes with their own certificates, databases, and grant policies. A obtains an attenuated grant from C for B, submits to B, and disconnects while C is offline. When C returns, B reads its local collection and calls C directly. B persists the sum of 13 before A reconnects to retrieve it. [Demo script](scripts/demo-autonomous.py), [guest programs](examples/autonomous)
+
+Use `pp2 peer attenuate` to obtain a grant for a recipient peer. `pp2 peer job-submit` takes a client-generated 64-digit hexadecimal job ID, an absolute expiration in Unix milliseconds, a program hash, an input file, and a graph budget. Supply named bindings from B's local configuration or use `--delegated FILE` with grants addressed to B. The file is a JSON object keyed by guest capability name. Each entry contains `peer` (the issuer certificate fingerprint), `grant`, `program`, and `access` (`Read` or `Write`). JSON fingerprints and hashes are arrays of 32 bytes. B's peer directory must include the presenter and each issuer.
+
+Use `job-status` and `job-cancel` with the submitting certificate. After an ambiguous submission reply, resubmit the same job ID and arguments. Jobs can live for up to five minutes. The peer keeps each terminal result in its database, and cancellation or expiration can leave any already accepted child work running within its own deadline. [Lifecycle and authority](docs/architecture.md#durable-computations)
+
+For an existing stock deployment, keep the peer databases, certificates, and grants. Add a `directory` object to each peer's `profile.json`, keyed by peer name, with an `address` and SHA-256 certificate `fingerprint` for each participating peer. For `peer serve` configurations, use `peers` entries with `address`, TLS `name`, and `fingerprint`, and reference the fingerprint in each binding's `peer` field. Upgrade all peers that participate in a graph together.
 
 ## Write a guest with effects
 
@@ -37,7 +52,7 @@ The default export of a collection program receives `(pp2, input)`.
 - `pp2.evaluate(capability, input, {calls, delegate, timeoutMs, update})` resolves to `{revision, value}`. Pass a capability from `pp2.capabilities`. Its grant determines which collection and program the target peer authorizes. Set `calls: 0` for a leaf. An optional `delegate` array supplies the only capabilities available to the child. An optional `timeoutMs` shortens that branch's inherited deadline.
 - On a write invocation, `pp2.storage.put(key, value)` and `pp2.storage.delete(key)` change the local collection. The program returns its ordinary result. The peer commits the changes, revision, and retry receipt together. A remote update requires a writable capability and explicit `update: {revision, operation}`, where `operation` is a 64-character hexadecimal operation ID. Updates are leaves.
 
-Capabilities can be passed to functions, stored in objects, and passed to child invocations through `delegate`. The host retains the connection settings and grant tokens. Effect failures reject their promises. The API supports normal JavaScript control flow and promise composition. Each worker currently services its submitted effects in order.
+Capabilities can be passed to functions, stored in objects, and passed to child invocations through `delegate`. The executing peer keeps the network settings and grant tokens outside the worker. It obtains recipient-bound grants for the requested subset and sends them to the child. Effect failures reject their promises. The API supports normal JavaScript control flow and promise composition. Each worker currently services its submitted effects in order.
 
 Application manifests link TypeScript runtime imports by source specifier and module name in each module's `imports` map. They can seed a collection from newline-delimited JSON pairs like `["stock/lamp/a1",3]`, or use `null` for an empty collection. For existing peers, `pp2 peer collection-init`, `graph-read`, and `graph-update` provide the equivalent lower-level interface. Existing snapshot programs continue to take `(state, input)` and run through `peer read` or `peer update`. [Graph limits and transaction semantics](docs/architecture.md#guest-effects-and-placement)
 

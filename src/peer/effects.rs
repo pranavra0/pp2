@@ -11,9 +11,10 @@ pub(super) const MAX_EFFECT_BYTES: usize = 128 * 1024;
 pub(super) const MAX_BINDINGS: usize = 16;
 pub(super) const MAX_KEY_BYTES: usize = 512;
 pub(super) const MAX_SCAN_ROWS: u16 = 128;
+pub(super) const MAX_JOB_LIFETIME_MS: u64 = 5 * 60 * 1000;
 
 /// Maximum work the root may assign to its descendants, under one wall-clock deadline.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphBudget {
     pub timeout_ms: u32,
@@ -28,28 +29,55 @@ impl GraphBudget {
         }
         Ok(())
     }
+
+    pub(super) fn fits(self, limit: Self) -> bool {
+        self.timeout_ms <= limit.timeout_ms
+            && self.calls <= limit.calls
+            && self.depth <= limit.depth
+    }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct GraphJob {
     pub grant: Hash,
     pub program: Hash,
     pub mode: EvaluationMode,
     pub input: Vec<u8>,
     pub budget: GraphBudget,
-    pub bindings: Vec<String>,
+    pub expires_at_ms: u64,
+    pub delegated_by: Option<Hash>,
+    pub bindings: GraphBindings,
 }
 
-/// A host-configured capability. The peer verifies the certificate and reference grant
-/// independently during each call. These fields never cross the worker boundary.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) enum GraphBindings {
+    Local(Vec<String>),
+    Forwarded(BTreeMap<String, Binding>),
+}
+
+/// A certificate-bound capability. Only the local host's peer directory can route it.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
-    pub address: std::net::SocketAddr,
-    pub name: String,
+    pub peer: Hash,
     pub grant: Hash,
     pub program: Hash,
     pub access: super::Access,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct BoundCapability {
+    pub binding: Binding,
+    pub delegated_by: Option<Hash>,
+}
+
+/// An administrator-approved network route to an exact peer certificate.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerEndpoint {
+    pub address: std::net::SocketAddr,
+    pub name: String,
+    pub fingerprint: Hash,
 }
 
 /// Bindings are addressed by name and scoped to an authenticated caller, entry grant and program.
@@ -190,7 +218,7 @@ impl Scope {
     }
 }
 
-/// Counters cover the graph observed by the initiating broker. Byte counters cover
+/// Counters cover the graph reported by the executing peers. Byte counters cover
 /// pp2 frames between peers, excluding TLS/TCP overhead and the initiating request.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 pub struct GraphMetrics {
@@ -206,6 +234,18 @@ pub struct GraphMetrics {
 }
 
 impl GraphMetrics {
+    pub(super) fn add_descendant(&mut self, other: Self) {
+        self.add_worker(other);
+        self.remote_calls = self.remote_calls.saturating_add(other.remote_calls);
+        self.remote_failures = self.remote_failures.saturating_add(other.remote_failures);
+        self.remote_request_bytes = self
+            .remote_request_bytes
+            .saturating_add(other.remote_request_bytes);
+        self.remote_response_bytes = self
+            .remote_response_bytes
+            .saturating_add(other.remote_response_bytes);
+    }
+
     pub(super) fn add_worker(&mut self, other: Self) {
         self.storage_us = self.storage_us.saturating_add(other.storage_us);
         self.storage_effects = self.storage_effects.saturating_add(other.storage_effects);

@@ -9,11 +9,13 @@ mod typescript;
 mod worker;
 
 pub use content::{JavaScript, data_from_json, data_to_json};
-pub use effects::{Binding, BindingSet, GraphBudget, GraphMetrics, validate_binding_names};
+pub use effects::{
+    Binding, BindingSet, GraphBudget, GraphMetrics, PeerEndpoint, validate_binding_names,
+};
 pub use storage::{Access, PeerStore, RECEIPT_WINDOW, Revision};
 pub use transport::{
-    Cancellation, Client, Credentials, Evaluation, EvaluationMode, GraphEvaluation, GraphReport,
-    RemoteReport, Server,
+    Cancellation, Client, Credentials, DurableEvaluation, Evaluation, EvaluationMode,
+    GraphEvaluation, GraphReport, JobStatus, RemoteReport, Server,
 };
 pub use typescript::compile_typescript;
 
@@ -78,6 +80,13 @@ impl From<io::Error> for PeerError {
 }
 
 type Result<T> = std::result::Result<T, PeerError>;
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 /// Internal subprocess entry point for binaries hosting a peer server.
 #[doc(hidden)]

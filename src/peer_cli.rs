@@ -11,9 +11,9 @@ use std::{
 use pp2::{
     Block, Hash,
     peer::{
-        Access, BindingSet, Client, Credentials, Evaluation, EvaluationMode, GraphBudget,
-        GraphEvaluation, JavaScript, PeerStore, Server, compile_typescript, data_from_json,
-        data_to_json,
+        Access, BindingSet, Client, Credentials, DurableEvaluation, Evaluation, EvaluationMode,
+        GraphBudget, GraphEvaluation, JavaScript, JobStatus, PeerEndpoint, PeerStore, Server,
+        compile_typescript, data_from_json, data_to_json,
     },
 };
 
@@ -30,12 +30,16 @@ const USAGE: &str = "Usage: pp2 peer <command>
   collection-init DB REFERENCE [ENTRIES_NDJSON]
   issue DB REFERENCE HOLDER_CERT reader|writer [PROGRAM]
   delegate ADDRESS NAME CA CERT KEY GRANT HOLDER_CERT reader|writer [PROGRAM]
+  attenuate ADDRESS NAME CA CERT KEY GRANT HOLDER_CERT reader|writer PROGRAM BUDGET_JSON EXPIRES_AT_MS
   revoke DB GRANT
   gc DB
   read DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE
   update DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE REVISION OPERATION
   graph-read DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON [CAPABILITY ...]
-  graph-update DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON REVISION OPERATION";
+  graph-update DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON REVISION OPERATION
+  job-submit DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON JOB_ID EXPIRES_AT_MS [CAPABILITY ... | --delegated FILE | --update REVISION OPERATION]
+  job-status ADDRESS NAME CA CERT KEY JOB_ID
+  job-cancel ADDRESS NAME CA CERT KEY JOB_ID";
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -51,7 +55,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
             let mut server = Server::new(db, std::env::current_exe()?, &creds)?;
             if let Some(path) = config.first() {
                 let graph: GraphConfig = serde_json::from_slice(&read(Path::new(path))?)?;
-                server = server.with_graph(&creds, graph.bindings, graph.brokers)?;
+                server = server.with_graph(&creds, graph.bindings, graph.peers)?;
             }
             let listener = TcpListener::bind(bind)?;
             println!("listening on {}", listener.local_addr()?);
@@ -170,6 +174,30 @@ pub fn run(args: &[OsString]) -> Result<()> {
             println!("{token}");
         }
         ["revoke", db, grant] => println!("{}", PeerStore::open(db)?.revoke(grant.parse()?)?),
+        [
+            "attenuate",
+            address,
+            name,
+            ca,
+            cert,
+            key,
+            grant,
+            holder,
+            level,
+            program,
+            budget,
+            expires,
+        ] => {
+            let token = client(address, name, ca, cert, key)?.attenuate(
+                grant.parse()?,
+                Credentials::fingerprint(holder)?,
+                access(level)?,
+                program.parse()?,
+                serde_json::from_str(budget)?,
+                expires.parse()?,
+            )?;
+            println!("{token}");
+        }
         ["gc", db] => println!("{} blocks removed", PeerStore::open(db)?.collect()?),
         [
             "read" | "update",
@@ -255,8 +283,105 @@ pub fn run(args: &[OsString]) -> Result<()> {
             )?;
             print_graph(report)?;
         }
+        [
+            "job-submit",
+            db,
+            address,
+            name,
+            ca,
+            cert,
+            key,
+            grant,
+            program,
+            file,
+            budget,
+            id,
+            expires,
+            rest @ ..,
+        ] => {
+            let (mode, bindings, delegated) = match rest {
+                ["--delegated", path] => (
+                    EvaluationMode::Read,
+                    Vec::new(),
+                    Some(serde_json::from_slice(&read(Path::new(path))?)?),
+                ),
+                ["--update", revision, operation] => (
+                    EvaluationMode::Update {
+                        expected_revision: revision.parse()?,
+                        operation: operation.parse()?,
+                    },
+                    Vec::new(),
+                    None,
+                ),
+                names => (
+                    EvaluationMode::Read,
+                    names.iter().map(|name| (*name).to_owned()).collect(),
+                    None,
+                ),
+            };
+            let packages = (*db != "-").then(|| PeerStore::open(db)).transpose()?;
+            let request = DurableEvaluation {
+                id: id.parse()?,
+                expires_at_ms: expires.parse()?,
+                graph: GraphEvaluation {
+                    evaluation: Evaluation {
+                        grant: grant.parse()?,
+                        program: program.parse()?,
+                        mode,
+                        input: &read_json(file)?,
+                        packages: packages.as_ref(),
+                    },
+                    budget: serde_json::from_str(budget)?,
+                    bindings: &bindings,
+                },
+            };
+            let client = client(address, name, ca, cert, key)?;
+            let status = match delegated {
+                Some(bindings) => client.submit_delegated_job(request, bindings)?,
+                None => client.submit_job(request)?,
+            };
+            print_job(status)?;
+        }
+        [
+            command @ ("job-status" | "job-cancel"),
+            address,
+            name,
+            ca,
+            cert,
+            key,
+            id,
+        ] => {
+            let client = client(address, name, ca, cert, key)?;
+            let id = id.parse()?;
+            let status = if *command == "job-status" {
+                client.job_status(id)?
+            } else {
+                client.cancel_job(id)?
+            };
+            print_job(status)?;
+        }
         _ => return Err(USAGE.into()),
     }
+    Ok(())
+}
+
+fn print_job(status: JobStatus) -> Result<()> {
+    use serde_json::json;
+    let value = match status {
+        JobStatus::Pending => json!({"state":"pending"}),
+        JobStatus::Running => json!({"state":"running"}),
+        JobStatus::Completed {
+            revision,
+            value,
+            graph,
+        } => {
+            json!({"state":"completed", "revision":revision, "value":data_to_json(&value)?, "graph":graph})
+        }
+        JobStatus::Failed(error) => json!({"state":"failed", "error":error.to_string()}),
+        JobStatus::Cancelled => json!({"state":"cancelled"}),
+        JobStatus::Expired => json!({"state":"expired"}),
+    };
+    println!("{value}");
     Ok(())
 }
 
@@ -266,7 +391,7 @@ struct GraphConfig {
     #[serde(default)]
     bindings: Vec<BindingSet>,
     #[serde(default)]
-    brokers: BTreeSet<Hash>,
+    peers: Vec<PeerEndpoint>,
 }
 
 pub(crate) fn print_graph(report: pp2::peer::GraphReport) -> Result<()> {
