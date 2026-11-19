@@ -1,0 +1,23 @@
+[package]
+name = "pp2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+getrandom = "0.4"
+postcard = { version = "1.1", features = ["alloc"], default-features = false }
+rusqlite = { version = "0.43", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+rquickjs = { version = "0.14", features = ["loader"] }
+seccompiler = "0.5"
