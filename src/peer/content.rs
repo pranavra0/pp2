@@ -6,7 +6,7 @@ use crate::{Block, BlockKind, Data, Error, Hash, wire};
 
 use super::{PeerError, Result};
 
-const MAGIC: &[u8; 4] = b"PPJ1";
+pub(super) const MAGIC: &[u8; 4] = b"PPJ1";
 pub(super) const MAX_MODULES: usize = 32;
 pub(super) const MAX_CODE: usize = 512 * 1024;
 const MAX_SAFE_INT: u64 = (1 << 53) - 1;

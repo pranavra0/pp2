@@ -1,6 +1,6 @@
 # pp2
 
-pp2 runs a content-addressed program on the peer that holds its data. The caller selects the peer and presents a capability for a durable reference. The peer verifies the caller, supplies the reference snapshot to an isolated process, and returns the result. Programs can ship to the peer on demand.
+pp2 runs content-addressed JavaScript on the peers that hold its data. A program can read a local collection, pass capabilities as guest values, and await computations at other peers. Each peer verifies the caller and program before executing code in an isolated process. Peers request verified modules on demand.
 
 ## Build and run
 
@@ -13,6 +13,33 @@ target/release/pp2 peer --help
 ~~~
 
 Install the peer CLI with `cargo install --locked --path .`. The application clients are the `document_library` and `inventory` example binaries under `target/release/examples` after building.
+
+## Run a three-peer application
+
+The stock example reads the reorder threshold at the office, evaluates a warehouse program at each location, and combines the totals. The manifest specifies each capability's peer, collection, program, and maximum access. OpenSSL provisions development identities and grants during initialization. JavaScript packaging and execution use the installed `pp2` binary.
+
+~~~sh
+pp2 app init examples/federated-stock/app.json ./stock-deployment
+pp2 app run ./stock-deployment '{"sku":"lamp"}'
+pp2 app run ./stock-deployment '{"sku":"lamp","viaWest":true}'
+~~~
+
+Both invocations return 10 lamps, with 7 at the west warehouse and 3 at the east warehouse. The second invocation explicitly passes the east capability and one descendant call to the west computation. `app run` starts three independent peer processes with separate databases and authenticated loopback connections. The deployment directory persists across invocations.
+
+To deploy the same application across hosts, set a reachable IP address and port in each manifest peer's `address` field before running `app init`. For example, set `"address": "192.0.2.11:7340"` on the office peer. Copy each generated peer directory to its corresponding host and start `pp2 app serve PEER_DIRECTORY` there. Copy the `client` directory to the invocation machine and run `pp2 app invoke CLIENT_DIRECTORY '{"sku":"lamp"}'`. Keep peer and client directories private to their operators. The `admin` directory contains the development CA signing key. The office broker needs TCP reachability to both warehouses. [Stock program](examples/federated-stock/stock.mjs), [warehouse program](examples/federated-stock/warehouse.mjs), [application manifest](examples/federated-stock/app.json)
+
+## Write a guest with effects
+
+The default export of a collection program receives `(pp2, input)`.
+
+- `pp2.storage.get(key)` resolves to `{found: false}` or `{found: true, value}`. Values may be null.
+- `pp2.storage.scan({prefix, after, limit})` resolves to `{entries, next}`. Each entry is a key-value pair. Pass `next` as the exclusive `after` cursor for the next page, until it is null. The host orders keys by their UTF-8 bytes and caps each page by rows and encoded size.
+- `pp2.evaluate(capability, input, {calls, delegate, timeoutMs, update})` resolves to `{revision, value}`. Pass a capability from `pp2.capabilities`. Its grant determines which collection and program the target peer authorizes. Set `calls: 0` for a leaf. An optional `delegate` array supplies the only capabilities available to the child. An optional `timeoutMs` shortens that branch's inherited deadline.
+- On a write invocation, `pp2.storage.put(key, value)` and `pp2.storage.delete(key)` change the local collection. The program returns its ordinary result. The peer commits the changes, revision, and retry receipt together. A remote update requires a writable capability and explicit `update: {revision, operation}`, where `operation` is a 64-character hexadecimal operation ID. Updates are leaves.
+
+Capabilities can be passed to functions, stored in objects, and passed to child invocations through `delegate`. The host retains the connection settings and grant tokens. Effect failures reject their promises. The API supports normal JavaScript control flow and promise composition. Each worker currently services its submitted effects in order.
+
+Application manifests link TypeScript runtime imports by source specifier and module name in each module's `imports` map. They can seed a collection from newline-delimited JSON pairs like `["stock/lamp/a1",3]`, or use `null` for an empty collection. For existing peers, `pp2 peer collection-init`, `graph-read`, and `graph-update` provide the equivalent lower-level interface. Existing snapshot programs continue to take `(state, input)` and run through `peer read` or `peer update`. [Graph limits and transaction semantics](docs/architecture.md#guest-effects-and-placement)
 
 ## Write a program in TypeScript
 
@@ -113,8 +140,9 @@ inventory release inventory.json 1 order-42
 ~~~sh
 scripts/validate-peers.py --isolated-networks
 scripts/validate-peers.py --samples 40
+scripts/benchmark-graph.py --isolated-networks --samples 40
 ~~~
 
-The validation script uses Python 3.9 or later, OpenSSL, and the TypeScript toolchain from `npm ci`. The network namespace run also uses Linux user namespaces, `unshare`, `nsenter`, and `ip`. The comparison uses Python's SQLite build with FTS5. See the [runtime design and measurement notes](docs/architecture.md).
+The validation script uses Python 3.9 or later, OpenSSL, and the TypeScript toolchain from `npm ci`. The network namespace run also uses Linux user namespaces, `unshare`, `nsenter`, and `ip`. The snapshot comparison uses Python's SQLite build with FTS5. The graph comparison uses the same stock queries on three pp2 peers and a conventional mTLS service. [Runtime design and measurements](docs/architecture.md)
 
 Use `pp2 eval` for local binary IR evaluation and `pp2 demo placement` for the simulated filter-and-fold workload. The other simulator scenarios are `sandbox`, `locality`, `gossip`, and `gc`.

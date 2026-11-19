@@ -1,6 +1,8 @@
 use std::{path::Path, time::Duration};
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior::Immediate, params};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior::Immediate, params,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{Block, Data, Hash};
@@ -8,6 +10,7 @@ use crate::{Block, Data, Hash};
 use super::{
     PeerError, Result,
     content::{self, Kind},
+    effects::{Effect, MAX_EFFECT_BYTES, Scan},
 };
 
 const MAX_DELEGATION_DEPTH: u8 = 8;
@@ -39,7 +42,14 @@ PRAGMA user_version = 1;
 PRAGMA application_id = 0x70703231;
 ";
 
-/// Read permits snapshot evaluation. Write also permits atomic replacement of the reference.
+const COLLECTIONS: &str = "
+CREATE TABLE collections (ref TEXT PRIMARY KEY REFERENCES refs(name)) WITHOUT ROWID;
+CREATE TABLE entries (ref TEXT REFERENCES collections(ref), key BLOB,
+                      value BLOB NOT NULL, PRIMARY KEY(ref, key)) WITHOUT ROWID;
+PRAGMA user_version = 2;
+";
+
+/// Read permits evaluation against a reference. Write also permits atomic updates.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum Access {
     Read,
@@ -96,7 +106,10 @@ pub struct PeerStore(Connection);
 
 impl PeerStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        Self::open_with_timeout(path.as_ref(), Duration::from_millis(1500))
+    }
+
+    pub(super) fn open_with_timeout(path: &Path, busy: Duration) -> Result<Self> {
         #[cfg(unix)]
         if path != Path::new(":memory:") {
             use std::{fs::OpenOptions, io::ErrorKind, os::unix::fs::OpenOptionsExt};
@@ -112,17 +125,21 @@ impl PeerStore {
             }
         }
         let mut conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_millis(1500))?;
-        let initialize = is_uninitialized(&conn)?;
+        conn.busy_timeout(busy)?;
+        let version = database_version(&conn)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // Bound the main database. Short transactions keep WAL readers from pinning old pages.
         conn.pragma_update(None, "max_page_count", 65_536)?;
-        if initialize {
+        if version < 2 {
             let tx = conn.transaction_with_behavior(Immediate)?;
-            if is_uninitialized(&tx)? {
+            let version = database_version(&tx)?;
+            if version == 0 {
                 tx.execute_batch(SCHEMA)?;
+            }
+            if version < 2 {
+                tx.execute_batch(COLLECTIONS)?;
             }
             tx.commit()?;
         }
@@ -247,6 +264,7 @@ impl PeerStore {
         let Some(revision) = revision(&tx, name)? else {
             return Ok(None);
         };
+        require_kind(&tx, name, false)?;
         let bytes = get(&tx, revision.hash, false)?.ok_or(PeerError::Missing(revision.hash))?;
         if content::inspect(revision.hash, &bytes)?.0 != Kind::Data {
             return Err(PeerError::Value("reference does not contain data".into()));
@@ -264,6 +282,7 @@ impl PeerStore {
         let tx = self.0.transaction_with_behavior(Immediate)?;
         let current =
             revision(&tx, name)?.ok_or_else(|| PeerError::NoReference(name.to_owned()))?;
+        require_kind(&tx, name, false)?;
         if current.number != expected {
             return Err(PeerError::Conflict(current.number));
         }
@@ -333,6 +352,7 @@ impl PeerStore {
     pub(super) fn begin(&mut self, call: Call) -> Result<EvaluationStart> {
         let tx = self.0.transaction()?;
         let scope = authorize(&tx, call)?;
+        require_kind(&tx, &scope.reference, false)?;
         if let Some(update) = call.update
             && let Some(receipt) = replay(&tx, call.grant, update)?
         {
@@ -380,30 +400,93 @@ impl PeerStore {
             return Err(PeerError::Conflict(current.number));
         }
         let revision = replace(&tx, &scope.reference, current, next)?;
-        let number = revision.number as i64;
-        tx.execute(
-            "INSERT INTO receipts VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                &call.grant.0[..],
-                &update.operation.0[..],
-                scope.reference,
-                &update.fingerprint.0[..],
-                number,
-                &value
-            ],
-        )?;
-        tx.execute(
-            "DELETE FROM receipts WHERE ref=?1 AND revision<=?2",
-            params![
-                scope.reference,
-                number.saturating_sub(RECEIPT_WINDOW as i64)
-            ],
-        )?;
+        save_receipt(&tx, call, &scope.reference, update, revision.number, &value)?;
         tx.commit()?;
         Ok(Receipt {
             revision: revision.number,
             value,
         })
+    }
+
+    /// Creates an indexed reference at revision zero and imports its initial entries atomically.
+    pub fn create_collection(
+        &mut self,
+        name: &str,
+        entries: impl IntoIterator<Item = Result<(String, Data)>>,
+    ) -> Result<Revision> {
+        check_name(name)?;
+        let bytes = Block::Data(Data::Nil).to_bytes()?;
+        let hash = Hash::digest(&bytes);
+        let tx = self.0.transaction_with_behavior(Immediate)?;
+        insert(&tx, hash, &bytes)?;
+        if tx.execute(
+            "INSERT INTO refs VALUES (?1, 0, ?2) ON CONFLICT(name) DO NOTHING",
+            params![name, &hash.0[..]],
+        )? == 0
+        {
+            return Err(PeerError::ReferenceExists(name.to_owned()));
+        }
+        tx.execute("INSERT INTO collections VALUES (?1)", [name])?;
+        {
+            let mut insert = tx.prepare("INSERT INTO entries VALUES (?1, ?2, ?3)")?;
+            for entry in entries {
+                let (key, value) = entry?;
+                let bytes = value.to_bytes()?;
+                check_entry(&key, &bytes)?;
+                insert.execute(params![name, key.as_bytes(), bytes])?;
+            }
+        }
+        tx.commit()?;
+        Ok(Revision { number: 0, hash })
+    }
+
+    pub(super) fn probe_collection(&mut self, call: Call) -> Result<Option<Receipt>> {
+        let tx = self.0.transaction()?;
+        let scope = authorize(&tx, call)?;
+        require_kind(&tx, &scope.reference, true)?;
+        if let Some(update) = call.update {
+            if let Some(receipt) = replay(&tx, call.grant, update)? {
+                return Ok(Some(receipt));
+            }
+            let current = revision(&tx, &scope.reference)?.ok_or(PeerError::Denied)?;
+            if update.expected != current.number {
+                return Err(PeerError::Conflict(current.number));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(super) fn scoped(&mut self, call: Call, busy: Duration) -> Result<ScopedStart<'_>> {
+        self.0.busy_timeout(busy)?;
+        let tx = if call.update.is_some() {
+            self.0.transaction_with_behavior(Immediate)?
+        } else {
+            self.0.transaction()?
+        };
+        let scope = authorize(&tx, call)?;
+        require_kind(&tx, &scope.reference, true)?;
+        if let Some(update) = call.update
+            && let Some(receipt) = replay(&tx, call.grant, update)?
+        {
+            return Ok(ScopedStart::Replayed(receipt));
+        }
+        let revision = revision(&tx, &scope.reference)?.ok_or(PeerError::Denied)?;
+        if let Some(update) = call.update
+            && update.expected != revision.number
+        {
+            return Err(PeerError::Conflict(revision.number));
+        }
+        Ok(ScopedStart::Collection(Collection {
+            tx,
+            reference: scope.reference,
+            revision: revision.number,
+            call,
+        }))
+    }
+
+    pub(super) fn confirm_collection(&self, call: Call) -> Result<()> {
+        let scope = authorize(&self.0, call)?;
+        require_kind(&self.0, &scope.reference, true)
     }
 
     /// Drops blocks unreachable from references and publications in one transaction.
@@ -416,6 +499,173 @@ impl PeerStore {
             [],
         )?)
     }
+}
+
+pub(super) enum ScopedStart<'a> {
+    Collection(Collection<'a>),
+    Replayed(Receipt),
+}
+
+pub(super) struct Collection<'a> {
+    tx: Transaction<'a>,
+    reference: String,
+    revision: u64,
+    call: Call,
+}
+
+impl Collection<'_> {
+    pub(super) fn effect(&self, effect: Effect) -> Result<Vec<u8>> {
+        use serde_json::json;
+        let result = match effect {
+            Effect::Get(key) => {
+                let bytes: Option<Vec<u8>> = self
+                    .tx
+                    .query_row(
+                        "SELECT value FROM entries WHERE ref=?1 AND key=?2",
+                        params![self.reference, key.as_bytes()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match bytes {
+                    Some(bytes) => json!({"found": true, "value": entry_json(&bytes)?}),
+                    None => json!({"found": false}),
+                }
+            }
+            Effect::Scan(scan) => return self.scan(scan),
+            Effect::Put(key, bytes) => {
+                self.call.update.ok_or(PeerError::Denied)?;
+                check_entry(&key, &bytes)?;
+                self.tx.execute(
+                    "INSERT INTO entries VALUES (?1, ?2, ?3)
+                     ON CONFLICT(ref, key) DO UPDATE SET value=excluded.value",
+                    params![self.reference, key.as_bytes(), bytes],
+                )?;
+                json!(null)
+            }
+            Effect::Delete(key) => {
+                self.call.update.ok_or(PeerError::Denied)?;
+                let deleted = self.tx.execute(
+                    "DELETE FROM entries WHERE ref=?1 AND key=?2",
+                    params![self.reference, key.as_bytes()],
+                )?;
+                json!(deleted != 0)
+            }
+            Effect::Evaluate(_) => return Err(PeerError::Denied),
+        };
+        content::data_from_json(result)?
+            .to_bytes()
+            .map_err(Into::into)
+    }
+
+    fn scan(&self, scan: Scan) -> Result<Vec<u8>> {
+        // UTF-8 never contains 0xff. BLOB comparison gives a bounded prefix range on the index.
+        let mut upper = scan.prefix.as_bytes().to_vec();
+        upper.push(0xff);
+        let lower = scan.after.as_deref().unwrap_or(&scan.prefix).as_bytes();
+        let mut stmt = self.tx.prepare_cached(
+            "SELECT key, value FROM entries WHERE ref=?1 AND key>=?2 AND key<?3 ORDER BY key",
+        )?;
+        let mut rows = stmt.query(params![self.reference, lower, upper])?;
+        let mut entries = Vec::new();
+        let mut last = None;
+        let mut next = None;
+        let mut bytes_left = Block::MAX_BYTES - 2048;
+        while let Some(row) = rows.next()? {
+            let key: Vec<u8> = row.get(0)?;
+            if scan.after.is_some() && key == lower {
+                continue;
+            }
+            let bytes: Vec<u8> = row.get(1)?;
+            let cost = bytes.len() + key.len() + 32;
+            if entries.len() == usize::from(scan.limit) || cost > bytes_left {
+                next = last;
+                break;
+            }
+            bytes_left -= cost;
+            let key = String::from_utf8(key).map_err(|err| PeerError::Value(err.to_string()))?;
+            entries.push(serde_json::json!([key, entry_json(&bytes)?]));
+            last = Some(key);
+        }
+        content::data_from_json(serde_json::json!({"entries": entries, "next": next}))?
+            .to_bytes()
+            .map_err(Into::into)
+    }
+
+    pub(super) fn finish(self, value: Vec<u8>, check: impl Fn() -> Result<()>) -> Result<Receipt> {
+        let mut number = self.revision;
+        if let Some(update) = self.call.update {
+            number += 1;
+            let revision =
+                i64::try_from(number).map_err(|_| PeerError::Limit("reference revisions"))?;
+            self.tx.execute(
+                "UPDATE refs SET revision=?1 WHERE name=?2",
+                params![revision, self.reference],
+            )?;
+            save_receipt(&self.tx, self.call, &self.reference, update, number, &value)?;
+        }
+        check()?;
+        self.tx.commit()?;
+        Ok(Receipt {
+            revision: number,
+            value,
+        })
+    }
+}
+
+fn check_entry(key: &str, bytes: &[u8]) -> Result<()> {
+    super::effects::check_key(key, false)?;
+    if bytes.len() > MAX_EFFECT_BYTES {
+        return Err(PeerError::Limit("entry bytes"));
+    }
+    entry_json(bytes)?;
+    Ok(())
+}
+
+fn entry_json(bytes: &[u8]) -> Result<serde_json::Value> {
+    content::data_to_json(&Data::from_bytes(bytes)?)
+}
+
+fn require_kind(conn: &Connection, name: &str, scoped: bool) -> Result<()> {
+    let collection: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM collections WHERE ref=?1)",
+        [name],
+        |row| row.get(0),
+    )?;
+    if collection != scoped {
+        return Err(PeerError::Value(if scoped {
+            "expected an indexed collection reference".into()
+        } else {
+            "expected a snapshot reference".into()
+        }));
+    }
+    Ok(())
+}
+
+fn save_receipt(
+    conn: &Connection,
+    call: Call,
+    reference: &str,
+    update: Update,
+    revision: u64,
+    value: &[u8],
+) -> Result<()> {
+    let number = revision as i64;
+    conn.execute(
+        "INSERT INTO receipts VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            &call.grant.0[..],
+            &update.operation.0[..],
+            reference,
+            &update.fingerprint.0[..],
+            number,
+            value
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM receipts WHERE ref=?1 AND revision<=?2",
+        params![reference, number.saturating_sub(RECEIPT_WINDOW as i64)],
+    )?;
+    Ok(())
 }
 
 fn replace(conn: &Connection, name: &str, current: Revision, next: &[u8]) -> Result<Revision> {
@@ -436,7 +686,7 @@ fn replace(conn: &Connection, name: &str, current: Revision, next: &[u8]) -> Res
     })
 }
 
-fn is_uninitialized(conn: &Connection) -> Result<bool> {
+fn database_version(conn: &Connection) -> Result<i64> {
     // Read the identity and version from one SQLite statement so concurrent initialization
     // cannot leave this connection with a mixture of the old and new schema metadata.
     let (application, version, entries): (i64, i64, i64) = conn.query_row(
@@ -446,8 +696,8 @@ fn is_uninitialized(conn: &Connection) -> Result<bool> {
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     match (application, version, entries) {
-        (0, 0, 0) => Ok(true),
-        (APPLICATION_ID, 1, _) => Ok(false),
+        (0, 0, 0) => Ok(0),
+        (APPLICATION_ID, 1 | 2, _) => Ok(version),
         (APPLICATION_ID, _, _) => Err(PeerError::Unsupported("peer database version")),
         _ => Err(PeerError::Unsupported(
             "expected a pp2 database or an empty file",

@@ -11,13 +11,14 @@ use std::{
 use pp2::{
     Block, Hash,
     peer::{
-        Access, Client, Credentials, Evaluation, EvaluationMode, JavaScript, PeerStore, Server,
-        compile_typescript, data_from_json, data_to_json,
+        Access, BindingSet, Client, Credentials, Evaluation, EvaluationMode, GraphBudget,
+        GraphEvaluation, JavaScript, PeerStore, Server, compile_typescript, data_from_json,
+        data_to_json,
     },
 };
 
 const USAGE: &str = "Usage: pp2 peer <command>
-  serve DB BIND CA CERT KEY
+  serve DB BIND CA CERT KEY [GRAPH_CONFIG]
   fingerprint CERT
   pack SOURCE OUTPUT [HASH | SPECIFIER=HASH ...]
   put DB BLOCK [--publish]
@@ -26,12 +27,15 @@ const USAGE: &str = "Usage: pp2 peer <command>
   fetch DB ADDRESS NAME CA CERT KEY HASH
   fetch-program DB ADDRESS NAME CA CERT KEY HASH [--publish]
   ref-init DB REFERENCE JSON_FILE
+  collection-init DB REFERENCE [ENTRIES_NDJSON]
   issue DB REFERENCE HOLDER_CERT reader|writer [PROGRAM]
   delegate ADDRESS NAME CA CERT KEY GRANT HOLDER_CERT reader|writer [PROGRAM]
   revoke DB GRANT
   gc DB
   read DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE
-  update DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE REVISION OPERATION";
+  update DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE REVISION OPERATION
+  graph-read DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON [CAPABILITY ...]
+  graph-update DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON REVISION OPERATION";
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -42,8 +46,13 @@ pub fn run(args: &[OsString]) -> Result<()> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
     match args.as_slice() {
         [] | ["--help" | "-h"] => println!("{USAGE}"),
-        ["serve", db, bind, ca, cert, key] => {
-            let server = Server::new(db, std::env::current_exe()?, &credentials(ca, cert, key))?;
+        ["serve", db, bind, ca, cert, key, config @ ..] if config.len() <= 1 => {
+            let creds = credentials(ca, cert, key);
+            let mut server = Server::new(db, std::env::current_exe()?, &creds)?;
+            if let Some(path) = config.first() {
+                let graph: GraphConfig = serde_json::from_slice(&read(Path::new(path))?)?;
+                server = server.with_graph(&creds, graph.bindings, graph.brokers)?;
+            }
             let listener = TcpListener::bind(bind)?;
             println!("listening on {}", listener.local_addr()?);
             server.serve(listener)?;
@@ -127,6 +136,10 @@ pub fn run(args: &[OsString]) -> Result<()> {
             let revision = PeerStore::open(db)?.create_ref(reference, &read_json(json)?)?;
             println!("{} {}", revision.number, revision.hash);
         }
+        ["collection-init", db, reference, entries @ ..] if entries.len() <= 1 => {
+            let file = entries.first().map(File::open).transpose()?;
+            crate::app_cli::seed(&mut PeerStore::open(db)?, reference, file)?;
+        }
         ["issue", db, reference, holder, level, program @ ..] if program.len() <= 1 => {
             let token = PeerStore::open(db)?.issue(
                 reference,
@@ -196,8 +209,75 @@ pub fn run(args: &[OsString]) -> Result<()> {
                 "fuel": report.fuel, "memory_bytes": report.memory_bytes})
             );
         }
+        [
+            command @ ("graph-read" | "graph-update"),
+            db,
+            address,
+            name,
+            ca,
+            cert,
+            key,
+            grant,
+            program,
+            file,
+            budget,
+            rest @ ..,
+        ] => {
+            let (mode, bindings) = match (*command, rest) {
+                ("graph-read", names) => (
+                    EvaluationMode::Read,
+                    names.iter().map(|s| (*s).into()).collect(),
+                ),
+                ("graph-update", [revision, operation]) => (
+                    EvaluationMode::Update {
+                        expected_revision: revision.parse()?,
+                        operation: operation.parse()?,
+                    },
+                    Vec::new(),
+                ),
+                _ => return Err(USAGE.into()),
+            };
+            let budget: GraphBudget = serde_json::from_str(budget)?;
+            let packages = (*db != "-").then(|| PeerStore::open(db)).transpose()?;
+            let report = client(address, name, ca, cert, key)?.run_graph(
+                GraphEvaluation {
+                    evaluation: Evaluation {
+                        grant: grant.parse()?,
+                        program: program.parse()?,
+                        mode,
+                        input: &read_json(file)?,
+                        packages: packages.as_ref(),
+                    },
+                    budget,
+                    bindings: &bindings,
+                },
+                None,
+            )?;
+            print_graph(report)?;
+        }
         _ => return Err(USAGE.into()),
     }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphConfig {
+    #[serde(default)]
+    bindings: Vec<BindingSet>,
+    #[serde(default)]
+    brokers: BTreeSet<Hash>,
+}
+
+pub(crate) fn print_graph(report: pp2::peer::GraphReport) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::json!({
+            "value": data_to_json(&report.value)?, "revision": report.revision,
+            "elapsed_us": report.elapsed_us, "request_bytes": report.request_bytes,
+            "response_bytes": report.response_bytes, "graph": report.graph,
+        })
+    );
     Ok(())
 }
 

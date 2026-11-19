@@ -24,14 +24,18 @@ pub use super::protocol::EvaluationMode;
 use super::{
     Access, PeerError, PeerStore, Result,
     content::{self, Kind, MAX_CODE, MAX_MODULES},
+    effects::BindingSet,
     protocol::{self, Job, Reply, Request},
     storage::{Call, EvaluationStart, Update},
-    worker::{self, Work},
+    worker::{self, Work, WorkContext},
 };
 
 const ALPN: &[u8] = b"pp2/1";
 const DEADLINE: Duration = Duration::from_secs(8);
 const MAX_CONNECTIONS: usize = 16;
+
+mod graph;
+pub use graph::{GraphEvaluation, GraphReport};
 
 /// TLS root certificates and one peer certificate with its private key.
 #[derive(Clone, Debug)]
@@ -74,12 +78,20 @@ fn tls(error: impl std::fmt::Display) -> PeerError {
     PeerError::Tls(error.to_string())
 }
 
-struct Socket {
-    tcp: TcpStream,
+#[derive(Clone)]
+struct Activity {
     deadline: Instant,
+    sockets: Vec<Arc<TcpStream>>,
 }
 
-impl Socket {
+impl Activity {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            sockets: Vec::new(),
+        }
+    }
+
     fn remaining(&self) -> io::Result<Duration> {
         self.deadline
             .checked_duration_since(Instant::now())
@@ -87,41 +99,99 @@ impl Socket {
             .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
     }
 
-    fn check_active(&self) -> Result<()> {
-        self.remaining().map_err(|_| PeerError::Timeout)?;
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            let mut fd = libc::pollfd {
-                fd: self.tcp.as_raw_fd(),
-                events: libc::POLLRDHUP,
-                revents: 0,
-            };
-            // SAFETY: the descriptor is held open and the kernel receives one initialized pollfd.
-            if unsafe { libc::poll(&mut fd, 1, 0) } > 0
-                && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
-            {
-                return Err(PeerError::Cancelled);
-            }
+    fn storage_wait(&self) -> Result<Duration> {
+        Ok(self.remaining()?.min(Duration::from_millis(100)))
+    }
+
+    fn check(&self) -> Result<()> {
+        self.remaining()?;
+        for tcp in &self.sockets {
+            check_connected(tcp)?;
         }
         Ok(())
     }
 }
 
+fn check_connected(_tcp: &TcpStream) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut fd = libc::pollfd {
+            fd: _tcp.as_raw_fd(),
+            events: libc::POLLRDHUP,
+            revents: 0,
+        };
+        // SAFETY: the descriptor is held open and the kernel receives one initialized pollfd.
+        if unsafe { libc::poll(&mut fd, 1, 0) } > 0
+            && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
+        {
+            return Err(PeerError::Cancelled);
+        }
+    }
+    Ok(())
+}
+
+struct Socket {
+    tcp: Arc<TcpStream>,
+    activity: Activity,
+}
+
+impl Socket {
+    fn active(&self) -> Activity {
+        let mut active = self.activity.clone();
+        active.sockets.push(self.tcp.clone());
+        active
+    }
+
+    fn check_active(&self) -> Result<()> {
+        self.activity.check()?;
+        check_connected(&self.tcp)
+    }
+
+    fn io<T>(&self, mut operation: impl FnMut(Duration) -> io::Result<T>) -> io::Result<T> {
+        loop {
+            let mut timeout = self.activity.remaining()?;
+            if !self.activity.sockets.is_empty() {
+                self.activity.check().map_err(|err| match err {
+                    PeerError::Timeout => io::Error::from(io::ErrorKind::TimedOut),
+                    _ => io::Error::from(io::ErrorKind::ConnectionAborted),
+                })?;
+                timeout = timeout.min(Duration::from_millis(25));
+            }
+            match operation(timeout) {
+                Err(error)
+                    if !self.activity.sockets.is_empty()
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        ) =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
 impl Read for Socket {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.tcp.set_read_timeout(Some(self.remaining()?))?;
-        self.tcp.read(bytes)
+        self.io(|timeout| {
+            self.tcp.set_read_timeout(Some(timeout))?;
+            (&*self.tcp).read(bytes)
+        })
     }
 }
 
 impl Write for Socket {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.tcp.set_write_timeout(Some(self.remaining()?))?;
-        self.tcp.write(bytes)
+        self.io(|timeout| {
+            self.tcp.set_write_timeout(Some(timeout))?;
+            (&*self.tcp).write(bytes)
+        })
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.tcp.flush()
+        (&*self.tcp).flush()
     }
 }
 
@@ -226,18 +296,18 @@ impl Client {
 
     fn connect(&self, started: Instant) -> Result<StreamOwned<ClientConnection, Socket>> {
         let tcp = TcpStream::connect_timeout(&self.endpoint, DEADLINE)?;
-        self.handshake(tcp, started)
+        self.handshake(tcp, Activity::new(started + DEADLINE))
     }
 
     fn handshake(
         &self,
         tcp: TcpStream,
-        started: Instant,
+        activity: Activity,
     ) -> Result<StreamOwned<ClientConnection, Socket>> {
         tcp.set_nodelay(true)?;
         let mut socket = Socket {
-            tcp,
-            deadline: started + DEADLINE,
+            tcp: Arc::new(tcp),
+            activity,
         };
         let mut conn = ClientConnection::new(self.tls.clone(), self.name.clone()).map_err(tls)?;
         conn.complete_io(&mut socket)?;
@@ -344,7 +414,7 @@ impl Client {
         let _registration = cancellation
             .map(|handle| handle.register(&tcp))
             .transpose()?;
-        let mut stream = self.handshake(tcp, started)?;
+        let mut stream = self.handshake(tcp, Activity::new(started + DEADLINE))?;
         let mut sent = protocol::send(
             &mut stream,
             &Request::Evaluate(Job {
@@ -407,6 +477,7 @@ pub struct Server {
     database: PathBuf,
     worker: PathBuf,
     tls: Arc<ServerConfig>,
+    graph: graph::Configuration,
 }
 
 impl Server {
@@ -434,7 +505,19 @@ impl Server {
             database: database.as_ref().canonicalize()?,
             worker: worker.as_ref().canonicalize()?,
             tls: Arc::new(config),
+            graph: graph::Configuration::default(),
         })
+    }
+
+    /// Configures outgoing capabilities and the authenticated brokers allowed to forward them.
+    pub fn with_graph(
+        mut self,
+        creds: &Credentials,
+        bindings: Vec<BindingSet>,
+        brokers: BTreeSet<Hash>,
+    ) -> Result<Self> {
+        self.graph = graph::Configuration::new(creds, bindings, brokers)?;
+        Ok(self)
     }
 
     pub fn serve(self, listener: TcpListener) -> Result<()> {
@@ -465,8 +548,8 @@ impl Server {
     fn handle(&self, tcp: TcpStream) -> Result<()> {
         tcp.set_nodelay(true)?;
         let mut socket = Socket {
-            tcp,
-            deadline: Instant::now() + DEADLINE,
+            tcp: Arc::new(tcp),
+            activity: Activity::new(Instant::now() + DEADLINE),
         };
         let mut conn = ServerConnection::new(self.tls.clone()).map_err(tls)?;
         conn.complete_io(&mut socket)?;
@@ -480,21 +563,39 @@ impl Server {
         let holder = Hash::digest(cert);
         let mut stream = StreamOwned::new(conn, socket);
         let (request, _) = protocol::receive(&mut stream)?;
-        let outcome = PeerStore::open(&self.database).and_then(|mut store| match request {
-            Request::Fetch(hash) => store
-                .public(hash)?
-                .map(Reply::Block)
-                .ok_or(PeerError::Missing(hash)),
-            Request::Delegate {
-                grant,
-                holder: delegate,
-                access,
-                program,
-            } => store
-                .delegate(holder, grant, delegate, access, program)
-                .map(Reply::Delegated),
-            Request::Evaluate(job) => self.evaluate(&mut stream, &mut store, holder, job),
-        });
+        let outcome = (|| {
+            let mut store = if let Request::Run(job) | Request::Subprocess(job) = &request {
+                job.budget.validate()?;
+                stream.sock.activity.deadline = stream
+                    .sock
+                    .activity
+                    .deadline
+                    .min(Instant::now() + Duration::from_millis(job.budget.timeout_ms.into()));
+                stream.sock.check_active()?;
+                PeerStore::open_with_timeout(&self.database, stream.sock.activity.storage_wait()?)?
+            } else {
+                PeerStore::open(&self.database)?
+            };
+            match request {
+                Request::Fetch(hash) => store
+                    .public(hash)?
+                    .map(Reply::Block)
+                    .ok_or(PeerError::Missing(hash)),
+                Request::Delegate {
+                    grant,
+                    holder: delegate,
+                    access,
+                    program,
+                } => store
+                    .delegate(holder, grant, delegate, access, program)
+                    .map(Reply::Delegated),
+                Request::Evaluate(job) => self.evaluate(&mut stream, &mut store, holder, job),
+                Request::Run(job) => self.run_graph(&mut stream, &mut store, holder, job, false),
+                Request::Subprocess(job) => {
+                    self.run_graph(&mut stream, &mut store, holder, job, true)
+                }
+            }
+        })();
         let reply = outcome.unwrap_or_else(|err| Reply::Failed(err.into()));
         protocol::send(&mut stream, &reply)?;
         stream.conn.send_close_notify();
@@ -540,37 +641,21 @@ impl Server {
             EvaluationStart::Snapshot(snapshot) => snapshot,
         };
         Data::from_bytes(&job.input)?;
-        let mut supplied = BTreeSet::new();
-        let code = load_code(job.program, false, |hash| {
-            if let Some(bytes) = store.executable(holder, hash)? {
-                return Ok(Some(bytes));
-            }
-            protocol::send(stream, &Reply::NeedProgram(hash))?;
-            let (bytes, _) = protocol::receive::<Option<Vec<u8>>>(stream)?;
-            if bytes.is_some() {
-                supplied.insert(hash);
-            }
-            Ok(bytes)
-        })?;
-        if supplied.is_empty() {
-            store.confirm(call)?;
-        } else {
-            store.cache_code(
-                call,
-                code.iter().filter(|(hash, _)| supplied.contains(hash)),
-            )?;
-        }
+        let code = receive_code(stream, store, call)?;
         stream.sock.check_active()?;
         let output = worker::run(
             &self.worker,
             Work {
                 program: job.program,
                 code,
-                state_hash: snapshot.revision.hash,
-                state: std::mem::take(&mut snapshot.bytes),
                 input: job.input,
+                context: WorkContext::Snapshot {
+                    hash: snapshot.revision.hash,
+                    bytes: std::mem::take(&mut snapshot.bytes),
+                },
             },
             || stream.sock.check_active(),
+            |_| Err(PeerError::Denied),
         )?;
         let result = Data::from_bytes(&output.value)?;
         stream.sock.check_active()?;
@@ -600,6 +685,36 @@ impl Server {
             metrics: Some(output.metrics),
         })
     }
+}
+
+fn receive_code(
+    stream: &mut StreamOwned<ServerConnection, Socket>,
+    store: &mut PeerStore,
+    call: Call,
+) -> Result<Vec<(Hash, Vec<u8>)>> {
+    let mut supplied = BTreeSet::new();
+    let code = load_code(call.program, false, |hash| {
+        stream.sock.check_active()?;
+        if let Some(bytes) = store.executable(call.holder, hash)? {
+            return Ok(Some(bytes));
+        }
+        protocol::send(stream, &Reply::NeedProgram(hash))?;
+        let (bytes, _) = protocol::receive::<Option<Vec<u8>>>(stream)?;
+        if bytes.is_some() {
+            supplied.insert(hash);
+        }
+        Ok(bytes)
+    })?;
+    stream.sock.check_active()?;
+    if supplied.is_empty() {
+        store.confirm(call)?;
+    } else {
+        store.cache_code(
+            call,
+            code.iter().filter(|(hash, _)| supplied.contains(hash)),
+        )?;
+    }
+    Ok(code)
 }
 
 struct Slot(Arc<AtomicUsize>);

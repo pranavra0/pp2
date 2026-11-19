@@ -532,3 +532,396 @@ fn real_peers_exchange_code_enforce_authority_and_recover_state() {
         Block::Data(Data::Int(12))
     );
 }
+
+#[test]
+fn indexed_effects_are_bounded_and_commit_with_their_receipt() {
+    use pp2::peer::{GraphBudget, GraphEvaluation};
+    use serde_json::json as j;
+
+    let temp = Temp::new();
+    certificates(&temp.0);
+    let db = temp.0.join("collection.db");
+    let mut store = PeerStore::open(&db).unwrap();
+    store
+        .create_collection(
+            "stock",
+            (0..4_000).map(|i| Ok((format!("stock/{i:04}"), Data::Text("x".repeat(128))))),
+        )
+        .unwrap();
+    store
+        .create_collection("other", [Ok(("secret".into(), Data::Int(42)))])
+        .unwrap();
+    let program = pack(
+        &mut store,
+        r#"
+        export default async ({storage}, input) => {
+            if (input.task === 'update') {
+                await storage.put('stock/0000', null);
+                const wasPresent = await storage.delete('stock/0001');
+                if (input.abort) throw new Error('rollback');
+                return {wasPresent, entry: await storage.get('stock/0000')};
+            }
+            if (input.task === 'overflow') {
+                for (let i = 0; i < 129; i++) await storage.get('stock/0000');
+                return false;
+            }
+            return {
+                page: await storage.scan({prefix: 'stock/', after: input.after, limit: 2}),
+                secret: await storage.get('secret'),
+            };
+        };
+    "#,
+        BTreeSet::new(),
+    );
+    let holder = Credentials::fingerprint(temp.0.join("writer.pem")).unwrap();
+    let read = store
+        .issue("stock", holder, Access::Read, Some(program))
+        .unwrap();
+    let write = store
+        .issue("stock", holder, Access::Write, Some(program))
+        .unwrap();
+    let daemon = Daemon::launch(&temp.0, &db);
+    let client = client(&temp.0, &daemon, "writer");
+    let invoke = |grant, input, mode, packages| {
+        client.run_graph(
+            GraphEvaluation {
+                evaluation: Evaluation {
+                    grant,
+                    program,
+                    mode,
+                    input: &json(input),
+                    packages,
+                },
+                bindings: &[],
+                budget: GraphBudget {
+                    timeout_ms: 3000,
+                    calls: 0,
+                    depth: 0,
+                },
+            },
+            None,
+        )
+    };
+    let first = invoke(read, j!({}), EvaluationMode::Read, Some(&store)).unwrap();
+    let first = peer::data_to_json(&first.value).unwrap();
+    assert_eq!(first["page"]["next"], "stock/0001");
+    assert_eq!(first["page"]["entries"][0][0], "stock/0000");
+    assert_eq!(first["secret"], j!({"found":false}));
+    let last = invoke(read, j!({"after":"stock/3997"}), EvaluationMode::Read, None).unwrap();
+    assert_eq!(
+        peer::data_to_json(&last.value).unwrap()["page"]["next"],
+        j!(null)
+    );
+
+    let update = EvaluationMode::Update {
+        expected_revision: 0,
+        operation: Hash([5; 32]),
+    };
+    assert!(matches!(
+        invoke(read, j!({"task":"update"}), update, None),
+        Err(PeerError::Denied)
+    ));
+    assert!(matches!(
+        invoke(write, j!({"task":"update","abort":true}), update, None),
+        Err(PeerError::Guest(message)) if message.contains("rollback")
+    ));
+    assert_eq!(store.reference("stock").unwrap().unwrap().number, 0);
+    let report = invoke(write, j!({"task":"update"}), update, None).unwrap();
+    assert_eq!(report.revision, 1);
+    assert_eq!(
+        report.value,
+        json(j!({"wasPresent":true,"entry":{"found":true,"value":null}}))
+    );
+    assert!(matches!(
+        invoke(write, j!({"task":"update","abort":true}), update, None),
+        Err(PeerError::Value(_))
+    ));
+    let changed = invoke(read, j!({}), EvaluationMode::Read, None).unwrap();
+    assert_eq!(
+        peer::data_to_json(&changed.value).unwrap()["page"]["entries"][1][0],
+        "stock/0002"
+    );
+    assert!(matches!(
+        invoke(read, j!({"task":"overflow"}), EvaluationMode::Read, None),
+        Err(PeerError::Value(_))
+    ));
+    drop(daemon);
+    store.collect().unwrap();
+    let daemon = Daemon::launch(&temp.0, &db);
+    let client = Client::new(daemon.1, "localhost", &credentials(&temp.0, "writer")).unwrap();
+    let receipt = client
+        .run_graph(
+            GraphEvaluation {
+                evaluation: Evaluation {
+                    grant: write,
+                    program,
+                    mode: update,
+                    input: &json(j!({"task":"update"})),
+                    packages: None,
+                },
+                bindings: &[],
+                budget: GraphBudget {
+                    timeout_ms: 1500,
+                    calls: 0,
+                    depth: 0,
+                },
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(receipt.revision, 1);
+    assert_eq!(receipt.value, report.value);
+    assert_eq!(receipt.graph.worker_busy_us, 0);
+}
+
+#[test]
+fn three_peers_enforce_delegation_budgets_and_cancel_a_descendant() {
+    use pp2::peer::{GraphBudget, GraphEvaluation};
+    use serde_json::json as j;
+
+    let temp = Temp::new();
+    let workspace = temp.0.join("deployment");
+    let manifest = temp.0.join("app.json");
+    fs::write(
+        &manifest,
+        j!({
+            "root": {"peer":"root", "collection":"stock", "module":"stock", "capabilities":{
+                "west":{"peer":"west","collection":"stock","module":"stock"},
+                "east":{"peer":"east","collection":"stock","module":"stock","write":true}
+            }},
+            "budget":{"timeout_ms":4000,"calls":2,"depth":2},
+            "modules":{"stock":{"source":"stock.mjs"}},
+            "peers":{
+                "root":{"collections":{"stock":null}},
+                "east":{"collections":{"stock":"east.ndjson"}},
+                "west":{"collections":{"stock":"west.ndjson"}}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(temp.0.join("east.ndjson"), "[\"stock\",7]\n").unwrap();
+    fs::write(temp.0.join("west.ndjson"), "[\"stock\",5]\n").unwrap();
+    fs::write(
+        temp.0.join("stock.mjs"),
+        r#"
+        export default async ({capabilities, storage, evaluate}, input) => {
+            const {east, west} = capabilities;
+            switch (input.task) {
+            case 'get':
+                return (await storage.get('stock')).value;
+            case 'nested':
+                return (await storage.get('stock')).value +
+                    (await evaluate(east, {task:'get'}, {calls: 0})).value;
+            case 'delegate':
+                return (await evaluate(west, {task:'nested'}, {
+                    calls: 1, delegate: input.share ? [east] : [],
+                })).value;
+            case 'forgery':
+                return await evaluate({}, {task:'get'}, {calls: 0});
+            case 'serialize':
+                return [east];
+            case 'write':
+                await storage.put('stock', input.value);
+                if (input.spin) while (true) {}
+                return (await storage.get('stock')).value;
+            case 'route-write':
+                try {
+                    return await evaluate(east, input.write, {
+                        calls: 0, update: {revision: input.revision, operation: input.operation},
+                        timeoutMs: input.timeout ?? null,
+                    });
+                } catch (err) {
+                    return {error: err.code};
+                }
+            default:
+                const results = await Promise.all([
+                    evaluate(west, {task:'get'}, {calls:0}),
+                    evaluate(east, {task:'get'}, {calls:0}),
+                ]);
+                return results[0].value + results[1].value;
+            }
+        };
+    "#,
+    )
+    .unwrap();
+    let binary = env!("CARGO_BIN_EXE_pp2");
+    let output = Command::new(binary)
+        .args(["app", "init"])
+        .arg(&manifest)
+        .arg(&workspace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let spawn = |name: &str, addresses| {
+        let mut child = Command::new(binary)
+            .args(["app", "__serve"])
+            .arg(workspace.join(name))
+            .arg(serde_json::to_string(&addresses).unwrap())
+            .arg(std::process::id().to_string())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        Daemon(child, line.trim().parse().unwrap())
+    };
+    let west = spawn("west", BTreeMap::<String, SocketAddr>::new());
+    let east = spawn("east", BTreeMap::new());
+    let root = spawn(
+        "root",
+        BTreeMap::from([("west".into(), west.1), ("east".into(), east.1)]),
+    );
+    let dir = workspace.join("client");
+    let creds = Credentials {
+        ca: dir.join("ca.pem"),
+        certificate: dir.join("peer.pem"),
+        key: dir.join("peer.key"),
+    };
+    let profile: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("profile.json")).unwrap()).unwrap();
+    let program: Hash = serde_json::from_value(profile["program"].clone()).unwrap();
+    let grant: Hash = serde_json::from_value(profile["grant"].clone()).unwrap();
+    let client = Client::new(root.1, "pp2-root", &creds).unwrap();
+    let bindings: Vec<String> = vec!["west".into(), "east".into()];
+    let request = |grant, input, calls, depth, cancellation: Option<Cancellation>| {
+        client.run_graph(
+            GraphEvaluation {
+                evaluation: Evaluation {
+                    grant,
+                    program,
+                    mode: EvaluationMode::Read,
+                    input: &json(input),
+                    packages: None,
+                },
+                bindings: &bindings,
+                budget: GraphBudget {
+                    timeout_ms: 4000,
+                    calls,
+                    depth,
+                },
+            },
+            cancellation.as_ref(),
+        )
+    };
+    let direct = request(grant, j!({}), 2, 1, None).unwrap();
+    assert_eq!(direct.value, Data::Int(12));
+    assert_eq!(direct.graph.remote_calls, 2);
+    assert_eq!(direct.graph.storage_effects, 2);
+    let delegated = request(grant, j!({"task":"delegate","share":true}), 2, 2, None).unwrap();
+    assert_eq!(delegated.value, direct.value);
+    assert_eq!(delegated.graph.remote_calls, 2);
+    assert!(delegated.graph.remote_request_bytes < direct.graph.remote_request_bytes);
+    for (input, calls, depth) in [
+        (j!({"task":"delegate","share":false}), 2, 2),
+        (j!({"task":"delegate","share":true}), 2, 1),
+        (j!({"task":"delegate","share":true}), 1, 2),
+        (j!({"task":"forgery"}), 2, 2),
+        (j!({"task":"serialize"}), 2, 2),
+    ] {
+        assert!(matches!(
+            request(grant, input, calls, depth, None),
+            Err(PeerError::Guest(_))
+        ));
+    }
+    let alternate = PeerStore::open(workspace.join("root/peer.db"))
+        .unwrap()
+        .issue(
+            "stock",
+            Credentials::fingerprint(&creds.certificate).unwrap(),
+            Access::Read,
+            Some(program),
+        )
+        .unwrap();
+    assert!(matches!(
+        request(alternate, j!({}), 2, 2, None),
+        Err(PeerError::Denied)
+    ));
+
+    let operation = Hash([9; 32]).to_string();
+    let spin = j!({"task":"route-write","write":{"task":"write","value":99,"spin":true},
+                   "revision":0,"operation":operation});
+    let east_db = workspace.join("east/peer.db");
+    let probe = rusqlite::Connection::open(&east_db).unwrap();
+    probe.busy_timeout(Duration::ZERO).unwrap();
+    let lock = || {
+        if probe.execute_batch("BEGIN IMMEDIATE").is_err() {
+            return false;
+        }
+        probe.execute_batch("ROLLBACK").unwrap();
+        true
+    };
+    thread::scope(|scope| {
+        let cancel = Cancellation::default();
+        let cancelled = cancel.clone();
+        let spin = spin.clone();
+        let request = &request;
+        let running = scope.spawn(move || request(grant, spin, 1, 1, Some(cancelled)));
+        let started = Instant::now();
+        while lock() && started.elapsed() < Duration::from_secs(1) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!lock(), "the descendant never opened an update");
+        cancel.cancel();
+        assert!(matches!(running.join().unwrap(), Err(PeerError::Cancelled)));
+        let started = Instant::now();
+        while !lock() && started.elapsed() < Duration::from_secs(1) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(lock(), "cancellation did not reach the descendant");
+    });
+    let mut deadline = spin;
+    deadline["timeout"] = j!(100);
+    let timed = request(grant, deadline, 1, 1, None).unwrap();
+    assert_eq!(timed.value, json(j!({"error":"timeout"})));
+    let mut east_store = PeerStore::open(&east_db).unwrap();
+    assert_eq!(east_store.reference("stock").unwrap().unwrap().number, 0);
+    let write = j!({"task":"route-write","write":{"task":"write","value":8},
+                    "revision":0,"operation":operation});
+    let updated = request(grant, write.clone(), 1, 1, None).unwrap();
+    assert_eq!(updated.value, json(j!({"revision":1,"value":8})));
+    let replayed = request(grant, write, 1, 1, None).unwrap();
+    assert_eq!(replayed.value, updated.value);
+    let east_profile: serde_json::Value =
+        serde_json::from_slice(&fs::read(workspace.join("root/profile.json")).unwrap()).unwrap();
+    let east_grant =
+        serde_json::from_value(east_profile["routes"]["east"]["grant"].clone()).unwrap();
+    assert!(east_store.revoke(east_grant).unwrap());
+    assert!(matches!(
+        request(grant, j!({"task":"delegate","share":true}), 2, 2, None),
+        Err(PeerError::Guest(message)) if message.contains("denied")
+    ));
+}
+
+#[test]
+fn version_one_databases_keep_their_snapshot_references() {
+    let dir = Temp::new();
+    let database = dir.0.join("old.db");
+    let mut store = PeerStore::open(&database).unwrap();
+    let revision = store.create_ref("old", &Data::Int(71)).unwrap();
+    drop(store);
+    {
+        let old = rusqlite::Connection::open(&database).unwrap();
+        old.execute_batch("DROP TABLE entries; DROP TABLE collections; PRAGMA user_version = 1;")
+            .unwrap();
+    }
+    let mut store = PeerStore::open(&database).unwrap();
+    assert_eq!(
+        store.read_ref("old").unwrap(),
+        Some((revision, Data::Int(71)))
+    );
+    store
+        .create_collection("new", [Ok(("counter".into(), Data::Int(5)))])
+        .unwrap();
+    assert!(store.read_ref("new").is_err());
+    assert_eq!(
+        store.read_ref("old").unwrap(),
+        Some((revision, Data::Int(71)))
+    );
+}

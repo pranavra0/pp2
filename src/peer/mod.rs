@@ -1,6 +1,7 @@
 //! Authenticated peer execution, durable references, and immutable content exchange.
 
 mod content;
+mod effects;
 mod protocol;
 mod storage;
 mod transport;
@@ -8,9 +9,11 @@ mod typescript;
 mod worker;
 
 pub use content::{JavaScript, data_from_json, data_to_json};
+pub use effects::{Binding, BindingSet, GraphBudget, GraphMetrics, validate_binding_names};
 pub use storage::{Access, PeerStore, RECEIPT_WINDOW, Revision};
 pub use transport::{
-    Cancellation, Client, Credentials, Evaluation, EvaluationMode, RemoteReport, Server,
+    Cancellation, Client, Credentials, Evaluation, EvaluationMode, GraphEvaluation, GraphReport,
+    RemoteReport, Server,
 };
 pub use typescript::compile_typescript;
 

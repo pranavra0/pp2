@@ -2,10 +2,11 @@ use std::{env, error::Error, fs::File, io::Read, process::ExitCode};
 
 use pp2::{Block, Cluster, Limits, LocalityPolicy, Program};
 
+mod app_cli;
 mod demo;
 mod peer_cli;
 
-const USAGE: &str = "Usage: pp2 peer <command>\n       pp2 demo [sandbox|placement|locality|gossip|gc]\n       pp2 eval <AEB1-program-file>";
+const USAGE: &str = "Usage: pp2 app <command>\n       pp2 peer <command>\n       pp2 demo [sandbox|placement|locality|gossip|gc]\n       pp2 eval <AEB1-program-file>";
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = env::args_os().skip(1).collect();
@@ -15,6 +16,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         [command, parent] if command == "__worker" => {
             pp2::peer::worker_main(parent.to_str().ok_or(USAGE)?.parse()?)?;
         }
+        [command, rest @ ..] if command == "app" => app_cli::run(rest)?,
         [command, rest @ ..] if command == "peer" => peer_cli::run(rest)?,
         [command] if command == "demo" => demo::run(None)?,
         [command, scenario] if command == "demo" => {

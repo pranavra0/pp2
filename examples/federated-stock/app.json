@@ -1,0 +1,21 @@
+{
+  "root": {
+    "peer": "office",
+    "collection": "settings",
+    "module": "stock",
+    "capabilities": {
+      "west": {"peer": "west", "collection": "stock", "module": "warehouse"},
+      "east": {"peer": "east", "collection": "stock", "module": "warehouse"}
+    }
+  },
+  "budget": {"timeout_ms": 4000, "calls": 2, "depth": 2},
+  "modules": {
+    "stock": {"source": "stock.mjs"},
+    "warehouse": {"source": "warehouse.mjs"}
+  },
+  "peers": {
+    "office": {"collections": {"settings": "office.ndjson"}},
+    "west": {"collections": {"stock": "west.ndjson"}},
+    "east": {"collections": {"stock": "east.ndjson"}}
+  }
+}

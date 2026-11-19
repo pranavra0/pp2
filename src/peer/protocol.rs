@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::Hash;
 
-use super::{Access, PeerError, Result};
+use super::{
+    Access, PeerError, Result,
+    effects::{GraphJob, GraphMetrics, Remote},
+};
 
 const MAGIC: &[u8; 4] = b"PPN1";
 const MAX_FRAME: usize = 1028 * 1024;
@@ -40,6 +43,9 @@ pub(super) enum Request {
         access: Access,
         program: Option<Hash>,
     },
+    Run(GraphJob),
+    // A child may request effects only through the live connection that invoked it.
+    Subprocess(GraphJob),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -53,6 +59,27 @@ pub(super) enum Reply {
     },
     Delegated(Hash),
     Failed(Failure),
+    Graph {
+        revision: u64,
+        value: Vec<u8>,
+        metrics: GraphMetrics,
+    },
+    Callback(Remote),
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) enum EffectReply {
+    Value(Vec<u8>),
+    Failed(Failure),
+}
+
+impl From<Result<Vec<u8>>> for EffectReply {
+    fn from(result: Result<Vec<u8>>) -> Self {
+        match result {
+            Ok(value) => Self::Value(value),
+            Err(error) => Self::Failed(error.into()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
