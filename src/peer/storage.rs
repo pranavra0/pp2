@@ -306,18 +306,25 @@ impl PeerStore {
 
     /// Makes one block available for fetch by authenticated peers and retains its graph.
     pub fn publish(&mut self, hash: Hash) -> Result<()> {
+        self.publish_all(&[hash])
+    }
+
+    /// Makes a set of immutable blocks available together, after validating each publication.
+    pub fn publish_all(&mut self, hashes: &[Hash]) -> Result<()> {
         let tx = self.0.transaction_with_behavior(Immediate)?;
-        require_graph(&tx, hash)?;
-        if content::inspect(
-            hash,
-            &get(&tx, hash, false)?.ok_or(PeerError::Missing(hash))?,
-        )?
-        .0 == Kind::Revision
-        {
-            return Err(PeerError::Denied);
+        for &hash in hashes {
+            require_graph(&tx, hash)?;
+            if content::inspect(
+                hash,
+                &get(&tx, hash, false)?.ok_or(PeerError::Missing(hash))?,
+            )?
+            .0 == Kind::Revision
+            {
+                return Err(PeerError::Denied);
+            }
+            replicas::prevent_private_publication(&tx, hash)?;
+            tx.execute("UPDATE blocks SET published=1 WHERE hash=?1", [&hash.0[..]])?;
         }
-        replicas::prevent_private_publication(&tx, hash)?;
-        tx.execute("UPDATE blocks SET published=1 WHERE hash=?1", [&hash.0[..]])?;
         tx.commit()?;
         Ok(())
     }

@@ -1,30 +1,32 @@
+import type { DirectoryGuest } from './directory.js';
+
 const prefix = 'document/';
 const maxDocuments = 32;
 const maxDirectories = 20;
 
-function words(text) {
+function words(text: string) {
     return (text.toLowerCase().match(/[a-z0-9]{1,64}/g) ?? []);
 }
 
-async function* documents(storage) {
-    let after = null;
+async function* documents(storage: DirectoryGuest['storage']) {
+    let after: string | null = null;
     do {
-        const page = await storage.scan({prefix, after, limit: maxDocuments});
+        const page: Awaited<ReturnType<typeof storage.scan>> = await storage.scan({prefix, after, limit: maxDocuments});
         yield* page.entries;
         after = page.next;
     } while (after !== null);
 }
 
-async function refresh({storage, resource, call}) {
+async function refresh({storage, resource, call}: DirectoryGuest) {
     const pending = [''];
-    const found = new Set();
+    const found = new Set<string>();
     let visited = 0;
     while (pending.length) {
-        const directory = pending.pop();
+        const directory = pending.pop()!;
         if (++visited > maxDirectories) throw new Error('Directory limit exceeded');
-        let after = null;
+        let after: string | null = null;
         do {
-            const page = await call(resource, 'list', {path: directory, after});
+            const page: {entries: [string, string][]; next: string | null} = await call(resource, 'list', {path: directory, after});
             for (const [name, kind] of page.entries) {
                 const path = directory ? directory + '/' + name : name;
                 if (kind === 'directory') {
@@ -48,7 +50,7 @@ async function refresh({storage, resource, call}) {
     return found.size;
 }
 
-export default async function index(guest, request) {
+export default async function index(guest: DirectoryGuest, request: {type: string; query?: string}) {
     const {storage} = guest;
     switch (request.type) {
         case 'status': {
@@ -63,6 +65,7 @@ export default async function index(guest, request) {
             const matches = [];
             if (terms.length) {
                 for await (const [key, tokens] of documents(storage)) {
+                    if (!Array.isArray(tokens)) throw new Error('Invalid index entry');
                     if (terms.every(term => tokens.includes(term))) matches.push(key.slice(prefix.length));
                 }
             }

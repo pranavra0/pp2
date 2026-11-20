@@ -49,7 +49,7 @@ struct PeerSpec {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ModuleSpec {
+pub(crate) struct ModuleSpec {
     source: PathBuf,
     #[serde(default)]
     imports: BTreeMap<String, String>,
@@ -402,7 +402,7 @@ fn init(path: &Path, directory: &Path, stable: bool) -> Result<()> {
     Ok(())
 }
 
-fn package(
+pub(crate) fn package(
     name: &str,
     modules: &BTreeMap<String, ModuleSpec>,
     source_dir: &Path,
@@ -436,7 +436,7 @@ fn package(
         if !aliases.is_empty() {
             return Err("application import aliases require TypeScript modules".into());
         }
-        fs::read_to_string(path)?
+        fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?
     };
     let bytes = JavaScript {
         source,

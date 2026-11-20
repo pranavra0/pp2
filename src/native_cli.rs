@@ -57,7 +57,7 @@ pub(crate) fn run(args: &[&str]) -> Result<()> {
             program,
             level,
         ] => {
-            share(
+            let binding = directory_grant(
                 workspace(home)?,
                 reference,
                 Path::new(directory),
@@ -65,6 +65,7 @@ pub(crate) fn run(args: &[&str]) -> Result<()> {
                 program.parse()?,
                 access(level)?,
             )?;
+            println!("{}", serde_json::to_string_pretty(&binding)?);
         }
         ["install", home, package, sources @ ..] => {
             let home = workspace(home)?;
@@ -132,7 +133,7 @@ pub(crate) fn run(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn workspace(home: &str) -> Result<&Path> {
+pub(crate) fn workspace(home: &str) -> Result<&Path> {
     let path = Path::new(home);
     if !path.exists() {
         node_init(path)?;
@@ -140,11 +141,11 @@ fn workspace(home: &str) -> Result<&Path> {
     Ok(path)
 }
 
-fn open(home: &Path) -> Result<PeerStore> {
+pub(crate) fn open(home: &Path) -> Result<PeerStore> {
     Ok(PeerStore::open(home.join("peer.db"))?)
 }
 
-fn server(home: &Path) -> Result<Server> {
+pub(crate) fn server(home: &Path) -> Result<Server> {
     Ok(Server::new_discovered(
         home.join("peer.db"),
         std::env::current_exe()?,
@@ -177,7 +178,7 @@ fn fetch(
     Ok((NativePackage::fetch(store, &clients, package)?, yes))
 }
 
-fn approve(
+pub(crate) fn approve(
     manifest: &NativePackage,
     package: &str,
     previous: Option<&NativePackage>,
@@ -228,36 +229,39 @@ fn bind(home: &str, id: Hash, name: &str, binding: Option<Binding>) -> Result<()
 }
 
 #[cfg(target_os = "linux")]
-fn share(
+pub(crate) fn directory_grant(
     home: &Path,
     reference: &str,
     directory: &Path,
     holder: Hash,
     program: Hash,
     access: Access,
-) -> Result<()> {
+) -> Result<Binding> {
     let peer = network(home)?.id();
     let resource = pp2::peer::Directory::resource(directory)?;
     let grant = open(home)?.share_host_resource(reference, resource, holder, program, access)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&Binding {
-            peer,
-            grant,
-            program,
-            access
-        })?
-    );
     eprintln!("Directory grant {grant}");
-    Ok(())
+    Ok(Binding {
+        peer,
+        grant,
+        program,
+        access,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn share(_: &Path, _: &str, _: &Path, _: Hash, _: Hash, _: Access) -> Result<()> {
+pub(crate) fn directory_grant(
+    _: &Path,
+    _: &str,
+    _: &Path,
+    _: Hash,
+    _: Hash,
+    _: Access,
+) -> Result<Binding> {
     Err("directory grants require Linux".into())
 }
 
-fn shell(server: &Server, id: Hash, first: Option<&str>, metrics: bool) -> Result<()> {
+pub(crate) fn shell(server: &Server, id: Hash, first: Option<&str>, metrics: bool) -> Result<()> {
     let event = |line: &str| -> Result<()> {
         let (result, report) = server.run_native(id, line)?;
         for line in result.lines {

@@ -6,7 +6,7 @@ A peer accepts one operation per mutually authenticated TLS 1.3 connection. It l
 
 A snapshot read runs against one immutable state block. The peer rechecks authorization before releasing a result. A snapshot update uses an expected revision and returns exactly {next, value}. The peer checks the revision and grants inside the committing transaction, then saves the next content block, the reference advance, and a receipt together. Reads see the revision they started with. Authoritative updates have a total order at the owning peer. [Replicated resources](#replicated-resources) can also declare a multi-writer history.
 
-Use the same grant, program, input, expected revision, and operation ID when retrying an ambiguous update. A recent match replays the receipt. Reusing an ID with different arguments while its receipt is retained produces an error. Receipts are retained for 1,024 revisions while the grant remains live. When the revision has advanced past that window, a conflict can establish that the retry did not apply now. The client must reconcile older outcomes through application state. The original `peer delegate` creates a distinct grant on each success. The graph attenuation operation described below replays the same live grant for an identical request.
+Use the same grant, program, input, expected revision, and operation ID when retrying an ambiguous update. A recent match replays the receipt. Reusing an ID with different arguments while its receipt is retained produces an error. Receipts are retained for 1,024 revisions while the grant remains live. When the revision has advanced past that window, a conflict can establish that the retry did not apply now. The client must reconcile older outcomes through application state. The `peer delegate` command creates a distinct grant on each success. The graph attenuation operation described below replays the same live grant for an identical request.
 
 The caller chooses the entry peer. The client reports elapsed time and application bytes in both directions, including code negotiation. Rust callers can use `Cancellation` to close a synchronous evaluation. Its worker stops when the request connection closes or the daemon exits. Cancellation can race a commit, so recovery uses the same update receipt mechanism.
 
@@ -75,6 +75,8 @@ The Linux directory provider opens the selected root without following symlinks 
 - `readText({path, limit})` returns a whole UTF-8 file up to 16 KiB and fails if it exceeds the requested limit.
 
 ## Native application lifecycle
+
+The source project maps named modules to files and capability requests to module names. Installation compiles these modules and resolves their content addresses before package review. Publishing exposes the selected immutable package and its program dependencies together in one transaction.
 
 A `PPA1` block names a JavaScript entry point, graph budget, and remote capability requests. Its content address covers the full manifest and its Merkle edges retain the entry, requested programs, and their imports. A workspace resolves modules from its cache or explicitly selected, authenticated code peers. Existing peer discovery locates the selected identities. The application needs neither their addresses nor a deployment graph.
 

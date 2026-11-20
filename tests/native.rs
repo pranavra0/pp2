@@ -126,7 +126,11 @@ fn installs_updates_searches_and_revokes_over_discovery() {
     };
     let app_source = include_str!("../examples/native-documents/app.mjs");
     let indexer = pack_program(
-        include_str!("../examples/native-documents/index.mjs"),
+        &pp2::peer::compile_typescript(
+            Path::new("examples/native-documents/index.ts"),
+            &Default::default(),
+        )
+        .unwrap(),
         "index",
     );
     let first_app = pack_program(app_source, "app");

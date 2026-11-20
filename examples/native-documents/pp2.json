@@ -1,0 +1,16 @@
+{
+  "name": "Document search",
+  "entry": "terminal",
+  "modules": {
+    "terminal": {"source": "app.mjs"},
+    "index": {"source": "index.ts"}
+  },
+  "budget": {"timeout_ms": 6000, "calls": 4, "depth": 1},
+  "bindings": {
+    "documents": {
+      "description": "Read text files and update the search index on their owner",
+      "program": "index",
+      "access": "Write"
+    }
+  }
+}
