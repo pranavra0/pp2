@@ -49,7 +49,7 @@ function emit(ts, program, entry) {
     return output;
 }
 
-function imports(ts, entry, source, link, literalOnly) {
+function imports(ts, entry, source, link) {
     const file = ts.createSourceFile(entry, source, ts.ScriptTarget.ES2022, true, ts.ScriptKind.JS);
     if (file.parseDiagnostics.length) {
         throw new Error(entry + ": " + ts.flattenDiagnosticMessageText(file.parseDiagnostics[0].messageText, "\n"));
@@ -61,7 +61,7 @@ function imports(ts, entry, source, link, literalOnly) {
             specifier = node.moduleSpecifier;
         } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
             specifier = node.arguments[0];
-            if (literalOnly && (!specifier || !ts.isStringLiteralLike(specifier))) {
+            if (!specifier || !ts.isStringLiteralLike(specifier)) {
                 throw new Error(entry + ": expected a literal dynamic import");
             }
         }
@@ -75,22 +75,6 @@ function imports(ts, entry, source, link, literalOnly) {
     }
     visit(file);
     return edits;
-}
-
-function compile(ts, entry, aliases) {
-    const program = ts.createProgram([entry], options(ts));
-    check(ts, ts.getPreEmitDiagnostics(program));
-    let output = emit(ts, program, entry);
-    const edits = imports(ts, entry, output, specifier => {
-        if (aliases.has(specifier)) return aliases.get(specifier);
-        if (!/^pp2:[a-f0-9]{64}$/.test(specifier)) {
-            throw new Error("link runtime import " + JSON.stringify(specifier) + " with SPECIFIER=HASH");
-        }
-    }, false);
-    for (const { start, end, linked } of edits.reverse()) {
-        output = output.slice(0, start) + JSON.stringify(linked) + output.slice(end);
-    }
-    return output;
 }
 
 function graph(ts, entry) {
@@ -130,7 +114,7 @@ function graph(ts, entry) {
                 }
             }
             throw new Error(filename + ": expected a relative JavaScript or TypeScript import, got " + JSON.stringify(specifier));
-        }, true);
+        });
         const parts = [];
         let end = 0;
         for (const edit of edits) {
@@ -150,8 +134,7 @@ function graph(ts, entry) {
 try {
     const entry = path.resolve(process.argv[1]);
     const ts = compiler(entry);
-    const mode = process.argv[2];
-    process.stdout.write(mode === "graph" ? graph(ts, entry) : compile(ts, entry, new Map(Object.entries(JSON.parse(mode)))));
+    process.stdout.write(graph(ts, entry));
 } catch (error) {
     process.stderr.write(error.message + "\n");
     process.exitCode = 1;

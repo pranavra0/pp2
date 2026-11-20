@@ -1,34 +1,12 @@
 //! Author-side compilation. Peers receive ordinary content-addressed ECMAScript modules.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io,
-    path::Path,
-    process::Command,
-};
+use std::{collections::BTreeSet, io, path::Path, process::Command};
 
 use serde::Deserialize;
 
-use crate::{Block, Hash};
+use crate::Hash;
 
 use super::{JavaScript, PeerError, Result, content};
-
-/// Strictly type-checks one TypeScript module and emits ES2022 for packaging.
-/// Relative runtime imports can be linked to existing pp2 blocks using exact specifier aliases.
-/// Dependencies used solely for types are read during compilation and erased from the output.
-/// Requires Node.js and the TypeScript package in the source or working directory's module tree.
-pub fn compile_typescript(source: &Path, aliases: &BTreeMap<String, Hash>) -> Result<String> {
-    let aliases: BTreeMap<_, _> = aliases
-        .iter()
-        .map(|(specifier, hash)| (specifier, format!("pp2:{hash}")))
-        .collect();
-    let aliases = serde_json::to_string(&aliases).expect("string map is JSON serializable");
-    let bytes = compile(source, &aliases)?;
-    if bytes.len() > Block::MAX_BYTES {
-        return Err(PeerError::Limit("compiled module bytes"));
-    }
-    String::from_utf8(bytes).map_err(|err| PeerError::TypeScript(err.to_string()))
-}
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -39,9 +17,9 @@ enum Part {
 
 /// Links a relative ESM source graph into pp2 blocks, with the entry block last.
 pub fn package_source(source: &Path) -> Result<Vec<(Hash, Vec<u8>)>> {
-    let output = compile(source, "graph")?;
+    let output = compile(source)?;
     let modules: Vec<Vec<Part>> =
-        serde_json::from_slice(&output).map_err(|err| PeerError::TypeScript(err.to_string()))?;
+        serde_json::from_slice(&output).map_err(|err| PeerError::Value(err.to_string()))?;
     if modules.is_empty() || modules.len() > content::MAX_MODULES {
         return Err(PeerError::Limit("module graph count"));
     }
@@ -56,7 +34,7 @@ pub fn package_source(source: &Path) -> Result<Vec<(Hash, Vec<u8>)>> {
                 Part::Dependency(index) => {
                     let &(hash, _) = blocks
                         .get(index)
-                        .ok_or_else(|| PeerError::TypeScript("invalid module dependency".into()))?;
+                        .ok_or_else(|| PeerError::Value("invalid module dependency".into()))?;
                     imports.insert(hash);
                     source.push_str(&format!("\"pp2:{hash}\""));
                 }
@@ -71,7 +49,7 @@ pub fn package_source(source: &Path) -> Result<Vec<(Hash, Vec<u8>)>> {
     Ok(blocks)
 }
 
-fn compile(source: &Path, mode: &str) -> Result<Vec<u8>> {
+fn compile(source: &Path) -> Result<Vec<u8>> {
     let output = Command::new("node")
         .args([
             "--input-type=commonjs",
@@ -80,11 +58,10 @@ fn compile(source: &Path, mode: &str) -> Result<Vec<u8>> {
             "--",
         ])
         .arg(source)
-        .arg(mode)
         .output()
         .map_err(|err| {
             if err.kind() == io::ErrorKind::NotFound {
-                PeerError::TypeScript(
+                PeerError::Value(
                     "install Node.js and run npm ci to enable TypeScript packaging".into(),
                 )
             } else {
@@ -93,7 +70,7 @@ fn compile(source: &Path, mode: &str) -> Result<Vec<u8>> {
         })?;
 
     if !output.status.success() {
-        return Err(PeerError::TypeScript(
+        return Err(PeerError::Value(
             String::from_utf8_lossy(&output.stderr).trim_end().into(),
         ));
     }

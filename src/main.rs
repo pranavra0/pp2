@@ -1,102 +1,78 @@
-use std::{env, error::Error, fs::File, io::Read, process::ExitCode};
+use pp2::{
+    Hash,
+    peer::{Options, Peer, PeerError, Result, serve_rendezvous, worker_main},
+};
+use std::{
+    env,
+    net::TcpListener,
+    path::{Path, PathBuf},
+};
 
-use pp2::{Block, Cluster, Limits, LocalityPolicy, Program};
+const USAGE: &str = "usage: pp2 init | serve ADDRESS | rendezvous ADDRESS | create RESOURCE JSON | pack FILE | grant RESOURCE HOLDER PROGRAM read|write | revoke CAPABILITY | eval FILE_OR_HASH [OPTIONS_JSON] | pin FILE_OR_HASH [OPTIONS_JSON]";
 
-mod app_cli;
-mod demo;
-mod native_cli;
-mod peer_cli;
-mod project_cli;
-mod replica_cli;
-
-const USAGE: &str = "pp2 — Write programs, not servers.
-
-  pp2 new DIRECTORY                   Create a document search project
-  pp2 install PROJECT                 Review and install from source
-  pp2 grant NAME DIRECTORY [HOLDER]   Connect a directory locally or issue a peer grant
-  pp2 run [LINE]                      Open the app or send one line
-  pp2 update PROJECT                  Review changes and keep installation state
-  pp2 list                            List installed applications
-  pp2 status                          Inspect the selected app and its grants
-  pp2 pack SOURCE [--publish]         Package a JavaScript or TypeScript source graph
-  pp2 eval SOURCE_OR_HASH [JSON]       Evaluate a program with no capabilities
-  pp2 eval --at GRANT SOURCE_OR_HASH [JSON]
-                                      Evaluate at the peer issuing the resource grant
-  pp2 eval --replica GRANT SOURCE_OR_HASH [JSON]
-                                      Prefer an approved local replica
-
-Across machines
-  pp2 publish                         Publish selected app code and print PACKAGE@PEER
-  pp2 install --from PACKAGE@PEER      Fetch and review a published app
-  pp2 update --from PACKAGE@PEER       Review a published update
-  pp2 identity                        Print this machine's peer ID
-  pp2 host [BIND]                     Serve resources (default: an available TCP port)
-  pp2 connect NAME GRANT_FILE         Attach a grant from the resource owner
-  pp2 revoke GRANT_ID                 Withdraw a grant issued here
-
-Set PP2_HOME to select a workspace (default: ~/.pp2).
-Set PP2_APP to an installation ID when more than one app is installed.
-
-Administration and runtime tools
-  pp2 app --help       Package and deployment operations
-  pp2 peer --help      Storage, networking and authority
-  pp2 demo             Run a runtime demonstration
-  pp2 eval-binary FILE Evaluate a binary program";
-
-fn run() -> Result<(), Box<dyn Error>> {
-    let args: Vec<_> = env::args_os().skip(1).collect();
-    match args.as_slice() {
-        [] => println!("{USAGE}"),
-        [flag] if flag == "--help" || flag == "-h" => println!("{USAGE}"),
-        [command, parent] if command == "__worker" => {
-            pp2::peer::worker_main(parent.to_str().ok_or(USAGE)?.parse()?)?;
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("{e}");
+        std::process::exit(1)
+    }
+}
+fn run() -> Result<()> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let home = env::var_os("PP2_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ".pp2".into());
+    match *args.as_slice() {
+        ["__worker", parent] => {
+            return worker_main(
+                parent
+                    .parse()
+                    .map_err(|_| PeerError::Invalid("invalid parent"))?,
+            );
         }
-        [command, rest @ ..] if command == "app" => app_cli::run(rest)?,
-        [command, rest @ ..] if command == "peer" => peer_cli::run(rest)?,
-        [command] if command == "demo" => demo::run(None)?,
-        [command, scenario] if command == "demo" => {
-            let scenario = scenario.to_str().ok_or(USAGE)?;
-            demo::run(Some(scenario))?;
+        ["init"] => {
+            println!("{}", Peer::init(&home)?);
+            return Ok(());
         }
-        [command, path]
-            if command == "eval-binary"
-                || (command == "eval"
-                    && path.to_str().is_none_or(|path| {
-                        !matches!(path, "--help" | "-h") && path.parse::<pp2::Hash>().is_err()
-                    })
-                    && !std::path::Path::new(path)
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "ts" | "mts"))) =>
-        {
-            let mut bytes = Vec::new();
-            File::open(path)?
-                .take(Block::MAX_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)?;
-            let program = Program::from_bytes(&bytes)?;
-            let mut cluster = Cluster::new();
-            let node = cluster.add_node()?;
-            let hash = cluster.put(node, &Block::Program(program))?;
-            let report = cluster.run(
-                node,
-                hash,
-                &[],
-                Limits::default(),
-                LocalityPolicy::default(),
-            )?;
-            println!("{:?}", report.value);
+        ["rendezvous", addr] => {
+            let listener = TcpListener::bind(addr)?;
+            println!("{}", listener.local_addr()?);
+            return serve_rendezvous(listener, true);
         }
-        _ => project_cli::run(&args)?,
+        [] | ["--help"] => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        _ => {}
+    }
+    let peer = Peer::open(&home, &env::current_exe()?)?;
+    match *args.as_slice() {
+        ["serve", addr] => {
+            let listener = TcpListener::bind(addr)?;
+            println!("{}@{}", peer.id(), listener.local_addr()?);
+            peer.serve(listener)?
+        }
+        ["create", name, state] => peer.create(name, serde_json::from_str(state)?)?,
+        ["pack", file] => println!("{}", peer.pack(Path::new(file))?),
+        ["grant", name, holder, program, mode @ ("read" | "write")] => println!(
+            "{}",
+            peer.grant(name, holder.parse()?, program.parse()?, mode == "write")?
+        ),
+        ["revoke", cap] => peer.revoke(cap)?,
+        [cmd @ ("eval" | "pin"), program, ref rest @ ..] if rest.len() <= 1 => {
+            let options: Options = serde_json::from_str(rest.first().copied().unwrap_or("{}"))?;
+            let hash = match program.parse::<Hash>() {
+                Ok(hash) => hash,
+                Err(_) => peer.pack(Path::new(program))?,
+            };
+            let result = peer.evaluate(hash, options)?;
+            if cmd == "pin" {
+                println!("{}", serde_json::to_string(&peer.pin(result)?)?)
+            } else {
+                println!("{result}")
+            }
+        }
+        _ => return Err(PeerError::Invalid(USAGE)),
     }
     Ok(())
-}
-
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("{error}");
-            ExitCode::FAILURE
-        }
-    }
 }

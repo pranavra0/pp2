@@ -132,13 +132,6 @@ impl Directory {
                 .chain(entry.conflict.as_ref().map(|record| (*id, record)))
         })
     }
-
-    pub(super) fn entries(&self) -> impl Iterator<Item = (Hash, &Record, bool)> {
-        self.0
-            .iter()
-            .filter(|(_, entry)| entry.conflict.is_none())
-            .map(|(id, entry)| (*id, &entry.record, entry.local))
-    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 import {total} from './total.js';
 
-export default async function summarize(_: unknown, readings: number[]) {
+export default function summarize(state: {readings: number[]}, minimum: number) {
+    const readings = state.readings.filter(value => value >= minimum);
     return {count: readings.length, total: total(readings)};
 }

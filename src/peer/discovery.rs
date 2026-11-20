@@ -23,7 +23,7 @@ mod rendezvous;
 
 use directory::{Directory, Location, MAX_ENDPOINTS, Record, valid_endpoint};
 pub use identity::PeerIdentity;
-pub(super) use identity::{IDENTITY_ALPN, Proof, prove_transport, verify_transport};
+pub(super) use identity::{IDENTITY_ALPN, prove_transport, verify_transport};
 pub(super) use rendezvous::connect as connect_relay;
 pub use rendezvous::serve_rendezvous;
 
@@ -31,7 +31,6 @@ const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 73, 42);
 const PORT: u16 = 47342;
 const LAN_PACKET: usize = 512;
 const BEACON_INTERVAL: Duration = Duration::from_millis(400);
-const LAN_WAIT: Duration = Duration::from_millis(500);
 const RECORD_LIMIT: usize = 32;
 const RELAY_WORKERS: usize = 2;
 
@@ -309,31 +308,5 @@ impl PeerNetwork {
 
     pub(super) fn can_wait_for_lan(&self) -> bool {
         self.0.lan.lock().expect("LAN socket").is_some()
-    }
-
-    pub(super) fn candidates(&self, deadline: Instant, local_only: bool) -> Vec<Hash> {
-        if !local_only {
-            self.refresh_rendezvous(None, deadline);
-        }
-        let lan_until = deadline.min(Instant::now() + LAN_WAIT);
-        let own = self.id();
-        loop {
-            self.drain_lan();
-            let peers = {
-                let mut directory = self.0.directory.lock().expect("discovery directory");
-                directory.prune(unix_ms());
-                directory
-                    .entries()
-                    .filter(|(id, _, local)| {
-                        *id != own && (!local_only || *local) && self.check_identity(*id).is_ok()
-                    })
-                    .map(|(id, _, _)| id)
-                    .collect::<Vec<_>>()
-            };
-            if !local_only || Instant::now() >= lan_until || !self.can_wait_for_lan() {
-                return peers;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
     }
 }
