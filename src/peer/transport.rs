@@ -23,7 +23,7 @@ use crate::{Block, Data, Hash};
 
 pub use super::protocol::EvaluationMode;
 use super::{
-    Access, HostProvider, PeerError, PeerNetwork, PeerStore, Result,
+    Access, HostProvider, PeerError, PeerNetwork, PeerStore, ResourceView, Result,
     content::{self, MAX_MODULES, load_code},
     discovery::{IDENTITY_ALPN, Route, prove_transport, verify_transport},
     effects::{BindingSet, PeerEndpoint},
@@ -42,6 +42,7 @@ const MAX_CONNECTIONS: usize = 16;
 mod graph;
 mod jobs;
 mod packages;
+mod replicas;
 pub use graph::{GraphEvaluation, GraphReport};
 pub use jobs::{DurableEvaluation, JobStatus};
 use packages::ContentSources;
@@ -296,6 +297,7 @@ pub struct Evaluation<'a> {
 #[derive(Debug)]
 pub struct RemoteReport {
     pub revision: u64,
+    pub view: Option<ResourceView>,
     pub value: Data,
     pub elapsed_ms: u64,
     pub request_bytes: u64,
@@ -586,6 +588,22 @@ impl Client {
         loop {
             let (reply, bytes) = protocol::receive::<Reply>(&mut stream)?;
             received += bytes;
+            let (reply, view) = match reply {
+                Reply::ResourceEvaluation {
+                    revision,
+                    value,
+                    metrics,
+                    view,
+                } => (
+                    Reply::Evaluation {
+                        revision,
+                        value,
+                        metrics,
+                    },
+                    Some(view),
+                ),
+                reply => (reply, None),
+            };
             match reply {
                 Reply::NeedProgram(hash) => {
                     if requested.len() >= MAX_MODULES || !requested.insert(hash) {
@@ -609,6 +627,7 @@ impl Client {
                 } => {
                     return Ok(RemoteReport {
                         revision,
+                        view,
                         value: Data::from_bytes(&value)?,
                         elapsed_ms: protocol::elapsed_ms(started),
                         request_bytes: sent,
@@ -622,6 +641,27 @@ impl Client {
                 _ => return Err(unexpected_reply()),
             }
         }
+    }
+}
+
+fn evaluation_reply(
+    revision: u64,
+    value: Vec<u8>,
+    metrics: Option<protocol::Metrics>,
+    view: Option<ResourceView>,
+) -> Reply {
+    match view {
+        Some(view) => Reply::ResourceEvaluation {
+            revision,
+            value,
+            metrics,
+            view,
+        },
+        None => Reply::Evaluation {
+            revision,
+            value,
+            metrics,
+        },
     }
 }
 
@@ -748,6 +788,7 @@ impl Server {
             if let Some(network) = &server.network {
                 scope.spawn(|| network.maintain(bound, &stop));
                 network.spawn_relays(scope, &stop, &accept);
+                scope.spawn(|| server.synchronize_replicas(network, &stop));
             }
             scope.spawn(|| server.schedule_applications(&stop));
             for _ in 0..jobs::WORKERS {
@@ -860,11 +901,29 @@ impl Server {
                     self.submit_job(&mut stream, &mut store, holder, submission, true)
                 }
                 Request::JobStatus(id) => store
-                    .job_status(storage::JobKey { holder, id })
+                    .job_status(
+                        storage::JobKey { holder, id },
+                        self.network.as_ref().map(PeerNetwork::id),
+                    )
                     .map(Reply::Job),
                 Request::CancelJob(id) => store
-                    .cancel_job(storage::JobKey { holder, id })
+                    .cancel_job(
+                        storage::JobKey { holder, id },
+                        self.network.as_ref().map(PeerNetwork::id),
+                    )
                     .map(Reply::Job),
+                Request::Replica(request) => {
+                    let network = self.network.as_ref().ok_or(PeerError::Denied)?;
+                    match request.block {
+                        Some(hash) => store
+                            .serve_replica_block(self.identity, holder, &request, hash)
+                            .map(Reply::Block),
+                        None => store
+                            .offer_replica(network.identity(), holder, &request)
+                            .map(Box::new)
+                            .map(Reply::Replica),
+                    }
+                }
                 Request::LegacyRun | Request::LegacySubprocess => Err(unexpected_reply()),
             }
         })();
@@ -885,17 +944,18 @@ impl Server {
         if job.input.len() > Block::MAX_BYTES {
             return Err(PeerError::Limit("input bytes"));
         }
-        let update = match job.mode {
-            EvaluationMode::Read => None,
-            EvaluationMode::Update {
-                expected_revision,
-                operation,
-            } => Some(Update {
-                expected: expected_revision,
-                operation,
-                fingerprint: Hash::digest(&protocol::encode(&job)?),
-            }),
-        };
+        let update = job
+            .mode
+            .update()
+            .map(|(expected, operation, merge)| {
+                Ok::<_, PeerError>(Update {
+                    expected,
+                    operation,
+                    merge,
+                    fingerprint: Hash::digest(&protocol::encode(&job)?),
+                })
+            })
+            .transpose()?;
         let call = Call {
             holder,
             grant: job.grant,
@@ -903,14 +963,17 @@ impl Server {
             update,
             graph: None,
             reaction: false,
+            consistency: job.mode.consistency(),
+            executor: self.network.as_ref().map(PeerNetwork::id),
         };
         let mut snapshot = match store.begin(call)? {
             EvaluationStart::Replayed(receipt) => {
-                return Ok(Reply::Evaluation {
-                    revision: receipt.revision,
-                    value: receipt.value,
-                    metrics: None,
-                });
+                return Ok(evaluation_reply(
+                    receipt.revision,
+                    receipt.value,
+                    None,
+                    receipt.view,
+                ));
             }
             EvaluationStart::Snapshot(snapshot) => snapshot,
         };
@@ -924,8 +987,9 @@ impl Server {
                 code,
                 input: job.input,
                 context: WorkContext::Snapshot {
-                    hash: snapshot.revision.hash,
+                    hash: snapshot.hash,
                     bytes: std::mem::take(&mut snapshot.bytes),
+                    view: snapshot.view.clone(),
                 },
             },
             || stream.sock.check_active(),
@@ -933,7 +997,7 @@ impl Server {
         )?;
         let result = Data::from_bytes(&output.value)?;
         stream.sock.check_active()?;
-        let (revision, value) = if update.is_some() {
+        let (revision, value, view) = if update.is_some() {
             let Data::Record(mut result) = result else {
                 return Err(update_result_error());
             };
@@ -945,19 +1009,25 @@ impl Server {
             let receipt = store.commit(
                 call,
                 &snapshot,
+                self.network.as_ref().map(PeerNetwork::identity),
                 &Block::Data(next).to_bytes()?,
                 value.to_bytes()?,
             )?;
-            (receipt.revision, receipt.value)
+            (receipt.revision, receipt.value, receipt.view)
         } else {
-            store.confirm(call)?;
-            (snapshot.revision.number, output.value)
+            store.confirm(call, &snapshot.view)?;
+            (
+                snapshot.revision.number,
+                output.value,
+                snapshot.view.resource.is_some().then_some(snapshot.view),
+            )
         };
-        Ok(Reply::Evaluation {
+        Ok(evaluation_reply(
             revision,
             value,
-            metrics: Some(output.metrics),
-        })
+            Some(output.metrics),
+            view,
+        ))
     }
 
     fn receive_code(
@@ -994,7 +1064,7 @@ impl Server {
         })?;
         stream.sock.check_active()?;
         if supplied.is_empty() {
-            store.confirm(call)?;
+            store.confirm_access(call)?;
         } else {
             store.cache_code(
                 call,

@@ -69,6 +69,7 @@ pub(super) enum Kind {
     Aeb,
     JavaScript,
     Native,
+    Revision,
 }
 
 pub(super) fn inspect(expected: Hash, bytes: &[u8]) -> Result<(Kind, BTreeSet<Hash>)> {
@@ -87,6 +88,12 @@ pub(super) fn inspect(expected: Hash, bytes: &[u8]) -> Result<(Kind, BTreeSet<Ha
             Kind::Native,
             super::NativePackage::from_bytes(bytes)?.programs(),
         ));
+    }
+    if bytes.starts_with(super::replication::MAGIC) {
+        let revision = super::replication::Change::decode(bytes)?;
+        let mut links = BTreeSet::from([revision.body.root]);
+        links.extend(revision.body.parents);
+        return Ok((Kind::Revision, links));
     }
     let (kind, links) = wire::inspect_block(bytes)?;
     Ok((

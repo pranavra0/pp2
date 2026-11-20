@@ -23,7 +23,7 @@ mod rendezvous;
 
 use directory::{Directory, Location, MAX_ENDPOINTS, Record, valid_endpoint};
 pub use identity::PeerIdentity;
-pub(super) use identity::{IDENTITY_ALPN, prove_transport, verify_transport};
+pub(super) use identity::{IDENTITY_ALPN, Proof, prove_transport, verify_transport};
 pub use rendezvous::serve_rendezvous;
 
 const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 73, 42);

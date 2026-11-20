@@ -1,4 +1,4 @@
-use std::{path::Path, time::Duration};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior::Immediate, params,
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Block, Data, Hash};
 
 use super::{
-    HostResource, PeerError, Result,
+    Consistency, HostResource, PeerError, PeerIdentity, ResourceView, Result,
     content::{self, Kind},
     effects::{Effect, GraphBudget, GraphMetrics, MAX_EFFECT_BYTES, Scan},
     protocol::{self, Forward, JobState},
@@ -18,6 +18,7 @@ use super::{
 mod applications;
 mod jobs;
 mod native;
+mod replicas;
 pub use applications::{
     ApplicationSpec, ApplicationState, ApplicationStatus, DeliveryOutcome, DeliveryStatus,
     SubscriptionSpec, SubscriptionState, SubscriptionStatus,
@@ -113,7 +114,9 @@ pub struct Revision {
 pub(super) struct Snapshot {
     pub(super) reference: String,
     pub(super) revision: Revision,
+    pub(super) hash: Hash,
     pub(super) bytes: Vec<u8>,
+    pub(super) view: ResourceView,
 }
 
 pub(super) struct Authority {
@@ -140,6 +143,8 @@ pub(super) struct Call {
     pub(super) update: Option<Update>,
     pub(super) graph: Option<GraphAccess>,
     pub(super) reaction: bool,
+    pub(super) consistency: Consistency,
+    pub(super) executor: Option<Hash>,
 }
 
 #[derive(Clone, Copy)]
@@ -147,11 +152,14 @@ pub(super) struct Update {
     pub(super) expected: u64,
     pub(super) operation: Hash,
     pub(super) fingerprint: Hash,
+    pub(super) merge: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct Receipt {
     pub(super) revision: u64,
     pub(super) value: Vec<u8>,
+    pub(super) view: Option<ResourceView>,
 }
 
 pub(super) enum EvaluationStart {
@@ -191,7 +199,7 @@ impl PeerStore {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // Bound the main database. Short transactions keep WAL readers from pinning old pages.
         conn.pragma_update(None, "max_page_count", 65_536)?;
-        if version < 5 {
+        if version < 6 {
             let tx = conn.transaction_with_behavior(Immediate)?;
             let version = database_version(&tx)?;
             if version == 0 {
@@ -208,6 +216,9 @@ impl PeerStore {
             }
             if version < 5 {
                 tx.execute_batch(native::SCHEMA)?;
+            }
+            if version < 6 {
+                tx.execute_batch(replicas::SCHEMA)?;
             }
             tx.commit()?;
         }
@@ -291,6 +302,15 @@ impl PeerStore {
     pub fn publish(&mut self, hash: Hash) -> Result<()> {
         let tx = self.0.transaction_with_behavior(Immediate)?;
         require_graph(&tx, hash)?;
+        if content::inspect(
+            hash,
+            &get(&tx, hash, false)?.ok_or(PeerError::Missing(hash))?,
+        )?
+        .0 == Kind::Revision
+        {
+            return Err(PeerError::Denied);
+        }
+        replicas::prevent_private_publication(&tx, hash)?;
         tx.execute("UPDATE blocks SET published=1 WHERE hash=?1", [&hash.0[..]])?;
         tx.commit()?;
         Ok(())
@@ -311,6 +331,7 @@ impl PeerStore {
         let tx = self.0.transaction_with_behavior(Immediate)?;
         insert(&tx, hash, &bytes)?;
         require_graph(&tx, hash)?;
+        replicas::can_replace_locally(&tx, name)?;
         let added = tx.execute(
             "INSERT INTO refs VALUES (?1, 0, ?2) ON CONFLICT(name) DO NOTHING",
             params![name, &hash.0[..]],
@@ -352,6 +373,7 @@ impl PeerStore {
         let current =
             revision(&tx, name)?.ok_or_else(|| PeerError::NoReference(name.to_owned()))?;
         require_kind(&tx, name, false)?;
+        replicas::can_replace_locally(&tx, name)?;
         if current.number != expected {
             return Err(PeerError::Conflict(current.number));
         }
@@ -393,6 +415,7 @@ impl PeerStore {
         if reaction_writer {
             require_kind(&tx, reference, true)?;
         }
+        replicas::authorize_view(&tx, reference, holder, program, access)?;
         prune_graph_grants(&tx, unix_ms())?;
         let id = insert_grant(
             &tx,
@@ -432,6 +455,7 @@ impl PeerStore {
     ) -> Result<Hash> {
         let tx = self.0.transaction_with_behavior(Immediate)?;
         let mut scope = authority(&tx, caller, grant)?;
+        replicas::can_delegate(&tx, &scope.reference)?;
         if access > scope.access || scope.depth >= MAX_DELEGATION_DEPTH || scope.graph.is_some() {
             return Err(PeerError::Denied);
         }
@@ -459,6 +483,7 @@ impl PeerStore {
         }
         let tx = self.0.transaction_with_behavior(Immediate)?;
         let mut scope = authority(&tx, caller, forwarded.grant)?;
+        replicas::can_delegate(&tx, &scope.reference)?;
         require_kind(&tx, &scope.reference, true)?;
         if forwarded.access > scope.access
             || scope
@@ -516,6 +541,7 @@ impl PeerStore {
         let tx = self.0.transaction()?;
         let scope = authorize(&tx, call)?;
         require_kind(&tx, &scope.reference, false)?;
+        let (view, root) = replicas::view(&tx, &scope.reference, call)?;
         if let Some(update) = call.update
             && let Some(receipt) = replay(&tx, call.grant, update)?
         {
@@ -527,18 +553,29 @@ impl PeerStore {
         {
             return Err(PeerError::Conflict(revision.number));
         }
-        let bytes = get(&tx, revision.hash, false)?.ok_or(PeerError::Missing(revision.hash))?;
+        replicas::check_write(&view, call.update)?;
+        let hash = root.unwrap_or(revision.hash);
+        let bytes = get(&tx, hash, false)?.ok_or(PeerError::Missing(hash))?;
         let snapshot = Snapshot {
             reference: scope.reference,
             revision,
+            hash,
             bytes,
+            view,
         };
         tx.commit()?;
         Ok(EvaluationStart::Snapshot(snapshot))
     }
 
-    pub(super) fn confirm(&self, call: Call) -> Result<()> {
+    pub(super) fn confirm_access(&self, call: Call) -> Result<()> {
         authorize(&self.0, call)?;
+        Ok(())
+    }
+
+    pub(super) fn confirm(&self, call: Call, view: &ResourceView) -> Result<()> {
+        let tx = self.0.unchecked_transaction()?;
+        authorize(&tx, call)?;
+        replicas::validate_release(&tx, view)?;
         Ok(())
     }
 
@@ -546,6 +583,7 @@ impl PeerStore {
         &mut self,
         call: Call,
         snapshot: &Snapshot,
+        signer: Option<&PeerIdentity>,
         next: &[u8],
         value: Vec<u8>,
     ) -> Result<Receipt> {
@@ -562,20 +600,34 @@ impl PeerStore {
         if current != snapshot.revision {
             return Err(PeerError::Conflict(current.number));
         }
-        let revision = replace(&tx, &scope.reference, current, next)?;
-        save_receipt(
-            &tx,
-            call.grant,
-            &scope.reference,
-            update,
-            revision.number,
-            &value,
-        )?;
-        tx.commit()?;
-        Ok(Receipt {
+        let (view, _) = replicas::view(&tx, &scope.reference, call)?;
+        replicas::check_write(&view, call.update)?;
+        let revision = if view.resource.is_some() {
+            let hash = Hash::digest(next);
+            if insert(&tx, hash, next)? != Kind::Data {
+                return Err(PeerError::Denied);
+            }
+            require_graph(&tx, hash)?;
+            replicas::commit(&tx, &scope.reference, signer, call, Some(hash))?;
+            Revision {
+                hash,
+                number: current.number + 1,
+            }
+        } else {
+            replace(&tx, &scope.reference, current, next)?
+        };
+        let receipt = Receipt {
             revision: revision.number,
             value,
-        })
+            view: if view.resource.is_some() {
+                Some(replicas::view(&tx, &scope.reference, call)?.0)
+            } else {
+                None
+            },
+        };
+        save_receipt(&tx, call.grant, &scope.reference, update, &receipt)?;
+        tx.commit()?;
+        Ok(receipt)
     }
 
     /// Creates an indexed reference at revision zero and imports its initial entries atomically.
@@ -631,6 +683,7 @@ impl PeerStore {
         let tx = self.0.transaction()?;
         let scope = authorize(&tx, call)?;
         require_kind(&tx, &scope.reference, true)?;
+        let (view, _) = replicas::view(&tx, &scope.reference, call)?;
         if let Some(update) = call.update {
             if let Some(receipt) = replay(&tx, call.grant, update)? {
                 return Ok(Some(receipt));
@@ -639,6 +692,7 @@ impl PeerStore {
             if update.expected != current.number {
                 return Err(PeerError::Conflict(current.number));
             }
+            replicas::check_write(&view, call.update)?;
         }
         Ok(None)
     }
@@ -652,6 +706,7 @@ impl PeerStore {
         };
         let scope = authorize(&tx, call)?;
         require_kind(&tx, &scope.reference, true)?;
+        let (view, root) = replicas::view(&tx, &scope.reference, call)?;
         if let Some(update) = call.update
             && let Some(receipt) = replay(&tx, call.grant, update)?
         {
@@ -663,13 +718,22 @@ impl PeerStore {
         {
             return Err(PeerError::Conflict(revision.number));
         }
+        replicas::check_write(&view, call.update)?;
+        let historical = if matches!(view.consistency, Consistency::Revision(_)) {
+            Some(replicas::read_manifest(
+                &tx,
+                root.ok_or(PeerError::Denied)?,
+            )?)
+        } else {
+            None
+        };
         Ok(ScopedStart::Collection(Collection {
             tx,
             reference: scope.reference,
             revision: revision.number,
-            grant: call.grant,
-            update: call.update,
-            reaction: call.reaction,
+            call: Box::new(call),
+            view,
+            historical,
         }))
     }
 
@@ -683,12 +747,14 @@ impl PeerStore {
         Ok(self.0.execute(
             "WITH RECURSIVE live(hash) AS (
             SELECT hash FROM refs UNION SELECT hash FROM blocks WHERE published=1
+            UNION SELECT id FROM replica_versions
+            UNION SELECT tip FROM replica_pending
             UNION SELECT hash FROM job_blocks
             UNION SELECT package FROM native_installations
             UNION SELECT s.program FROM subscriptions s JOIN subscription_authority a USING(id)
                   WHERE s.expires>?1
             UNION SELECT edges.child FROM edges JOIN live ON edges.parent=live.hash
-        ) DELETE FROM blocks WHERE hash NOT IN (SELECT hash FROM live)",
+        ) DELETE FROM blocks WHERE NOT EXISTS(SELECT 1 FROM live WHERE live.hash=blocks.hash)",
             [unix_ms() as i64],
         )?)
     }
@@ -703,14 +769,18 @@ pub(super) struct Collection<'a> {
     tx: Transaction<'a>,
     reference: String,
     revision: u64,
-    grant: Hash,
-    update: Option<Update>,
-    reaction: bool,
+    call: Box<Call>,
+    view: ResourceView,
+    historical: Option<BTreeMap<String, Hash>>,
 }
 
 impl Collection<'_> {
     pub(super) fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub(super) fn view(&self) -> &ResourceView {
+        &self.view
     }
 
     pub(super) fn host_resource(&self) -> Result<Option<HostResource>> {
@@ -736,14 +806,20 @@ impl Collection<'_> {
         use serde_json::json;
         let result = match effect {
             Effect::Get(key) => {
-                let bytes: Option<Vec<u8>> = self
-                    .tx
-                    .query_row(
-                        "SELECT value FROM entries WHERE ref=?1 AND key=?2",
-                        params![self.reference, key.as_bytes()],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
+                let bytes: Option<Vec<u8>> = if let Some(entries) = &self.historical {
+                    entries
+                        .get(&key)
+                        .map(|hash| replicas::entry_block(&self.tx, *hash))
+                        .transpose()?
+                } else {
+                    self.tx
+                        .query_row(
+                            "SELECT value FROM entries WHERE ref=?1 AND key=?2",
+                            params![self.reference, key.as_bytes()],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                };
                 match bytes {
                     Some(bytes) => json!({"found": true, "value": entry_json(&bytes)?}),
                     None => json!({"found": false}),
@@ -751,7 +827,7 @@ impl Collection<'_> {
             }
             Effect::Scan(scan) => return self.scan(scan),
             Effect::Put(key, bytes) => {
-                self.update.ok_or(PeerError::Denied)?;
+                self.call.update.ok_or(PeerError::Denied)?;
                 check_entry(&key, &bytes)?;
                 self.tx.execute(
                     "INSERT INTO entries VALUES (?1, ?2, ?3)
@@ -761,7 +837,7 @@ impl Collection<'_> {
                 json!(null)
             }
             Effect::Delete(key) => {
-                self.update.ok_or(PeerError::Denied)?;
+                self.call.update.ok_or(PeerError::Denied)?;
                 let deleted = self.tx.execute(
                     "DELETE FROM entries WHERE ref=?1 AND key=?2",
                     params![self.reference, key.as_bytes()],
@@ -776,31 +852,53 @@ impl Collection<'_> {
     }
 
     fn scan(&self, scan: Scan) -> Result<Vec<u8>> {
+        let lower = scan.after.as_deref().unwrap_or(&scan.prefix);
+        if let Some(entries) = &self.historical {
+            let entries = entries
+                .range(lower.to_owned()..)
+                .take_while(|(key, _)| key.starts_with(&scan.prefix))
+                .map(|(key, hash)| Ok((key.clone(), replicas::entry_block(&self.tx, *hash)?)));
+            return Self::scan_rows(&scan, entries);
+        }
         // UTF-8 never contains 0xff. BLOB comparison gives a bounded prefix range on the index.
         let mut upper = scan.prefix.as_bytes().to_vec();
         upper.push(0xff);
-        let lower = scan.after.as_deref().unwrap_or(&scan.prefix).as_bytes();
         let mut stmt = self.tx.prepare_cached(
             "SELECT key, value FROM entries WHERE ref=?1 AND key>=?2 AND key<?3 ORDER BY key",
         )?;
-        let mut rows = stmt.query(params![self.reference, lower, upper])?;
+        let rows = stmt.query_map(params![self.reference, lower.as_bytes(), upper], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        Self::scan_rows(
+            &scan,
+            rows.map(|row| {
+                let (key, bytes) = row?;
+                let key =
+                    String::from_utf8(key).map_err(|err| PeerError::Value(err.to_string()))?;
+                Ok((key, bytes))
+            }),
+        )
+    }
+
+    fn scan_rows(
+        scan: &Scan,
+        rows: impl Iterator<Item = Result<(String, Vec<u8>)>>,
+    ) -> Result<Vec<u8>> {
         let mut entries = Vec::new();
         let mut last = None;
         let mut next = None;
         let mut bytes_left = Block::MAX_BYTES - 2048;
-        while let Some(row) = rows.next()? {
-            let key: Vec<u8> = row.get(0)?;
-            if scan.after.is_some() && key == lower {
+        for row in rows {
+            let (key, bytes) = row?;
+            if scan.after.as_ref() == Some(&key) {
                 continue;
             }
-            let bytes: Vec<u8> = row.get(1)?;
             let cost = bytes.len() + key.len() + 32;
             if entries.len() == usize::from(scan.limit) || cost > bytes_left {
                 next = last;
                 break;
             }
             bytes_left -= cost;
-            let key = String::from_utf8(key).map_err(|err| PeerError::Value(err.to_string()))?;
             entries.push(serde_json::json!([key, entry_json(&bytes)?]));
             last = Some(key);
         }
@@ -814,44 +912,36 @@ impl Collection<'_> {
         value: Vec<u8>,
         check: impl Fn() -> Result<()>,
         durable: Option<(JobKey, GraphMetrics)>,
+        signer: Option<&PeerIdentity>,
     ) -> Result<Receipt> {
-        let mut number = self.revision;
-        if let Some(update) = self.update {
-            number += 1;
+        let mut receipt = Receipt {
+            revision: self.revision,
+            value,
+            view: self.view.resource.is_some().then_some(self.view),
+        };
+        if let Some(update) = self.call.update {
+            receipt.revision += 1;
+            let number = receipt.revision;
             let revision =
                 i64::try_from(number).map_err(|_| PeerError::Limit("reference revisions"))?;
-            self.tx.execute(
-                "UPDATE refs SET revision=?1 WHERE name=?2",
-                params![revision, self.reference],
-            )?;
-            save_receipt(
-                &self.tx,
-                self.grant,
-                &self.reference,
-                update,
-                number,
-                &value,
-            )?;
+            if replicas::commit(&self.tx, &self.reference, signer, *self.call, None)? {
+                receipt.view = Some(replicas::view(&self.tx, &self.reference, *self.call)?.0);
+            } else {
+                self.tx.execute(
+                    "UPDATE refs SET revision=?1 WHERE name=?2",
+                    params![revision, self.reference],
+                )?;
+                applications::record_change(&self.tx, &self.reference, number, self.call.reaction)?;
+            }
+            save_receipt(&self.tx, self.call.grant, &self.reference, update, &receipt)?;
             if let Some((key, graph)) = durable {
                 jobs::check_running(&self.tx, key)?;
-                jobs::end(
-                    &self.tx,
-                    key,
-                    &JobState::Completed {
-                        revision: number,
-                        value: value.clone(),
-                        graph,
-                    },
-                )?;
+                jobs::end(&self.tx, key, &JobState::completed(receipt.clone(), graph))?;
             }
-            applications::record_change(&self.tx, &self.reference, number, self.reaction)?;
         }
         check()?;
         self.tx.commit()?;
-        Ok(Receipt {
-            revision: number,
-            value,
-        })
+        Ok(receipt)
     }
 }
 
@@ -874,6 +964,7 @@ fn register_resource(
     resource: HostResource,
     reuse: bool,
 ) -> Result<()> {
+    replicas::can_replace_locally(conn, name)?;
     super::effects::validate_binding_name(&resource.provider)?;
     let configuration = resource.configuration.to_bytes()?;
     if configuration.len() > MAX_EFFECT_BYTES {
@@ -900,6 +991,7 @@ fn create_collection(
     entries: impl IntoIterator<Item = Result<(String, Data)>>,
 ) -> Result<Revision> {
     check_name(name)?;
+    replicas::can_replace_locally(conn, name)?;
     let bytes = Block::Data(Data::Nil).to_bytes()?;
     let hash = Hash::digest(&bytes);
     insert(conn, hash, &bytes)?;
@@ -943,19 +1035,19 @@ fn save_receipt(
     grant: Hash,
     reference: &str,
     update: Update,
-    revision: u64,
-    value: &[u8],
+    receipt: &Receipt,
 ) -> Result<()> {
-    let number = revision as i64;
+    let number = receipt.revision as i64;
     conn.execute(
-        "INSERT INTO receipts VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO receipts VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             &grant.0[..],
             &update.operation.0[..],
             reference,
             &update.fingerprint.0[..],
             number,
-            value
+            receipt.value,
+            receipt.view.as_ref().map(protocol::encode).transpose()?,
         ],
     )?;
     conn.execute(
@@ -995,7 +1087,7 @@ fn database_version(conn: &Connection) -> Result<i64> {
     )?;
     match (application, version, entries) {
         (0, 0, 0) => Ok(0),
-        (APPLICATION_ID, 1..=5, _) => Ok(version),
+        (APPLICATION_ID, 1..=6, _) => Ok(version),
         (APPLICATION_ID, _, _) => Err(PeerError::Unsupported("peer database version")),
         _ => Err(PeerError::Unsupported(
             "expected a pp2 database or an empty file",
@@ -1171,27 +1263,48 @@ fn authorize(conn: &Connection, call: Call) -> Result<Authority> {
     {
         return Err(PeerError::Denied);
     }
+    replicas::authorize_executor(conn, &scope.reference, call.executor)?;
+    replicas::authorize_view(
+        conn,
+        &scope.reference,
+        call.holder,
+        Some(call.program),
+        if call.update.is_some() {
+            Access::Write
+        } else {
+            Access::Read
+        },
+    )?;
     Ok(scope)
 }
 
 fn replay(conn: &Connection, grant: Hash, update: Update) -> Result<Option<Receipt>> {
     let previous = conn
         .query_row(
-            "SELECT request, revision, value FROM receipts WHERE grant_id=?1 AND operation=?2",
+            "SELECT request, revision, value, view FROM receipts WHERE grant_id=?1 AND operation=?2",
             params![&grant.0[..], &update.operation.0[..]],
             |row| {
                 Ok((
                     Hash(row.get(0)?),
-                    Receipt {
-                        revision: row.get::<_, i64>(1)? as u64,
-                        value: row.get(2)?,
-                    },
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
                 ))
             },
         )
         .optional()?;
     match previous {
-        Some((hash, receipt)) if hash == update.fingerprint => Ok(Some(receipt)),
+        Some((hash, revision, value, view)) if hash == update.fingerprint => {
+            let view = view.as_deref().map(protocol::decode).transpose()?;
+            if let Some(view) = &view {
+                replicas::validate_release(conn, view)?;
+            }
+            Ok(Some(Receipt {
+                revision,
+                value,
+                view,
+            }))
+        }
         Some(_) => Err(PeerError::Value(
             "operation ID already used for a different request".into(),
         )),

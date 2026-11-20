@@ -7,7 +7,6 @@ use crate::peer::{
     effects::{
         BoundCapability, GraphBindings, GraphJob, MAX_JOB_LIFETIME_MS, validate_binding_names,
     },
-    protocol::EvaluationMode,
 };
 
 const MAX_EVENTS: i64 = 4096;
@@ -345,7 +344,7 @@ impl PeerStore {
         let candidates = {
             let mut query = tx.prepare(&format!(
                 "SELECT s.id, s.ref, s.entry_grant, s.program, s.budget, s.capabilities, s.expires,
-                        s.cursor, r.revision, EXISTS(SELECT 1 FROM subscription_authority WHERE id=s.id)
+                        s.cursor, r.revision, EXISTS(SELECT 1 FROM subscription_authority WHERE id=s.id), s.watch_grant
                  {CANDIDATES} ORDER BY s.scheduled, s.id"
             ))?;
             query
@@ -361,6 +360,7 @@ impl PeerStore {
                         cursor: row.get(7)?,
                         latest: row.get(8)?,
                         authorized: row.get(9)?,
+                        watch_grant: Hash(row.get(10)?),
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?
@@ -384,6 +384,7 @@ struct Candidate {
     cursor: i64,
     latest: i64,
     authorized: bool,
+    watch_grant: Hash,
 }
 
 impl Candidate {
@@ -393,6 +394,16 @@ impl Candidate {
         }
         if self.expires <= now {
             return retire(conn, self.id, EXPIRED, &JobState::Expired);
+        }
+        let entry = match subscription_grant(conn, holder, self.entry_grant, self.program) {
+            Ok(entry) => entry,
+            Err(PeerError::Denied) => return Ok(()), // A temporary lease expiry leaves the cursor intact.
+            Err(error) => return Err(error),
+        };
+        match subscription_grant(conn, holder, self.watch_grant, self.program) {
+            Ok(_) => {}
+            Err(PeerError::Denied) => return Ok(()),
+            Err(error) => return Err(error),
         }
         let event = conn
             .query_row(
@@ -445,7 +456,7 @@ impl Candidate {
         let graph = GraphJob {
             grant: self.entry_grant,
             program: self.program,
-            mode: EvaluationMode::Read,
+            mode: replicas::subscription_mode(conn, &entry.reference)?,
             input,
             budget: protocol::decode(&self.budget)?,
             expires_at_ms: (self.expires as u64).min(now as u64 + MAX_JOB_LIFETIME_MS),
@@ -506,15 +517,26 @@ pub(super) fn record_change(
 }
 
 pub(super) fn check_subscription(conn: &Connection, id: Hash) -> Result<()> {
-    if conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM subscription_authority WHERE id=?1)",
-        [&id.0[..]],
-        |row| row.get::<_, bool>(0),
-    )? {
-        Ok(())
-    } else {
-        Err(PeerError::Cancelled)
-    }
+    let (holder, program, watch, entry) = conn
+        .query_row(
+            "SELECT a.holder, s.program, s.watch_grant, s.entry_grant
+         FROM subscriptions s JOIN applications a ON a.name=s.application
+         JOIN subscription_authority active ON active.id=s.id WHERE s.id=?1",
+            [&id.0[..]],
+            |row| {
+                Ok((
+                    Hash(row.get(0)?),
+                    Hash(row.get(1)?),
+                    Hash(row.get(2)?),
+                    Hash(row.get(3)?),
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(PeerError::Cancelled)?;
+    subscription_grant(conn, holder, watch, program)?;
+    subscription_grant(conn, holder, entry, program)?;
+    Ok(())
 }
 
 pub(super) fn complete_delivery(conn: &Connection, key: JobKey, state: &JobState) -> Result<bool> {
@@ -530,7 +552,9 @@ pub(super) fn complete_delivery(conn: &Connection, key: JobKey, state: &JobState
         return Ok(false);
     };
     let (outcome, error) = match state {
-        JobState::Completed { .. } => (DeliveryOutcome::Completed, None),
+        JobState::Completed { .. } | JobState::ResourceCompleted { .. } => {
+            (DeliveryOutcome::Completed, None)
+        }
         JobState::Failed(error) => (
             DeliveryOutcome::Failed,
             Some(
@@ -582,6 +606,7 @@ fn subscription_grant(
     {
         return Err(PeerError::Denied);
     }
+    replicas::authorize_view(conn, &grant.reference, holder, Some(program), Access::Read)?;
     Ok(grant)
 }
 

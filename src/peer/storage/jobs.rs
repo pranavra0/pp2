@@ -63,8 +63,10 @@ impl PeerStore {
         &self,
         key: JobKey,
         request: Hash,
+        executor: Option<Hash>,
     ) -> Result<Option<JobState>> {
-        let Some((actual, state)) = job(&self.0, key)? else {
+        let tx = self.0.unchecked_transaction()?;
+        let Some((actual, state)) = job(&tx, key, executor)? else {
             return Ok(None);
         };
         if actual != request {
@@ -85,7 +87,7 @@ impl PeerStore {
         code: &[(Hash, Vec<u8>)],
     ) -> Result<JobState> {
         let tx = self.0.transaction_with_behavior(Immediate)?;
-        if let Some((actual, state)) = job(&tx, key)? {
+        if let Some((actual, state)) = job(&tx, key, call.executor)? {
             return if actual == request {
                 Ok(state)
             } else {
@@ -123,15 +125,24 @@ impl PeerStore {
         Ok(JobState::Pending)
     }
 
-    pub(in crate::peer) fn job_status(&self, key: JobKey) -> Result<JobState> {
-        job(&self.0, key)?
+    pub(in crate::peer) fn job_status(
+        &self,
+        key: JobKey,
+        executor: Option<Hash>,
+    ) -> Result<JobState> {
+        let tx = self.0.unchecked_transaction()?;
+        job(&tx, key, executor)?
             .map(|(_, state)| state)
             .ok_or(PeerError::Denied)
     }
 
-    pub(in crate::peer) fn cancel_job(&mut self, key: JobKey) -> Result<JobState> {
+    pub(in crate::peer) fn cancel_job(
+        &mut self,
+        key: JobKey,
+        executor: Option<Hash>,
+    ) -> Result<JobState> {
         let tx = self.0.transaction_with_behavior(Immediate)?;
-        let (_, state) = job(&tx, key)?.ok_or(PeerError::Denied)?;
+        let (_, state) = job(&tx, key, executor)?.ok_or(PeerError::Denied)?;
         let state = match state {
             JobState::Pending | JobState::Running => {
                 end(&tx, key, &JobState::Cancelled)?;
@@ -260,10 +271,16 @@ impl PeerStore {
                 )?;
             }
             JobOutcome::Finished(mut result) => {
-                if let Some(call) = call
-                    && let Err(error) = authorize(&tx, call)
-                {
-                    result = JobState::Failed(error.into());
+                if let Some(call) = call {
+                    let confirmed = authorize(&tx, call).and_then(|_| match &result {
+                        JobState::ResourceCompleted { view, .. } => {
+                            replicas::validate_release(&tx, view)
+                        }
+                        _ => Ok(()),
+                    });
+                    if let Err(error) = confirmed {
+                        result = JobState::Failed(error.into());
+                    }
                 }
                 end(&tx, key, &result)?;
             }
@@ -415,8 +432,9 @@ pub(super) fn enqueue(
     };
     conn.execute(
         "INSERT INTO jobs (holder, id, request, program, input, expires, ready, state, spec,
-                           reaction, subscription, event, event_revision, reaction_input)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)",
+                           reaction, subscription, event, event_revision, reaction_input, replica_grant)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13,
+            (SELECT grants.id FROM grants JOIN replicas USING(ref) WHERE grants.id=?14))",
         params![
             &key.holder.0[..],
             &key.id.0[..],
@@ -430,7 +448,8 @@ pub(super) fn enqueue(
             delivery.as_ref().map(|d| &d.subscription.0[..]),
             delivery.as_ref().map(|d| &d.event.0[..]),
             delivery.as_ref().map(|d| d.revision),
-            reaction.then_some(graph.input)
+            reaction.then_some(graph.input),
+            &graph.grant.0[..],
         ],
     )?;
     for hash in [Some(graph.program), (!reaction).then_some(input_hash)]
@@ -445,9 +464,9 @@ pub(super) fn enqueue(
     Ok(())
 }
 
-fn job(conn: &Connection, key: JobKey) -> Result<Option<(Hash, JobState)>> {
+fn job(conn: &Connection, key: JobKey, executor: Option<Hash>) -> Result<Option<(Hash, JobState)>> {
     conn.query_row(
-        "SELECT request, state, expires, result FROM jobs WHERE holder=?1 AND id=?2",
+        "SELECT request, state, expires, result, replica_grant, program FROM jobs WHERE holder=?1 AND id=?2",
         params![&key.holder.0[..], &key.id.0[..]],
         |row| {
             Ok((
@@ -455,11 +474,18 @@ fn job(conn: &Connection, key: JobKey) -> Result<Option<(Hash, JobState)>> {
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, Option<Vec<u8>>>(3)?,
+                row.get::<_, Option<[u8; 32]>>(4)?.map(Hash),
+                Hash(row.get(5)?),
             ))
         },
     )
     .optional()?
-    .map(|(request, state, expires, result)| {
+    .map(|(request, state, expires, result, grant, program)| {
+        if let Some(grant) = grant {
+            let scope = authority(conn, key.holder, grant)?;
+            replicas::authorize_executor(conn, &scope.reference, executor)?;
+            replicas::authorize_view(conn, &scope.reference, key.holder, Some(program), Access::Read)?;
+        }
         let state = match state {
             TERMINAL => protocol::decode(
                 &result.ok_or_else(|| PeerError::Value("missing job result".into()))?,
@@ -468,6 +494,9 @@ fn job(conn: &Connection, key: JobKey) -> Result<Option<(Hash, JobState)>> {
             PENDING => JobState::Pending,
             _ => JobState::Running,
         };
+        if let JobState::ResourceCompleted { view, .. } = &state {
+            replicas::validate_release(conn, view)?;
+        }
         Ok((request, state))
     })
     .transpose()

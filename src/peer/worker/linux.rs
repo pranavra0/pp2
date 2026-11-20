@@ -264,7 +264,7 @@ fn evaluate(mut work: Work) -> Result<Output> {
         return Err(PeerError::Limit("module graph"));
     }
     let waiting = Rc::new(Cell::new(Duration::ZERO));
-    if let WorkContext::Snapshot { hash, bytes } = &work.context
+    if let WorkContext::Snapshot { hash, bytes, .. } = &work.context
         && content::inspect(*hash, bytes)?.0 != Kind::Data
     {
         return Err(PeerError::Value("expected state data".into()));
@@ -276,9 +276,11 @@ fn evaluate(mut work: Work) -> Result<Output> {
         .ok_or(PeerError::Missing(work.program))?;
     let (_, root) = work.code.swap_remove(at);
     let (value, fuel, memory) = match content::inspect(work.program, &root)?.0 {
-        Kind::Data | Kind::Native => return Err(PeerError::Value("expected program".into())),
+        Kind::Data | Kind::Native | Kind::Revision => {
+            return Err(PeerError::Value("expected program".into()));
+        }
         Kind::Aeb => {
-            let WorkContext::Snapshot { hash, bytes } = work.context else {
+            let WorkContext::Snapshot { hash, bytes, .. } = work.context else {
                 return Err(PeerError::Value(
                     "graph evaluation requires JavaScript".into(),
                 ));
@@ -432,7 +434,7 @@ fn evaluate_javascript(
                     })?;
                     let names = serde_json::to_string(&guest.bindings)
                         .expect("binding names are JSON strings");
-                    let api: Array = setup.call((rpc, ctx.json_parse(names)?, guest.write, guest.resource, guest.revision.to_string()))?;
+                    let api: Array = setup.call((rpc, ctx.json_parse(names)?, guest.write, guest.resource, guest.revision.to_string(), ctx.json_parse(guest.view.to_json().to_string())?))?;
                     replacer = api.get(1)?;
                     Some((api.get::<Value>(0)?, api.get::<Function>(2)?))
                 }
@@ -444,7 +446,17 @@ fn evaluate_javascript(
             let input = ctx.json_parse(input.as_bytes())?;
             let result: Value = match &guest {
                 Some((api, _)) => entry.call((api.clone(), input))?,
-                None => entry.call((ctx.json_parse(state.as_deref().expect("snapshot context"))?, input))?,
+                None => {
+                    let WorkContext::Snapshot { view, .. } = &work.context else {
+                        unreachable!("snapshot invocation");
+                    };
+                    let state = ctx.json_parse(state.as_deref().expect("snapshot context"))?;
+                    if view.resource.is_some() {
+                        entry.call((state, input, ctx.json_parse(view.to_json().to_string())?))?
+                    } else {
+                        entry.call((state, input))?
+                    }
+                }
             };
             let result = match result.as_promise() {
                 Some(promise) => promise.finish::<Value>()?,
@@ -486,6 +498,8 @@ fn exchange_effect(args: Array<'_>, waiting: &Cell<Duration>) -> rquickjs::Resul
     let timeout: u16 = args.get(5)?;
     let revision: String = args.get(6)?;
     let operation: String = args.get(7)?;
+    let consistency: String = args.get(8)?;
+    let merge: bool = args.get(9)?;
     let result = (|| -> Result<EffectReply> {
         let data = |payload: &str| {
             if payload.len() > super::super::effects::MAX_EFFECT_BYTES * 6 {
@@ -506,6 +520,12 @@ fn exchange_effect(args: Array<'_>, waiting: &Cell<Duration>) -> rquickjs::Resul
                 } else {
                     aux.split(',').map(str::to_owned).collect()
                 },
+                consistency: match consistency.as_str() {
+                    "authoritative" => crate::peer::Consistency::Authoritative,
+                    "replica" => crate::peer::Consistency::Replica,
+                    id => crate::peer::Consistency::Revision(id.parse()?),
+                },
+                merge,
                 update: if revision.is_empty() {
                     None
                 } else {

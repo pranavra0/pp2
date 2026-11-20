@@ -6,6 +6,7 @@ mod effects;
 mod host;
 mod native;
 mod protocol;
+mod replication;
 mod storage;
 mod transport;
 mod typescript;
@@ -20,6 +21,10 @@ pub use effects::{
 pub use host::Directory;
 pub use host::{HostProvider, HostResource};
 pub use native::{NativeInstallation, NativePackage, RequestedBinding, TerminalResult};
+pub use replication::{
+    Consistency, ReplicaAccess, ReplicaStatus, ResourceMode, ResourceRevision, ResourceView,
+    SyncReport,
+};
 pub use storage::{
     Access, ApplicationSpec, ApplicationState, ApplicationStatus, DeliveryOutcome, DeliveryStatus,
     PeerStore, RECEIPT_WINDOW, Revision, SubscriptionSpec, SubscriptionState, SubscriptionStatus,

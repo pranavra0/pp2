@@ -1,8 +1,8 @@
 use super::jobs::{self, Attempt};
 use super::*;
 use crate::peer::{
-    Access, Binding, GraphBudget, GraphMetrics, HostResource, NativePackage, PeerEndpoint,
-    TerminalResult,
+    Access, Binding, Consistency, GraphBudget, GraphMetrics, HostResource, NativePackage,
+    PeerEndpoint, TerminalResult,
     effects::{self, BoundCapability, Effect, GraphBindings, GraphJob, Remote, Scope},
     native::{self, STATE, Terminal},
     protocol::{Forward, JobState, Submission},
@@ -23,6 +23,7 @@ pub struct GraphEvaluation<'a> {
 #[derive(Debug)]
 pub struct GraphReport {
     pub revision: u64,
+    pub view: Option<ResourceView>,
     pub value: Data,
     pub elapsed_us: u64,
     pub request_bytes: u64,
@@ -32,7 +33,7 @@ pub struct GraphReport {
 
 pub(super) struct Configuration {
     callers: BTreeMap<(Hash, Hash, Hash), BTreeMap<String, Binding>>,
-    peers: BTreeMap<Hash, Client>,
+    pub(super) peers: BTreeMap<Hash, Client>,
     stable: bool,
 }
 
@@ -177,17 +178,11 @@ impl Client {
         if result.is_err() && cancellation.is_some_and(Cancellation::requested) {
             return Err(PeerError::Cancelled);
         }
-        let Reply::Graph {
-            revision,
-            value,
-            metrics: graph,
-        } = result?
-        else {
-            return Err(unexpected_reply());
-        };
+        let (revision, value, graph, view) = graph_result(result?)?;
         effects::check_response(&value)?;
         Ok(GraphReport {
             revision,
+            view,
             value: Data::from_bytes(&value)?,
             elapsed_us: started.elapsed().as_micros() as u64,
             request_bytes: traffic.sent,
@@ -232,7 +227,7 @@ impl Client {
                     };
                     traffic.sent += protocol::send(&mut stream, &code.remove(&hash))?;
                 }
-                Reply::Graph { .. } | Reply::Job(_) => {
+                Reply::Graph { .. } | Reply::ResourceGraph { .. } | Reply::Job(_) => {
                     stream.sock.activity.check()?;
                     return Ok(reply);
                 }
@@ -396,15 +391,25 @@ impl Invocation<'_> {
     ) -> Result<(Hash, GraphJob)> {
         let target = self.routes.get(&remote.target).ok_or(PeerError::Denied)?;
         let route = &target.binding;
-        let mode = match remote.update {
-            Some((expected_revision, operation)) if route.access == Access::Write => {
+        let mode = match (remote.consistency, remote.update) {
+            (_, Some(_)) if route.access != Access::Write => return Err(PeerError::Denied),
+            (Consistency::Authoritative, Some((expected_revision, operation))) => {
                 EvaluationMode::Update {
                     expected_revision,
                     operation,
                 }
             }
-            Some(_) => return Err(PeerError::Denied),
-            None => EvaluationMode::Read,
+            (Consistency::Replica, Some((expected_revision, operation))) => {
+                EvaluationMode::UpdateReplica {
+                    expected_revision,
+                    operation,
+                    merge: remote.merge,
+                }
+            }
+            (Consistency::Authoritative, None) => EvaluationMode::Read,
+            (Consistency::Replica, None) => EvaluationMode::ReadReplica,
+            (Consistency::Revision(id), None) => EvaluationMode::ReadRevision(id),
+            (Consistency::Revision(_), Some(_)) => return Err(PeerError::Denied),
         };
         if self.native && remote.delegate.iter().any(|name| name == STATE) {
             return Err(PeerError::Denied);
@@ -495,7 +500,11 @@ impl Invocation<'_> {
             } else {
                 self.server.identity
             };
-            let call = job.call(holder, false)?;
+            let call = job.call(
+                holder,
+                false,
+                self.server.network.as_ref().map(PeerNetwork::id),
+            )?;
             let code = NativePackage::load_program(job.program, |hash| self.packages.get(hash))?;
             let (receipt, metrics) = self.server.execute_graph(
                 &mut self.packages,
@@ -507,13 +516,13 @@ impl Invocation<'_> {
                 Execution::Synchronous,
             )?;
             self.metrics.add_descendant(metrics);
-            return remote_value(receipt.revision, &receipt.value);
+            return remote_value(receipt.revision, &receipt.value, receipt.view.as_ref());
         }
         let mut traffic = Traffic::default();
         self.metrics.remote_calls += 1;
         let result = (|| {
             let (peer, job) = self.prepare(&remote, budget, expiry, &active)?;
-            match self.peer(peer)?.exchange_program(
+            let reply = self.peer(peer)?.exchange_program(
                 job.program,
                 Request::Run(job),
                 active,
@@ -526,24 +535,17 @@ impl Invocation<'_> {
                         self.packages.executable(self.call.holder, hash)
                     }
                 },
-            )? {
-                Reply::Graph {
-                    revision,
-                    value,
-                    metrics,
-                } => {
-                    effects::check_response(&value)?;
-                    Ok((revision, value, metrics))
-                }
-                _ => Err(unexpected_reply()),
-            }
+            )?;
+            let (revision, value, metrics, view) = graph_result(reply)?;
+            effects::check_response(&value)?;
+            Ok((revision, value, metrics, view))
         })();
         self.metrics.remote_request_bytes += traffic.sent;
         self.metrics.remote_response_bytes += traffic.received;
         match result {
-            Ok((revision, bytes, metrics)) => {
+            Ok((revision, bytes, metrics, view)) => {
                 self.metrics.add_descendant(metrics);
-                remote_value(revision, &bytes)
+                remote_value(revision, &bytes, view.as_ref())
             }
             Err(error) => {
                 self.metrics.remote_failures += 1;
@@ -581,7 +583,16 @@ impl Invocation<'_> {
                 graph,
             } => {
                 self.metrics.add_descendant(graph);
-                return remote_value(revision, &value);
+                return remote_value(revision, &value, None);
+            }
+            JobState::ResourceCompleted {
+                revision,
+                value,
+                graph,
+                view,
+            } => {
+                self.metrics.add_descendant(graph);
+                return remote_value(revision, &value, Some(&view));
             }
             JobState::Failed(error) => Err(error.into()),
             JobState::Expired => Err(PeerError::Timeout),
@@ -607,7 +618,21 @@ impl Invocation<'_> {
         let expiry = remote
             .timeout_ms
             .map_or(expiry, |ms| expiry.min(unix_ms() + u64::from(ms)));
-        let fingerprint = Hash::digest(&protocol::encode(remote)?);
+        // Preserve fingerprints recorded for existing authoritative effects.
+        let base = (
+            &remote.target,
+            &remote.input,
+            remote.allowance,
+            remote.timeout_ms,
+            &remote.delegate,
+            remote.update,
+        );
+        let encoded = if remote.consistency == Consistency::Authoritative {
+            protocol::encode(&base)?
+        } else {
+            protocol::encode(&(base, remote.consistency, remote.merge))?
+        };
+        let fingerprint = Hash::digest(&encoded);
         let intent =
             attempt
                 .store
@@ -681,48 +706,65 @@ impl Invocation<'_> {
     }
 }
 
-fn remote_value(revision: u64, bytes: &[u8]) -> Result<Vec<u8>> {
+fn remote_value(revision: u64, bytes: &[u8], view: Option<&ResourceView>) -> Result<Vec<u8>> {
     let value = Data::from_bytes(bytes)?;
     let revision = i64::try_from(revision).map_err(|_| PeerError::Limit("revision"))?;
-    Ok(Data::Record(
-        [
-            ("revision".into(), Data::Int(revision)),
-            ("value".into(), value),
-        ]
-        .into_iter()
-        .collect(),
-    )
-    .to_bytes()?)
+    let mut result = BTreeMap::from([
+        ("revision".into(), Data::Int(revision)),
+        ("value".into(), value),
+    ]);
+    if let Some(view) = view {
+        result.insert("view".into(), content::data_from_json(view.to_json())?);
+    }
+    Ok(Data::Record(result).to_bytes()?)
+}
+
+fn graph_result(reply: Reply) -> Result<(u64, Vec<u8>, GraphMetrics, Option<ResourceView>)> {
+    match reply {
+        Reply::Graph {
+            revision,
+            value,
+            metrics,
+        } => Ok((revision, value, metrics, None)),
+        Reply::ResourceGraph {
+            revision,
+            value,
+            metrics,
+            view,
+        } => Ok((revision, value, metrics, Some(view))),
+        _ => Err(unexpected_reply()),
+    }
 }
 
 impl GraphJob {
-    pub(super) fn call(&self, holder: Hash, reaction: bool) -> Result<Call> {
+    pub(super) fn call(
+        &self,
+        holder: Hash,
+        reaction: bool,
+        executor: Option<Hash>,
+    ) -> Result<Call> {
         self.budget.validate()?;
         if self.input.len() > Block::MAX_BYTES {
             return Err(PeerError::Limit("input bytes"));
         }
         Data::from_bytes(&self.input)?;
-        let update = match self.mode {
-            EvaluationMode::Read => None,
-            EvaluationMode::Update {
-                expected_revision,
-                operation,
-            } => {
-                let empty =
-                    matches!(&self.bindings, GraphBindings::Local(names) if names.is_empty());
-                if self.budget.calls != 0 || !empty {
-                    return Err(PeerError::Denied);
-                }
-                Some(Update {
-                    expected: expected_revision,
-                    operation,
-                    fingerprint: Hash::digest(&protocol::encode(&(
-                        self.program,
-                        self.mode,
-                        &self.input,
-                    ))?),
-                })
+        let update = if let Some((expected, operation, merge)) = self.mode.update() {
+            let empty = matches!(&self.bindings, GraphBindings::Local(names) if names.is_empty());
+            if self.budget.calls != 0 || !empty {
+                return Err(PeerError::Denied);
             }
+            Some(Update {
+                expected,
+                operation,
+                merge,
+                fingerprint: Hash::digest(&protocol::encode(&(
+                    self.program,
+                    self.mode,
+                    &self.input,
+                ))?),
+            })
+        } else {
+            None
         };
         Ok(Call {
             holder,
@@ -735,6 +777,8 @@ impl GraphJob {
                 delegated_by: self.delegated_by,
             }),
             reaction,
+            consistency: self.mode.consistency(),
+            executor,
         })
     }
 }
@@ -823,7 +867,7 @@ impl Server {
             delegated_by: None,
             bindings: GraphBindings::Local(Vec::new()),
         };
-        let call = job.call(id, false)?;
+        let call = job.call(id, false, self.network.as_ref().map(PeerNetwork::id))?;
         let (receipt, metrics) = self.execute_graph(
             &mut store,
             call,
@@ -847,7 +891,7 @@ impl Server {
         job: GraphJob,
     ) -> Result<Reply> {
         stream.sock.check_active()?;
-        let call = job.call(holder, false)?;
+        let call = job.call(holder, false, self.network.as_ref().map(PeerNetwork::id))?;
         let bindings = self.graph.resolve(call, job.bindings)?;
         if let Some(receipt) = store.probe_collection(call)? {
             return Ok(graph_reply(receipt, GraphMetrics::default()));
@@ -953,6 +997,7 @@ impl Server {
                     write: call.update.is_some(),
                     resource: resource.is_some(),
                     revision: storage.revision(),
+                    view: storage.view().clone(),
                 }),
             },
             || active.check(),
@@ -1012,9 +1057,14 @@ impl Server {
             output.value,
             || active.check(),
             durable.map(|job| (job.key, metrics)),
+            self.network.as_ref().map(PeerNetwork::identity),
         )?;
         if call.update.is_none() {
-            store.confirm_collection(call)?;
+            if let Some(view) = &receipt.view {
+                store.confirm(call, view)?;
+            } else {
+                store.confirm_collection(call)?;
+            }
             active.check()?;
         }
         Ok((receipt, metrics))
@@ -1022,9 +1072,22 @@ impl Server {
 }
 
 fn graph_reply(receipt: crate::peer::storage::Receipt, metrics: GraphMetrics) -> Reply {
-    Reply::Graph {
-        revision: receipt.revision,
-        value: receipt.value,
-        metrics,
+    let crate::peer::storage::Receipt {
+        revision,
+        value,
+        view,
+    } = receipt;
+    match view {
+        Some(view) => Reply::ResourceGraph {
+            revision,
+            value,
+            metrics,
+            view,
+        },
+        None => Reply::Graph {
+            revision,
+            value,
+            metrics,
+        },
     }
 }

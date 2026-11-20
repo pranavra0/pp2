@@ -100,6 +100,52 @@ The handler receives `{id, reference, revision}`. The ID is a stable hex string 
 
 The [native document example](examples/native-documents/README.md) builds an index on a separate machine, searches it interactively, and keeps previous results available while disconnected. It includes a two-machine walkthrough and a comparison with a conventional mTLS service.
 
+## Run Personal Notes on three peers
+
+~~~sh
+cargo build --locked --bin pp2
+python3 scripts/demo-replicated-notes.py
+~~~
+
+The demo installs the same native package in three independent workspaces. Two devices edit while all peer daemons are stopped. After reconnecting, they agree on the same two heads, keep both texts for the conflicted note, and retain the notes added on either branch. An explicit merge combines the branches and a later `resolve` chooses the note text. The third device catches up from another replica while the owner is offline. The demo also checks restart recovery, zero-block sync when current, private content protection, and revocation. [Demo script](scripts/demo-replicated-notes.py), [replication semantics and offline leases](docs/architecture.md#replicated-resources)
+
+### Install across three machines
+
+1. Run `pp2 app native identity ./notes-home` on each machine. Keep each workspace and identity key on its own machine. On the owner machine, package the app and create the resource. Record the package hash, store program hash, resource ID, and owner identity. Supply each other machine's identity to `approve`.
+
+   ~~~sh
+   read -r PACKAGE STORE_PROGRAM < <(examples/replicated-notes/package.sh pp2 ./notes-home)
+   pp2 peer collection-init ./notes-home/peer.db notes
+   RESOURCE=$(pp2 peer replica share ./notes-home notes multi-writer)
+   pp2 peer replica approve ./notes-home "$RESOURCE" "$LAPTOP_ID" write "$STORE_PROGRAM"
+   pp2 peer replica approve ./notes-home "$RESOURCE" "$THIRD_ID" write "$STORE_PROGRAM"
+   pp2 app native host ./notes-home 0.0.0.0:7340
+   ~~~
+
+2. On each other machine, use those values and the owner's reachable address. The initial sync establishes the placement lease and creates the local reference.
+
+   ~~~sh
+   OWNER_TARGET="$OWNER_ID@$OWNER_ADDRESS"
+   pp2 peer replica follow ./notes-home "$RESOURCE" "$OWNER_TARGET" notes
+   pp2 peer replica sync ./notes-home "$RESOURCE" "$OWNER_TARGET"
+   ~~~
+
+   If a sync reports `"pending":true`, repeat it to finish the remaining blocks. Start `pp2 app native host ./notes-home 0.0.0.0:7340` on the other machines to exchange changes in the background. For route discovery on a LAN, allow discovery traffic and the TCP listener. For direct routes, run `pp2 peer replica route ./notes-home "$RESOURCE" "$PEER_ID" "$PEER_ADDRESS"` for each other peer on each machine, using addresses such as `192.0.2.10:7340`.
+
+3. Install the package and attach the local writer grant on each machine. The owner can use its own reachable address for `OWNER_TARGET`.
+
+   ~~~sh
+   APP=$(pp2 app native install ./notes-home "$PACKAGE" "$OWNER_TARGET" --yes)
+   pp2 peer replica grant ./notes-home notes writer "$STORE_PROGRAM" > notes-grant.json
+   pp2 app native grant ./notes-home "$APP" notes notes-grant.json
+   pp2 app native run ./notes-home "$APP" 'set welcome hello'
+   pp2 app native run ./notes-home "$APP" 'show welcome'
+   ~~~
+
+4. Disconnect two machines and use `set TITLE TEXT` on each. Reconnect their hosts to exchange changes. Use `list` and `show TITLE` to inspect both branches, `merge` to combine them, and `resolve TITLE TEXT` to choose a text. Notes compares whole snapshots and preserves all distinct texts across the branches, including an older text that remains on another branch. Use `pp2 peer replica status ./notes-home "$RESOURCE"` to compare head IDs. After a placement lease expires, reconnect to the owner to renew and fetch any missing history.
+
+Owners can also share resources in `immutable` and `single-writer` modes. Use `store` for a copy that can synchronize, `read` to allow local execution, and `write` to also allow local updates on multi-writer resources. Use `pp2 peer replica --help` for placement, status, history, and revocation commands.
+
 ## Write a guest with effects
 
 The default export of a collection program receives `(pp2, input)`.
@@ -108,10 +154,12 @@ The default export of a collection program receives `(pp2, input)`.
 - `pp2.call(pp2.resource, operation, input)` reads an explicitly scoped host resource. `pp2.resource` is null when the invocation has no host resource. For a directory, use `list`, `read`, or `readText`. [Host resource interface](docs/architecture.md#host-resources)
 - `pp2.storage.get(key)` resolves to `{found: false}` or `{found: true, value}`. Values may be null.
 - `pp2.storage.scan({prefix, after, limit})` resolves to `{entries, next}`. Each entry is a key-value pair. Pass `next` as the exclusive `after` cursor for the next page, until it is null. The host orders keys by their UTF-8 bytes and caps each page by rows and encoded size.
-- `pp2.evaluate(capability, input, {calls, delegate, timeoutMs, update})` resolves to `{revision, value}`. Pass a capability from `pp2.capabilities`. Its grant determines which collection and program the target peer authorizes. Set `calls: 0` for a leaf. An optional `delegate` array supplies the only capabilities available to the child. An optional `timeoutMs` shortens that branch's inherited deadline.
+- `pp2.evaluate(capability, input, {calls, delegate, timeoutMs, update, consistency})` resolves to `{revision, value}` and includes `view` for replicated resources. Pass a capability from `pp2.capabilities`. Its grant determines which collection and program the target peer authorizes. Set `calls: 0` for a leaf. An optional `delegate` array supplies the only capabilities available to the child. An optional `timeoutMs` shortens that branch's inherited deadline.
 - On a write invocation, `pp2.storage.put(key, value)` and `pp2.storage.delete(key)` change the local collection. The program returns its ordinary result. The peer commits the changes, revision, and retry receipt together. A remote update requires a writable capability and explicit `update: {revision, operation}`, where `operation` is a 64-character hexadecimal operation ID. Updates are leaves.
 
 Capabilities can be passed to functions, stored in objects, and passed to child invocations through `delegate`. The executing peer keeps the network settings and grant tokens outside the worker. It obtains recipient-bound grants for the requested subset and sends them to the child. Effect failures reject their promises. The API supports normal JavaScript control flow and promise composition. Each worker currently services its submitted effects in order.
+
+Collection programs can inspect `pp2.storage.view`. The default `consistency: 'authoritative'` requires an authoritative state. Specify `'replica'` to allow the local view at the peer named in the capability, or pass an immutable revision ID for an exact read. Multi-writer commits use replica consistency. When a replica view reports multiple heads, read those revisions and submit an update with `merge: true` and the current numeric revision. The leaf program writes the merged state through the same collection effects.
 
 Application manifests link TypeScript runtime imports by source specifier and module name in each module's `imports` map. They can seed a collection from newline-delimited JSON pairs like `["stock/lamp/a1",3]`, or use `null` for an empty collection. For existing peers, `pp2 peer collection-init`, `graph-read`, and `graph-update` provide the equivalent lower-level interface. Existing snapshot programs continue to take `(state, input)` and run through `peer read` or `peer update`. [Graph limits and transaction semantics](docs/architecture.md#guest-effects-and-placement)
 

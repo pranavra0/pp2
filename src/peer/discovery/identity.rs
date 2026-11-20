@@ -69,7 +69,7 @@ impl PeerIdentity {
         self.0.public_key().as_ref()
     }
 
-    pub(super) fn sign(&self, domain: &[u8], message: &[u8]) -> Proof {
+    pub(in crate::peer) fn sign(&self, domain: &[u8], message: &[u8]) -> Proof {
         let signature = self.0.sign(&[domain, message].concat());
         Proof {
             key: self.public_key().try_into().expect("Ed25519 public key"),
@@ -86,13 +86,13 @@ fn peer_id(key: &[u8]) -> Hash {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(super) struct Proof {
+pub(in crate::peer) struct Proof {
     key: [u8; 32],
     signature: [[u8; 32]; 2],
 }
 
 impl Proof {
-    pub(super) fn verify(&self, domain: &[u8], message: &[u8]) -> Result<Hash> {
+    pub(in crate::peer) fn verify(&self, domain: &[u8], message: &[u8]) -> Result<Hash> {
         UnparsedPublicKey::new(&signature::ED25519, self.key)
             .verify(&[domain, message].concat(), self.signature.as_flattened())
             .map_err(|_| PeerError::Denied)?;

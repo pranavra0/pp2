@@ -32,6 +32,12 @@ pub enum JobStatus {
         value: Data,
         graph: GraphMetrics,
     },
+    ResourceCompleted {
+        revision: u64,
+        value: Data,
+        graph: GraphMetrics,
+        view: ResourceView,
+    },
     Failed(PeerError),
     Cancelled,
     Expired,
@@ -53,6 +59,20 @@ impl TryFrom<JobState> for JobStatus {
                     revision,
                     value: Data::from_bytes(&value)?,
                     graph,
+                }
+            }
+            JobState::ResourceCompleted {
+                revision,
+                value,
+                graph,
+                view,
+            } => {
+                effects::check_response(&value)?;
+                Self::ResourceCompleted {
+                    revision,
+                    value: Data::from_bytes(&value)?,
+                    graph,
+                    view: *view,
                 }
             }
             JobState::Failed(error) => Self::Failed(error.into()),
@@ -207,7 +227,9 @@ impl Server {
         } else {
             Hash::digest(&protocol::encode(&job)?)
         };
-        if let Some(state) = store.existing_job(key, request)? {
+        if let Some(state) =
+            store.existing_job(key, request, self.network.as_ref().map(PeerNetwork::id))?
+        {
             return Ok(Reply::Job(state));
         }
         let remaining = job.expires_at_ms.saturating_sub(unix_ms());
@@ -217,7 +239,7 @@ impl Server {
         if remaining > MAX_JOB_LIFETIME_MS {
             return Err(PeerError::Limit("job lifetime"));
         }
-        let call = job.call(holder, reaction)?;
+        let call = job.call(holder, reaction, self.network.as_ref().map(PeerNetwork::id))?;
         store.confirm_collection(call)?;
         let bindings = self.graph.resolve(call, job.bindings.clone())?;
         let code = self.receive_code(stream, store, call)?;
@@ -292,7 +314,11 @@ impl Server {
             if let Some(network) = &self.network {
                 network.check_identity(key.holder)?;
             }
-            let invocation = graph.call(key.holder, reaction)?;
+            let invocation = graph.call(
+                key.holder,
+                reaction,
+                self.network.as_ref().map(PeerNetwork::id),
+            )?;
             call = Some(invocation);
             store.confirm_collection(invocation)?;
             let attempt = Rc::new(Attempt::new(
@@ -317,11 +343,7 @@ impl Server {
                 active,
                 graph::Execution::Durable(&attempt),
             )?;
-            Ok(JobState::Completed {
-                revision: receipt.revision,
-                value: receipt.value,
-                graph: metrics,
-            })
+            Ok(JobState::completed(receipt, metrics))
         };
         let result = run();
         let error = watch.and_then(|attempt| attempt.failure.take());

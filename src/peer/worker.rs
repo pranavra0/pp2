@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Hash;
 
-use super::{PeerError, Result, effects::Effect, protocol::Metrics};
+use super::{PeerError, ResourceView, Result, effects::Effect, protocol::Metrics};
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Work {
@@ -16,7 +16,11 @@ pub(super) struct Work {
 
 #[derive(Serialize, Deserialize)]
 pub(super) enum WorkContext {
-    Snapshot { hash: Hash, bytes: Vec<u8> },
+    Snapshot {
+        hash: Hash,
+        bytes: Vec<u8>,
+        view: ResourceView,
+    },
     Graph(Guest),
 }
 
@@ -26,6 +30,7 @@ pub(super) struct Guest {
     pub write: bool,
     pub resource: bool,
     pub revision: u64,
+    pub view: ResourceView,
 }
 
 pub(super) struct Output {

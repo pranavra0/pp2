@@ -51,8 +51,12 @@ impl Profile {
         mode: EvaluationMode,
     ) -> std::result::Result<RemoteReport, PeerError> {
         let binding = match mode {
-            EvaluationMode::Read => &self.read,
-            EvaluationMode::Update { .. } => self.write.as_ref().ok_or(PeerError::Denied)?,
+            EvaluationMode::Read
+            | EvaluationMode::ReadReplica
+            | EvaluationMode::ReadRevision(_) => &self.read,
+            EvaluationMode::Update { .. } | EvaluationMode::UpdateReplica { .. } => {
+                self.write.as_ref().ok_or(PeerError::Denied)?
+            }
         };
         let credentials = Credentials {
             ca: self.ca.clone(),

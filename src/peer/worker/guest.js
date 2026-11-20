@@ -1,4 +1,4 @@
-(rpc, names, writeStorage, hasResource, revision) => {
+(rpc, names, writeStorage, hasResource, revision, view) => {
     'use strict';
 
     const create = Object.create;
@@ -51,12 +51,12 @@
     }
 
     let pending = 0;
-    async function request(kind, key, payload, aux, limit, timeout, revision, operation) {
+    async function request(kind, key, payload, aux, limit, timeout, revision, operation, consistency = 'authoritative', merge = false) {
         pending++;
         try {
             // Yield to the QuickJS job queue. Effects run in submission order.
             await null;
-            const reply = parse(rpc([kind, key, payload, aux, limit, timeout, revision, operation]));
+            const reply = parse(rpc([kind, key, payload, aux, limit, timeout, revision, operation, consistency, merge]));
             if (!reply.ok) {
                 const error = new Failure(reply.message);
                 error.code = reply.code;
@@ -70,7 +70,9 @@
     }
 
     const currentRevision = Number(revision);
+    freeze(view.heads);
     const storage = freeze({
+        view: freeze(view),
         get revision() {
             if (!integer(currentRevision)) throw new Type('revision exceeds the JavaScript safe integer range');
             return currentRevision;
@@ -100,7 +102,7 @@
             if (capability !== resource || resource === null) throw new Type('expected a host capability from this invocation');
             return request('host', text(operation), stringify(input, replacer), '', 0, 0, '', '');
         },
-        async evaluate(capability, input, {calls, delegate = [], timeoutMs = null, update = null}) {
+        async evaluate(capability, input, {calls, delegate = [], timeoutMs = null, update = null, consistency = 'authoritative'}) {
             if (!isArray(delegate) || delegate.length > 16) throw new Type('expected a bounded list of capabilities');
             let names = '';
             for (let i = 0; i < delegate.length; i++) {
@@ -109,11 +111,13 @@
             if (update !== null && (!integer(update.revision) || update.revision < 0)) {
                 throw new Type('expected an update revision');
             }
+            const merge = update !== null && update.merge === true;
+            if (merge && consistency !== 'replica') throw new Type('a merge requires replica consistency');
             if (timeoutMs === 0) throw new Type('expected a positive child deadline');
             return request(
                 'evaluate', slot(capability), stringify(input, replacer), names,
                 bounded(calls), timeoutMs === null ? 0 : bounded(timeoutMs), update === null ? '' : '' + update.revision,
-                update === null ? '' : text(update.operation),
+                update === null ? '' : text(update.operation), text(consistency), merge,
             );
         },
     });

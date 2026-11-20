@@ -24,6 +24,7 @@ const USAGE: &str = "Usage: pp2 peer <command>
   serve-network DB BIND NODE_DIRECTORY [GRAPH_CONFIG]
   rendezvous BIND [--relay]
   node-init NODE_DIRECTORY
+  replica <command>
   identity-new IDENTITY_KEY
   identity IDENTITY_KEY
   connect NODE_DIRECTORY PEER_ID[@ADDRESS] OPERATION [OPERATION_ARGS ...]
@@ -46,9 +47,12 @@ const USAGE: &str = "Usage: pp2 peer <command>
   gc DB
   read DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE
   update DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE REVISION OPERATION
+  replica-read|revision-read|replica-update DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE [REVISION_ID | REVISION OPERATION [--merge]]
   graph-read DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON [CAPABILITY ...]
   graph-update DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON REVISION OPERATION
-  job-submit DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON JOB_ID EXPIRES_AT_MS [CAPABILITY ... | --delegated FILE | --update REVISION OPERATION]
+  graph-replica-read|graph-revision-read|graph-replica-update DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON [REVISION_ID | REVISION OPERATION [--merge]]
+  job-submit DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON JOB_ID EXPIRES_AT_MS [--replica | --revision REVISION_ID] [CAPABILITY ... | --delegated FILE]
+  job-submit DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON JOB_ID EXPIRES_AT_MS [--replica] --update REVISION OPERATION [--merge]
   job-status ADDRESS NAME CA CERT KEY JOB_ID
   job-cancel ADDRESS NAME CA CERT KEY JOB_ID";
 
@@ -59,6 +63,9 @@ pub fn run(args: &[OsString]) -> Result<()> {
         .iter()
         .map(|arg| arg.to_str().ok_or("expected UTF-8 argument"))
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    if let ["replica", rest @ ..] = args.as_slice() {
+        return crate::replica_cli::run(rest);
+    }
     if let ["connect", directory, target, command, operands @ ..] = args.as_slice() {
         let (id, fallback) = if let Some((id, address)) = target.split_once('@') {
             (id.parse()?, Some(address.parse::<SocketAddr>()?))
@@ -67,7 +74,18 @@ pub fn run(args: &[OsString]) -> Result<()> {
         };
         let mut args = vec![*command];
         let operands = match *command {
-            "fetch" | "fetch-program" | "read" | "update" | "graph-read" | "graph-update"
+            "fetch"
+            | "fetch-program"
+            | "read"
+            | "update"
+            | "graph-read"
+            | "graph-update"
+            | "replica-read"
+            | "revision-read"
+            | "replica-update"
+            | "graph-replica-read"
+            | "graph-revision-read"
+            | "graph-replica-update"
             | "job-submit" => {
                 let (db, rest) = operands.split_first().ok_or(USAGE)?;
                 args.push(*db);
@@ -301,7 +319,7 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
         }
         ["gc", db] => println!("{} blocks removed", PeerStore::open(db)?.collect()?),
         [
-            "read" | "update",
+            "read" | "update" | "replica-read" | "revision-read" | "replica-update",
             db,
             address,
             name,
@@ -313,14 +331,7 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
             file,
             rest @ ..,
         ] => {
-            let mode = match (args[0], rest) {
-                ("read", []) => EvaluationMode::Read,
-                ("update", [revision, operation]) => EvaluationMode::Update {
-                    expected_revision: revision.parse()?,
-                    operation: operation.parse()?,
-                },
-                _ => return Err(USAGE.into()),
-            };
+            let mode = evaluation_mode(args[0], rest)?;
             let packages = (*db != "-").then(|| PeerStore::open(db)).transpose()?;
             let report = client(address, name, ca, cert, key)?.evaluate(Evaluation {
                 grant: grant.parse()?,
@@ -329,17 +340,22 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
                 input: &read_json(file)?,
                 packages: packages.as_ref(),
             })?;
-            let value = data_to_json(&report.value)?;
-            println!(
-                "{}",
-                serde_json::json!({"revision": report.revision, "value": value,
+            let mut result = serde_json::json!({"revision": report.revision,
+                "value": data_to_json(&report.value)?,
                 "request_bytes": report.request_bytes, "response_bytes": report.response_bytes,
                 "elapsed_ms": report.elapsed_ms, "worker_ms": report.worker_ms,
-                "fuel": report.fuel, "memory_bytes": report.memory_bytes})
-            );
+                "fuel": report.fuel, "memory_bytes": report.memory_bytes});
+            if let Some(view) = report.view {
+                result["view"] = view.to_json();
+            }
+            println!("{result}");
         }
         [
-            command @ ("graph-read" | "graph-update"),
+            command @ ("graph-read"
+            | "graph-update"
+            | "graph-replica-read"
+            | "graph-revision-read"
+            | "graph-replica-update"),
             db,
             address,
             name,
@@ -352,19 +368,17 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
             budget,
             rest @ ..,
         ] => {
-            let (mode, bindings) = match (*command, rest) {
-                ("graph-read", names) => (
-                    EvaluationMode::Read,
+            let command = command.strip_prefix("graph-").ok_or(USAGE)?;
+            let (mode, bindings) = match (command, rest) {
+                ("read" | "replica-read", names) => (
+                    evaluation_mode(command, &[])?,
                     names.iter().map(|s| (*s).into()).collect(),
                 ),
-                ("graph-update", [revision, operation]) => (
-                    EvaluationMode::Update {
-                        expected_revision: revision.parse()?,
-                        operation: operation.parse()?,
-                    },
-                    Vec::new(),
+                ("revision-read", [revision, names @ ..]) => (
+                    evaluation_mode(command, &[*revision])?,
+                    names.iter().map(|s| (*s).into()).collect(),
                 ),
-                _ => return Err(USAGE.into()),
+                _ => (evaluation_mode(command, rest)?, Vec::new()),
             };
             let budget: GraphBudget = serde_json::from_str(budget)?;
             let packages = (*db != "-").then(|| PeerStore::open(db)).transpose()?;
@@ -400,22 +414,27 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
             expires,
             rest @ ..,
         ] => {
+            let (read_mode, rest) = match rest {
+                ["--replica", rest @ ..] => (EvaluationMode::ReadReplica, rest),
+                ["--revision", id, rest @ ..] => (EvaluationMode::ReadRevision(id.parse()?), rest),
+                rest => (EvaluationMode::Read, rest),
+            };
             let (mode, bindings, delegated) = match rest {
                 ["--delegated", path] => (
-                    EvaluationMode::Read,
+                    read_mode,
                     Vec::new(),
                     Some(serde_json::from_slice(&read(Path::new(path))?)?),
                 ),
-                ["--update", revision, operation] => (
-                    EvaluationMode::Update {
-                        expected_revision: revision.parse()?,
-                        operation: operation.parse()?,
-                    },
-                    Vec::new(),
-                    None,
-                ),
+                ["--update", args @ ..] => {
+                    let command = match read_mode {
+                        EvaluationMode::Read => "update",
+                        EvaluationMode::ReadReplica => "replica-update",
+                        _ => return Err(USAGE.into()),
+                    };
+                    (evaluation_mode(command, args)?, Vec::new(), None)
+                }
                 names => (
-                    EvaluationMode::Read,
+                    read_mode,
                     names.iter().map(|name| (*name).to_owned()).collect(),
                     None,
                 ),
@@ -478,6 +497,14 @@ fn print_job(status: JobStatus) -> Result<()> {
         } => {
             json!({"state":"completed", "revision":revision, "value":data_to_json(&value)?, "graph":graph})
         }
+        JobStatus::ResourceCompleted {
+            revision,
+            value,
+            graph,
+            view,
+        } => {
+            json!({"state":"completed", "revision":revision, "value":data_to_json(&value)?, "graph":graph, "view":view.to_json()})
+        }
         JobStatus::Failed(error) => json!({"state":"failed", "error":error.to_string()}),
         JobStatus::Cancelled => json!({"state":"cancelled"}),
         JobStatus::Expired => json!({"state":"expired"}),
@@ -495,15 +522,36 @@ struct GraphConfig {
     peers: Vec<PeerEndpoint>,
 }
 
+fn evaluation_mode(command: &str, rest: &[&str]) -> Result<EvaluationMode> {
+    Ok(match (command, rest) {
+        ("read", []) => EvaluationMode::Read,
+        ("replica-read", []) => EvaluationMode::ReadReplica,
+        ("revision-read", [id]) => EvaluationMode::ReadRevision(id.parse()?),
+        ("update", [revision, operation]) => EvaluationMode::Update {
+            expected_revision: revision.parse()?,
+            operation: operation.parse()?,
+        },
+        ("replica-update", [revision, operation] | [revision, operation, "--merge"]) => {
+            EvaluationMode::UpdateReplica {
+                expected_revision: revision.parse()?,
+                operation: operation.parse()?,
+                merge: rest.len() == 3,
+            }
+        }
+        _ => return Err(USAGE.into()),
+    })
+}
+
 pub(crate) fn print_graph(report: pp2::peer::GraphReport) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::json!({
-            "value": data_to_json(&report.value)?, "revision": report.revision,
-            "elapsed_us": report.elapsed_us, "request_bytes": report.request_bytes,
-            "response_bytes": report.response_bytes, "graph": report.graph,
-        })
-    );
+    let mut result = serde_json::json!({
+        "value": data_to_json(&report.value)?, "revision": report.revision,
+        "elapsed_us": report.elapsed_us, "request_bytes": report.request_bytes,
+        "response_bytes": report.response_bytes, "graph": report.graph,
+    });
+    if let Some(view) = report.view {
+        result["view"] = view.to_json();
+    }
+    println!("{result}");
     Ok(())
 }
 

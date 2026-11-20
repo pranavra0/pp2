@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Block, Hash};
 
-use super::{EvaluationMode, PeerError, Result};
+use super::{Consistency, EvaluationMode, PeerError, Result};
 
 pub(super) const MAX_EFFECTS: u16 = 128;
 pub(super) const MAX_EFFECT_BYTES: usize = 128 * 1024;
@@ -110,6 +110,8 @@ pub(super) struct Remote {
     pub timeout_ms: Option<u16>,
     pub delegate: Vec<String>,
     pub update: Option<(u64, Hash)>,
+    pub consistency: Consistency,
+    pub merge: bool,
 }
 
 impl Remote {
@@ -119,6 +121,11 @@ impl Remote {
         }
         if self.timeout_ms.is_some_and(|ms| !(1..=8000).contains(&ms)) {
             return Err(PeerError::Limit("child deadline"));
+        }
+        if (self.update.is_some() && matches!(self.consistency, Consistency::Revision(_)))
+            || (self.merge && (self.consistency != Consistency::Replica || self.update.is_none()))
+        {
+            return Err(PeerError::Denied);
         }
         validate_binding_names(&self.delegate)
     }

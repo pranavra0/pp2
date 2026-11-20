@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::Hash;
 
 use super::{
-    Access, PeerError, Result,
+    Access, Consistency, PeerError, ResourceView, Result,
     effects::{GraphBudget, GraphJob, GraphMetrics},
+    replication::{Offer, SyncRequest},
 };
 
 const MAGIC: &[u8; 4] = b"PPN1";
@@ -23,6 +24,38 @@ pub enum EvaluationMode {
         expected_revision: u64,
         operation: Hash,
     },
+    ReadReplica,
+    ReadRevision(Hash),
+    UpdateReplica {
+        expected_revision: u64,
+        operation: Hash,
+        merge: bool,
+    },
+}
+
+impl EvaluationMode {
+    pub(super) fn consistency(self) -> Consistency {
+        match self {
+            Self::Read | Self::Update { .. } => Consistency::Authoritative,
+            Self::ReadReplica | Self::UpdateReplica { .. } => Consistency::Replica,
+            Self::ReadRevision(id) => Consistency::Revision(id),
+        }
+    }
+
+    pub(super) fn update(self) -> Option<(u64, Hash, bool)> {
+        match self {
+            Self::Update {
+                expected_revision,
+                operation,
+            } => Some((expected_revision, operation, false)),
+            Self::UpdateReplica {
+                expected_revision,
+                operation,
+                merge,
+            } => Some((expected_revision, operation, merge)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -51,6 +84,7 @@ pub(super) enum Request {
     JobStatus(Hash),
     CancelJob(Hash),
     SubmitReaction(Submission),
+    Replica(SyncRequest),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -71,6 +105,35 @@ pub(super) enum JobState {
     Failed(Failure),
     Cancelled,
     Expired,
+    ResourceCompleted {
+        revision: u64,
+        value: Vec<u8>,
+        graph: GraphMetrics,
+        view: Box<ResourceView>,
+    },
+}
+
+impl JobState {
+    pub(super) fn completed(receipt: super::storage::Receipt, graph: GraphMetrics) -> Self {
+        let super::storage::Receipt {
+            revision,
+            value,
+            view,
+        } = receipt;
+        match view {
+            Some(view) => Self::ResourceCompleted {
+                revision,
+                value,
+                graph,
+                view: Box::new(view),
+            },
+            None => Self::Completed {
+                revision,
+                value,
+                graph,
+            },
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -101,6 +164,19 @@ pub(super) enum Reply {
         metrics: GraphMetrics,
     },
     Job(JobState),
+    Replica(Box<Offer>),
+    ResourceEvaluation {
+        revision: u64,
+        value: Vec<u8>,
+        metrics: Option<Metrics>,
+        view: ResourceView,
+    },
+    ResourceGraph {
+        revision: u64,
+        value: Vec<u8>,
+        metrics: GraphMetrics,
+        view: ResourceView,
+    },
 }
 
 #[derive(Serialize, Deserialize)]

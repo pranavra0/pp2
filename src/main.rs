@@ -6,6 +6,7 @@ mod app_cli;
 mod demo;
 mod native_cli;
 mod peer_cli;
+mod replica_cli;
 
 const USAGE: &str = "Usage: pp2 app <command>\n       pp2 peer <command>\n       pp2 demo [sandbox|placement|locality|gossip|gc]\n       pp2 eval <AEB1-program-file>";
 
