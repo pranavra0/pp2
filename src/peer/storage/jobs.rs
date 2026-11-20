@@ -31,6 +31,19 @@ pub(in crate::peer) struct QueuedJob {
     pub(in crate::peer) key: JobKey,
     pub(in crate::peer) graph: GraphJob,
     pub(in crate::peer) bindings: BTreeMap<String, BoundCapability>,
+    pub(in crate::peer) reaction: bool,
+}
+
+pub(super) struct Delivery {
+    pub(super) subscription: Hash,
+    pub(super) event: Hash,
+    pub(super) revision: i64,
+}
+
+pub(super) enum JobOrigin {
+    Client,
+    Reaction,
+    Subscription(Delivery),
 }
 
 #[derive(Clone)]
@@ -90,47 +103,22 @@ impl PeerStore {
         }
         let authority = authorize(&tx, call)?;
         require_kind(&tx, &authority.reference, true)?;
-        let (count, owned): (u32, u32) = tx.query_row(
-            "SELECT count(*), count(CASE WHEN holder=?1 THEN 1 END)
-             FROM jobs WHERE state<2 AND expires>?2",
-            params![&key.holder.0[..], now as i64],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if count >= MAX_ACTIVE || owned >= MAX_PER_HOLDER {
-            return Err(PeerError::Limit("active jobs"));
+        if !has_capacity(&tx, key.holder, now)? {
+            return Err(if call.reaction {
+                PeerError::Busy
+            } else {
+                PeerError::Limit("active jobs")
+            });
         }
-        let input = Block::Data(Data::from_bytes(&graph.input)?).to_bytes()?;
-        let input_hash = Hash::digest(&input);
-        insert(&tx, input_hash, &input)?;
-        let spec = Specification {
-            grant: graph.grant,
-            mode: graph.mode,
-            delegated_by: graph.delegated_by,
-            budget: graph.budget,
-            bindings,
-        };
-        tx.execute(
-            "INSERT INTO jobs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, NULL)",
-            params![
-                &key.holder.0[..],
-                &key.id.0[..],
-                &request.0[..],
-                &graph.program.0[..],
-                &input_hash.0[..],
-                graph.expires_at_ms as i64,
-                now as i64,
-                protocol::encode(&spec)?
-            ],
-        )?;
         for (hash, bytes) in code {
             insert(&tx, *hash, bytes)?;
         }
-        for hash in [input_hash, graph.program] {
-            tx.execute(
-                "INSERT INTO job_blocks VALUES (?1, ?2, ?3)",
-                params![&key.holder.0[..], &key.id.0[..], &hash.0[..]],
-            )?;
-        }
+        let origin = if call.reaction {
+            JobOrigin::Reaction
+        } else {
+            JobOrigin::Client
+        };
+        enqueue(&tx, key, request, graph, bindings, origin, now)?;
         tx.commit()?;
         Ok(JobState::Pending)
     }
@@ -161,12 +149,13 @@ impl PeerStore {
         Ok(())
     }
 
-    pub(in crate::peer) fn claim_job(&mut self) -> Result<Option<QueuedJob>> {
+    pub(in crate::peer) fn claim_job(&mut self, identity: Hash) -> Result<Option<QueuedJob>> {
         let now = unix_ms() as i64;
         if !self.0.query_row(
-            "SELECT EXISTS(SELECT 1 FROM jobs WHERE state=0 AND ready<=?1)
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE state=0 AND ready<=?1
+                           AND (subscription IS NULL OR holder=?2))
                  OR EXISTS(SELECT 1 FROM jobs WHERE state<2 AND expires<=?1)",
-            [now],
+            params![now, &identity.0[..]],
             |row| row.get::<_, bool>(0),
         )? {
             return Ok(None);
@@ -189,9 +178,11 @@ impl PeerStore {
         }
         let candidate = tx
             .query_row(
-                "SELECT holder, id, expires, program, input, spec FROM jobs
-             WHERE state=0 AND ready<=?1 AND expires>?1 ORDER BY ready, holder, id LIMIT 1",
-                [now],
+                "SELECT holder, id, expires, program, input, spec, reaction,
+                        reaction_input FROM jobs
+             WHERE state=0 AND ready<=?1 AND expires>?1 AND (subscription IS NULL OR holder=?2)
+             ORDER BY ready, holder, id LIMIT 1",
+                params![now, &identity.0[..]],
                 |row| {
                     Ok((
                         JobKey {
@@ -202,18 +193,27 @@ impl PeerStore {
                         Hash(row.get(3)?),
                         Hash(row.get(4)?),
                         row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, bool>(6)?,
+                        row.get::<_, Option<Vec<u8>>>(7)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((key, expires, program, input_hash, spec)) = candidate else {
+        let Some((key, expires, program, input_hash, spec, reaction, reaction_input)) = candidate
+        else {
             tx.commit()?;
             return Ok(None);
         };
         let spec: Specification = protocol::decode(&spec)?;
-        let input = get(&tx, input_hash, false)?.ok_or(PeerError::Missing(input_hash))?;
-        let Block::Data(input) = Block::from_bytes(&input)? else {
-            return Err(PeerError::Value("expected durable input block".into()));
+        let input = match reaction_input {
+            Some(input) => input,
+            None => {
+                let bytes = get(&tx, input_hash, false)?.ok_or(PeerError::Missing(input_hash))?;
+                let Block::Data(input) = Block::from_bytes(&bytes)? else {
+                    return Err(PeerError::Value("expected durable input block".into()));
+                };
+                input.to_bytes()?
+            }
         };
         tx.execute(
             "UPDATE jobs SET state=1 WHERE holder=?1 AND id=?2",
@@ -226,13 +226,14 @@ impl PeerStore {
                 grant: spec.grant,
                 program,
                 mode: spec.mode,
-                input: input.to_bytes()?,
+                input,
                 budget: spec.budget,
                 expires_at_ms: expires as u64,
                 delegated_by: spec.delegated_by,
                 bindings: GraphBindings::Local(Vec::new()),
             },
             bindings: spec.bindings,
+            reaction,
         }))
     }
 
@@ -330,16 +331,22 @@ impl PeerStore {
     }
 
     pub(in crate::peer) fn save_job_child(
-        &self,
+        &mut self,
         key: JobKey,
         ordinal: u16,
         child: &(Hash, Submission),
     ) -> Result<()> {
-        self.0.execute(
+        let tx = self.0.transaction_with_behavior(Immediate)?;
+        check_running(&tx, key)?;
+        let inserted = tx.execute(
             "UPDATE job_effects SET child=?4 WHERE holder=?1 AND id=?2 AND ordinal=?3 AND child IS NULL",
             params![&key.holder.0[..], &key.id.0[..], ordinal, protocol::encode(child)?],
         )?;
-        self.check_job(key)
+        if inserted != 0 {
+            applications::record_child_deadline(&tx, key, child.1.graph.expires_at_ms)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub(in crate::peer) fn save_job_effect(
@@ -368,6 +375,74 @@ impl PeerStore {
         }
         Ok(())
     }
+}
+
+pub(super) fn has_capacity(conn: &Connection, holder: Hash, now: u64) -> Result<bool> {
+    let (count, owned): (u32, u32) = conn.query_row(
+        "SELECT count(*), count(CASE WHEN holder=?1 THEN 1 END)
+         FROM jobs WHERE state<2 AND expires>?2",
+        params![&holder.0[..], now as i64],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(count < MAX_ACTIVE && owned < MAX_PER_HOLDER)
+}
+
+pub(super) fn enqueue(
+    conn: &Connection,
+    key: JobKey,
+    request: Hash,
+    graph: GraphJob,
+    bindings: BTreeMap<String, BoundCapability>,
+    origin: JobOrigin,
+    now: u64,
+) -> Result<()> {
+    let reaction = !matches!(origin, JobOrigin::Client);
+    let delivery = match origin {
+        JobOrigin::Subscription(delivery) => Some(delivery),
+        _ => None,
+    };
+    let input = Block::Data(Data::from_bytes(&graph.input)?).to_bytes()?;
+    let input_hash = Hash::digest(&input);
+    if !reaction {
+        insert(conn, input_hash, &input)?;
+    }
+    let spec = Specification {
+        grant: graph.grant,
+        mode: graph.mode,
+        delegated_by: graph.delegated_by,
+        budget: graph.budget,
+        bindings,
+    };
+    conn.execute(
+        "INSERT INTO jobs (holder, id, request, program, input, expires, ready, state, spec,
+                           reaction, subscription, event, event_revision, reaction_input)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            &key.holder.0[..],
+            &key.id.0[..],
+            &request.0[..],
+            &graph.program.0[..],
+            &input_hash.0[..],
+            graph.expires_at_ms as i64,
+            now as i64,
+            protocol::encode(&spec)?,
+            reaction,
+            delivery.as_ref().map(|d| &d.subscription.0[..]),
+            delivery.as_ref().map(|d| &d.event.0[..]),
+            delivery.as_ref().map(|d| d.revision),
+            reaction.then_some(graph.input)
+        ],
+    )?;
+    for hash in [Some(graph.program), (!reaction).then_some(input_hash)]
+        .into_iter()
+        .flatten()
+    {
+        conn.execute(
+            "INSERT INTO job_blocks VALUES (?1, ?2, ?3)",
+            params![&key.holder.0[..], &key.id.0[..], &hash.0[..]],
+        )?;
+    }
+    Ok(())
 }
 
 fn job(conn: &Connection, key: JobKey) -> Result<Option<(Hash, JobState)>> {
@@ -399,25 +474,33 @@ fn job(conn: &Connection, key: JobKey) -> Result<Option<(Hash, JobState)>> {
 }
 
 pub(super) fn check_running(conn: &Connection, key: JobKey) -> Result<u64> {
-    let (state, expires): (i64, i64) = conn.query_row(
-        "SELECT state, expires FROM jobs WHERE holder=?1 AND id=?2",
-        params![&key.holder.0[..], &key.id.0[..]],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    if state != RUNNING {
+    let job = conn
+        .query_row(
+            "SELECT j.state, j.expires, j.subscription FROM jobs j WHERE j.holder=?1 AND j.id=?2",
+            params![&key.holder.0[..], &key.id.0[..]],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, Option<[u8; 32]>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((RUNNING, expires, subscription)) = job else {
         return Err(PeerError::Cancelled);
-    }
-    if expires as u64 <= unix_ms() {
+    };
+    if expires <= unix_ms() {
         return Err(PeerError::Timeout);
     }
-    Ok(expires as u64)
+    if let Some(id) = subscription {
+        applications::check_subscription(conn, Hash(id))?;
+    }
+    Ok(expires)
 }
 
 pub(super) fn end(conn: &Connection, key: JobKey, outcome: &JobState) -> Result<()> {
-    conn.execute(
-        "UPDATE jobs SET state=2, spec=NULL, result=?3 WHERE holder=?1 AND id=?2",
-        params![&key.holder.0[..], &key.id.0[..], protocol::encode(outcome)?],
-    )?;
+    let delivered = applications::complete_delivery(conn, key, outcome)?;
     conn.execute(
         "DELETE FROM job_blocks WHERE holder=?1 AND id=?2",
         params![&key.holder.0[..], &key.id.0[..]],
@@ -426,5 +509,16 @@ pub(super) fn end(conn: &Connection, key: JobKey, outcome: &JobState) -> Result<
         "DELETE FROM job_effects WHERE holder=?1 AND id=?2",
         params![&key.holder.0[..], &key.id.0[..]],
     )?;
+    if delivered {
+        conn.execute(
+            "DELETE FROM jobs WHERE holder=?1 AND id=?2",
+            params![&key.holder.0[..], &key.id.0[..]],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE jobs SET state=2, spec=NULL, result=?3, reaction_input=NULL WHERE holder=?1 AND id=?2",
+            params![&key.holder.0[..], &key.id.0[..], protocol::encode(outcome)?],
+        )?;
+    }
     Ok(())
 }

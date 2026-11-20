@@ -573,15 +573,21 @@ impl Invocation<'_> {
                 let child = (peer, Submission { id, graph });
                 attempt
                     .store
-                    .borrow()
+                    .borrow_mut()
                     .save_job_child(attempt.key, ordinal, &child)?;
                 child
             };
             active.check()?;
             let mut traffic = Traffic::default();
+            let program = child.graph.program;
+            let request = if self.call.reaction {
+                Request::SubmitReaction(child)
+            } else {
+                Request::Submit(child)
+            };
             let reply = self.peer(peer)?.exchange_program(
-                child.graph.program,
-                Request::Submit(child),
+                program,
+                request,
                 active.clone(),
                 None,
                 &mut traffic,
@@ -633,7 +639,7 @@ fn remote_value(revision: u64, bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 impl GraphJob {
-    pub(super) fn call(&self, holder: Hash) -> Result<Call> {
+    pub(super) fn call(&self, holder: Hash, reaction: bool) -> Result<Call> {
         self.budget.validate()?;
         if self.input.len() > Block::MAX_BYTES {
             return Err(PeerError::Limit("input bytes"));
@@ -671,6 +677,7 @@ impl GraphJob {
                 expires_at_ms: self.expires_at_ms,
                 delegated_by: self.delegated_by,
             }),
+            reaction,
         })
     }
 }
@@ -727,7 +734,7 @@ impl Server {
         job: GraphJob,
     ) -> Result<Reply> {
         stream.sock.check_active()?;
-        let call = job.call(holder)?;
+        let call = job.call(holder, false)?;
         let bindings = self.graph.resolve(call, job.bindings)?;
         if let Some(receipt) = store.probe_collection(call)? {
             return Ok(graph_reply(receipt, GraphMetrics::default()));

@@ -195,13 +195,18 @@ impl Server {
         store: &mut PeerStore,
         holder: Hash,
         submission: Submission,
+        reaction: bool,
     ) -> Result<Reply> {
         let key = JobKey {
             holder,
             id: submission.id,
         };
         let job = submission.graph;
-        let request = Hash::digest(&protocol::encode(&job)?);
+        let request = if reaction {
+            Hash::digest(&protocol::encode(&(b"pp2 reaction", &job))?)
+        } else {
+            Hash::digest(&protocol::encode(&job)?)
+        };
         if let Some(state) = store.existing_job(key, request)? {
             return Ok(Reply::Job(state));
         }
@@ -212,7 +217,7 @@ impl Server {
         if remaining > MAX_JOB_LIFETIME_MS {
             return Err(PeerError::Limit("job lifetime"));
         }
-        let call = job.call(holder)?;
+        let call = job.call(holder, reaction)?;
         store.confirm_collection(call)?;
         let bindings = self.graph.resolve(call, job.bindings.clone())?;
         let code = receive_code(stream, store, call)?;
@@ -226,6 +231,20 @@ impl Server {
             .map(Reply::Job)
     }
 
+    pub(super) fn schedule_applications(&self, stop: &AtomicBool) {
+        while !stop.load(Ordering::Relaxed) {
+            if let Ok(mut store) = PeerStore::open_with_timeout(&self.database, POLL) {
+                while !stop.load(Ordering::Relaxed) {
+                    if store.schedule_subscriptions(self.identity).is_err() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+            thread::sleep(POLL);
+        }
+    }
+
     pub(super) fn work_jobs(&self, stop: &AtomicBool) {
         while !stop.load(Ordering::Relaxed) {
             if self.work_job(stop).is_err() {
@@ -237,7 +256,7 @@ impl Server {
     fn work_job(&self, stop: &AtomicBool) -> Result<()> {
         let mut store = PeerStore::open_with_timeout(&self.database, POLL)?;
         while !stop.load(Ordering::Relaxed) {
-            let Some(job) = store.claim_job()? else {
+            let Some(job) = store.claim_job(self.identity)? else {
                 thread::sleep(POLL);
                 continue;
             };
@@ -265,11 +284,12 @@ impl Server {
             key,
             graph,
             bindings,
+            reaction,
         } = job;
         let mut call = None;
         let mut watch = None;
         let run = || -> Result<JobState> {
-            let invocation = graph.call(key.holder)?;
+            let invocation = graph.call(key.holder, reaction)?;
             call = Some(invocation);
             store.confirm_collection(invocation)?;
             let attempt = Rc::new(Attempt::new(

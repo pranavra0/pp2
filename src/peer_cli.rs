@@ -29,6 +29,7 @@ const USAGE: &str = "Usage: pp2 peer <command>
   ref-init DB REFERENCE JSON_FILE
   collection-init DB REFERENCE [ENTRIES_NDJSON]
   issue DB REFERENCE HOLDER_CERT reader|writer [PROGRAM]
+  issue-reaction-writer DB REFERENCE HOLDER_CERT PROGRAM
   delegate ADDRESS NAME CA CERT KEY GRANT HOLDER_CERT reader|writer [PROGRAM]
   attenuate ADDRESS NAME CA CERT KEY GRANT HOLDER_CERT reader|writer PROGRAM BUDGET_JSON EXPIRES_AT_MS
   revoke DB GRANT
@@ -150,6 +151,14 @@ pub fn run(args: &[OsString]) -> Result<()> {
                 Credentials::fingerprint(holder)?,
                 access(level)?,
                 optional_hash(program)?,
+            )?;
+            println!("{token}");
+        }
+        ["issue-reaction-writer", db, reference, holder, program] => {
+            let token = PeerStore::open(db)?.issue_reaction_writer(
+                reference,
+                Credentials::fingerprint(holder)?,
+                program.parse()?,
             )?;
             println!("{token}");
         }

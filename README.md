@@ -43,6 +43,21 @@ Use `job-status` and `job-cancel` with the submitting certificate. After an ambi
 
 For an existing stock deployment, keep the peer databases, certificates, and grants. Add a `directory` object to each peer's `profile.json`, keyed by peer name, with an `address` and SHA-256 certificate `fingerprint` for each participating peer. For `peer serve` configurations, use `peers` entries with `address`, TLS `name`, and `fingerprint`, and reference the fingerprint in each binding's `peer` field. Upgrade all peers that participate in a graph together.
 
+## Run the persistent inventory application
+
+~~~sh
+cargo build --release --locked --bin pp2
+python3 scripts/demo-persistent-inventory.py
+~~~
+
+The warehouse accepts a stock update while the office is offline. The demo kills and restarts the warehouse daemon, then starts the office. The warehouse's installed handler resumes automatically and updates the office's inventory projection. The office skips the projection write when delivering its own subscription. The demo also checks that the office can revoke the warehouse's write grant and that removing the warehouse installation stops local delivery. [Demo script](scripts/demo-persistent-inventory.py) and [guest programs](examples/persistent-inventory).
+
+Package the handler and its imports into the serving peer's database. Use `pp2 peer issue DB REFERENCE PEER_CERT reader PROGRAM` to grant the handler a watch on one local reference. For an indexed collection, the same grant can also give the handler read access to its entries. For a snapshot reference, issue a separate read grant on an indexed collection for the handler's storage context.
+
+Use `pp2 app install DB PEER_CERT SUBSCRIPTIONS_JSON` with a JSON object containing `name` and a `subscriptions` object keyed by subscription name. Each subscription specifies `program`, `watch_grant`, `budget`, and `expires_at_ms`. Optional `entry_grant` selects a separate collection and optional `capabilities` lists explicit bindings using the same shape as durable job bindings above. The serving daemon uses its own certificate and must have a directory entry for each destination. Remote resource owners issue their own grants. Use `pp2 peer issue-reaction-writer DB COLLECTION EXECUTOR_CERT PROGRAM` at the destination to allow a handler's durable child to update that collection.
+
+The handler receives `{id, reference, revision}`. The ID is a stable hex string and the revision is a decimal string. `pp2 app status DB APPLICATION` shows each cursor, pending revision, missed count, and most recent terminal outcome. Use `pp2 app unsubscribe DB APPLICATION SUBSCRIPTION` to revoke one subscription or `pp2 app remove DB APPLICATION` to stop the installation. Status reports `removing` while already dispatched children may still hold live deadlines. [Delivery and lifecycle semantics](docs/architecture.md#persistent-applications)
+
 ## Write a guest with effects
 
 The default export of a collection program receives `(pp2, input)`.

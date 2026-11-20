@@ -15,7 +15,12 @@ use super::{
     unix_ms,
 };
 
+mod applications;
 mod jobs;
+pub use applications::{
+    ApplicationSpec, ApplicationState, ApplicationStatus, DeliveryOutcome, DeliveryStatus,
+    SubscriptionSpec, SubscriptionState, SubscriptionStatus,
+};
 pub(super) use jobs::{JobKey, JobOutcome, QueuedJob};
 
 const MAX_DELEGATION_DEPTH: u8 = 8;
@@ -116,6 +121,7 @@ pub(super) struct Authority {
     program: Option<Hash>,
     depth: u8,
     graph: Option<GraphAccess>,
+    reaction_writer: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -132,6 +138,7 @@ pub(super) struct Call {
     pub(super) program: Hash,
     pub(super) update: Option<Update>,
     pub(super) graph: Option<GraphAccess>,
+    pub(super) reaction: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -183,7 +190,7 @@ impl PeerStore {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // Bound the main database. Short transactions keep WAL readers from pinning old pages.
         conn.pragma_update(None, "max_page_count", 65_536)?;
-        if version < 3 {
+        if version < 4 {
             let tx = conn.transaction_with_behavior(Immediate)?;
             let version = database_version(&tx)?;
             if version == 0 {
@@ -194,6 +201,9 @@ impl PeerStore {
             }
             if version < 3 {
                 tx.execute_batch(AUTONOMOUS)?;
+            }
+            if version < 4 {
+                tx.execute_batch(applications::SCHEMA)?;
             }
             tx.commit()?;
         }
@@ -304,6 +314,7 @@ impl PeerStore {
         if added == 0 {
             return Err(PeerError::ReferenceExists(name.to_owned()));
         }
+        applications::record_change(&tx, name, 0, false)?;
         tx.commit()?;
         Ok(Revision { number: 0, hash })
     }
@@ -353,7 +364,31 @@ impl PeerStore {
         access: Access,
         program: Option<Hash>,
     ) -> Result<Hash> {
+        self.issue_grant(reference, holder, access, program, false)
+    }
+
+    /// Grants a pinned program the ability to make updates from durable reactions.
+    pub fn issue_reaction_writer(
+        &mut self,
+        reference: &str,
+        holder: Hash,
+        program: Hash,
+    ) -> Result<Hash> {
+        self.issue_grant(reference, holder, Access::Write, Some(program), true)
+    }
+
+    fn issue_grant(
+        &mut self,
+        reference: &str,
+        holder: Hash,
+        access: Access,
+        program: Option<Hash>,
+        reaction_writer: bool,
+    ) -> Result<Hash> {
         let tx = self.0.transaction_with_behavior(Immediate)?;
+        if reaction_writer {
+            require_kind(&tx, reference, true)?;
+        }
         prune_graph_grants(&tx, unix_ms())?;
         let id = insert_grant(
             &tx,
@@ -364,6 +399,7 @@ impl PeerStore {
                 program,
                 depth: 0,
                 graph: None,
+                reaction_writer,
             },
             None,
         )?;
@@ -373,10 +409,13 @@ impl PeerStore {
 
     /// Revokes a grant and all its descendants in one transaction.
     pub fn revoke(&mut self, grant: Hash) -> Result<bool> {
-        Ok(self
-            .0
-            .execute("DELETE FROM grants WHERE id=?1", [&grant.0[..]])?
-            != 0)
+        let tx = self.0.transaction_with_behavior(Immediate)?;
+        let revoked = tx.execute("DELETE FROM grants WHERE id=?1", [&grant.0[..]])? != 0;
+        if revoked {
+            applications::revoke_unauthorized(&tx)?;
+        }
+        tx.commit()?;
+        Ok(revoked)
     }
 
     pub(super) fn delegate(
@@ -563,6 +602,7 @@ impl PeerStore {
                 insert.execute(params![name, key.as_bytes(), bytes])?;
             }
         }
+        applications::record_change(&tx, name, 0, false)?;
         tx.commit()?;
         Ok(Revision { number: 0, hash })
     }
@@ -609,6 +649,7 @@ impl PeerStore {
             revision: revision.number,
             grant: call.grant,
             update: call.update,
+            reaction: call.reaction,
         }))
     }
 
@@ -623,9 +664,11 @@ impl PeerStore {
             "WITH RECURSIVE live(hash) AS (
             SELECT hash FROM refs UNION SELECT hash FROM blocks WHERE published=1
             UNION SELECT hash FROM job_blocks
+            UNION SELECT s.program FROM subscriptions s JOIN subscription_authority a USING(id)
+                  WHERE s.expires>?1
             UNION SELECT edges.child FROM edges JOIN live ON edges.parent=live.hash
         ) DELETE FROM blocks WHERE hash NOT IN (SELECT hash FROM live)",
-            [],
+            [unix_ms() as i64],
         )?)
     }
 }
@@ -641,6 +684,7 @@ pub(super) struct Collection<'a> {
     revision: u64,
     grant: Hash,
     update: Option<Update>,
+    reaction: bool,
 }
 
 impl Collection<'_> {
@@ -756,6 +800,7 @@ impl Collection<'_> {
                     },
                 )?;
             }
+            applications::record_change(&self.tx, &self.reference, number, self.reaction)?;
         }
         check()?;
         self.tx.commit()?;
@@ -834,6 +879,7 @@ fn replace(conn: &Connection, name: &str, current: Revision, next: &[u8]) -> Res
         "UPDATE refs SET hash=?1, revision=?2 WHERE name=?3",
         params![&hash.0[..], number, name],
     )?;
+    applications::record_change(conn, name, number as u64, false)?;
     Ok(Revision {
         number: number as u64,
         hash,
@@ -851,7 +897,7 @@ fn database_version(conn: &Connection) -> Result<i64> {
     )?;
     match (application, version, entries) {
         (0, 0, 0) => Ok(0),
-        (APPLICATION_ID, 1..=3, _) => Ok(version),
+        (APPLICATION_ID, 1..=4, _) => Ok(version),
         (APPLICATION_ID, _, _) => Err(PeerError::Unsupported("peer database version")),
         _ => Err(PeerError::Unsupported(
             "expected a pp2 database or an empty file",
@@ -956,6 +1002,9 @@ fn insert_grant(
             parent.as_ref().map(|h| &h.0[..])
         ],
     )?;
+    if scope.reaction_writer {
+        conn.execute("INSERT INTO reaction_writers VALUES (?1)", [&id[..]])?;
+    }
     Ok(Hash(id))
 }
 
@@ -973,7 +1022,8 @@ fn prune_graph_grants(conn: &Connection, now: u64) -> Result<()> {
 
 fn authority(conn: &Connection, holder: Hash, grant: Hash) -> Result<Authority> {
     conn.query_row(
-        "SELECT ref, access, program, grants.depth, expires, timeout, calls, graph_grants.depth, presenter
+        "SELECT ref, access, program, grants.depth, expires, timeout, calls, graph_grants.depth, presenter,
+                EXISTS(SELECT 1 FROM reaction_writers WHERE id=grants.id)
          FROM grants LEFT JOIN graph_grants USING(id)
          WHERE id=?1 AND holder=?2 AND (expires IS NULL OR expires>?3)",
         params![&grant.0[..], &holder.0[..], unix_ms() as i64],
@@ -999,6 +1049,7 @@ fn authority(conn: &Connection, holder: Hash, grant: Hash) -> Result<Authority> 
                     }),
                     None => None,
                 },
+                reaction_writer: row.get(9)?,
             })
         },
     )
@@ -1010,6 +1061,8 @@ fn authorize(conn: &Connection, call: Call) -> Result<Authority> {
     let scope = authority(conn, call.holder, call.grant)?;
     if scope.program.is_some_and(|allowed| allowed != call.program)
         || (call.update.is_some() && scope.access != Access::Write)
+        || (scope.reaction_writer && !call.reaction)
+        || (call.reaction && call.update.is_some() && !scope.reaction_writer)
         || call.graph.and_then(|graph| graph.delegated_by)
             != scope.graph.and_then(|limit| limit.delegated_by)
         || scope.graph.is_some_and(|limit| {

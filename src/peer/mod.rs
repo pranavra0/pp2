@@ -12,7 +12,10 @@ pub use content::{JavaScript, data_from_json, data_to_json};
 pub use effects::{
     Binding, BindingSet, GraphBudget, GraphMetrics, PeerEndpoint, validate_binding_names,
 };
-pub use storage::{Access, PeerStore, RECEIPT_WINDOW, Revision};
+pub use storage::{
+    Access, ApplicationSpec, ApplicationState, ApplicationStatus, DeliveryOutcome, DeliveryStatus,
+    PeerStore, RECEIPT_WINDOW, Revision, SubscriptionSpec, SubscriptionState, SubscriptionStatus,
+};
 pub use transport::{
     Cancellation, Client, Credentials, DurableEvaluation, Evaluation, EvaluationMode,
     GraphEvaluation, GraphReport, JobStatus, RemoteReport, Server,

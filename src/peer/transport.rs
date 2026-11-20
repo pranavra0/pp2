@@ -24,7 +24,7 @@ use crate::{Block, Data, Hash};
 pub use super::protocol::EvaluationMode;
 use super::{
     Access, PeerError, PeerStore, Result,
-    content::{self, Kind, MAX_CODE, MAX_MODULES},
+    content::{self, MAX_MODULES, load_code},
     effects::{BindingSet, PeerEndpoint},
     protocol::{self, Job, Reply, Request},
     storage::{self, Call, EvaluationStart, Update},
@@ -497,6 +497,7 @@ pub struct Server {
     worker: PathBuf,
     tls: Arc<ServerConfig>,
     graph: graph::Configuration,
+    identity: Hash,
 }
 
 impl Server {
@@ -511,6 +512,7 @@ impl Server {
         }
         PeerStore::open(database.as_ref())?;
         let (certs, key) = creds.identity()?;
+        let identity = Hash::digest(&certs[0]);
         let verifier = WebPkiClientVerifier::builder(Arc::new(creds.roots()?))
             .build()
             .map_err(tls)?;
@@ -525,6 +527,7 @@ impl Server {
             worker: worker.as_ref().canonicalize()?,
             tls: Arc::new(config),
             graph: graph::Configuration::default(),
+            identity,
         })
     }
 
@@ -551,6 +554,7 @@ impl Server {
         let server = Arc::new(self);
         let stop = AtomicBool::new(false);
         thread::scope(|scope| {
+            scope.spawn(|| server.schedule_applications(&stop));
             for _ in 0..jobs::WORKERS {
                 scope.spawn(|| server.work_jobs(&stop));
             }
@@ -636,7 +640,10 @@ impl Server {
                 Request::Run(job) => self.run_graph(&mut stream, &mut store, holder, job),
                 Request::Forward(request) => store.forward(holder, request).map(Reply::Delegated),
                 Request::Submit(submission) => {
-                    self.submit_job(&mut stream, &mut store, holder, submission)
+                    self.submit_job(&mut stream, &mut store, holder, submission, false)
+                }
+                Request::SubmitReaction(submission) => {
+                    self.submit_job(&mut stream, &mut store, holder, submission, true)
                 }
                 Request::JobStatus(id) => store
                     .job_status(storage::JobKey { holder, id })
@@ -681,6 +688,7 @@ impl Server {
             program: job.program,
             update,
             graph: None,
+            reaction: false,
         };
         let mut snapshot = match store.begin(call)? {
             EvaluationStart::Replayed(receipt) => {
@@ -778,43 +786,4 @@ impl Drop for Slot {
 
 fn update_result_error() -> PeerError {
     PeerError::Value("expected exactly {next, value} from an update".into())
-}
-
-fn load_code(
-    root: Hash,
-    allow_missing: bool,
-    mut get: impl FnMut(Hash) -> Result<Option<Vec<u8>>>,
-) -> Result<Vec<(Hash, Vec<u8>)>> {
-    let mut seen = BTreeSet::new();
-    let mut pending = vec![root];
-    let mut graph = Vec::new();
-    let mut bytes_left = MAX_CODE;
-    while let Some(hash) = pending.pop() {
-        if !seen.insert(hash) {
-            continue;
-        }
-        if seen.len() > MAX_MODULES {
-            return Err(PeerError::Limit("module graph count"));
-        }
-        let Some(bytes) = get(hash)? else {
-            if allow_missing {
-                continue;
-            }
-            return Err(PeerError::Missing(hash));
-        };
-        bytes_left = bytes_left
-            .checked_sub(bytes.len())
-            .ok_or(PeerError::Limit("module graph bytes"))?;
-        match content::inspect(hash, &bytes)? {
-            (Kind::JavaScript, imports) => pending.extend(imports),
-            (Kind::Aeb, _) if hash == root => {}
-            _ => {
-                return Err(PeerError::Value(
-                    "unexpected block kind in module graph".into(),
-                ));
-            }
-        }
-        graph.push((hash, bytes));
-    }
-    Ok(graph)
 }

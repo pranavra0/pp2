@@ -91,6 +91,45 @@ pub(super) fn inspect(expected: Hash, bytes: &[u8]) -> Result<(Kind, BTreeSet<Ha
     ))
 }
 
+pub(super) fn load_code(
+    root: Hash,
+    allow_missing: bool,
+    mut get: impl FnMut(Hash) -> Result<Option<Vec<u8>>>,
+) -> Result<Vec<(Hash, Vec<u8>)>> {
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![root];
+    let mut graph = Vec::new();
+    let mut bytes_left = MAX_CODE;
+    while let Some(hash) = pending.pop() {
+        if !seen.insert(hash) {
+            continue;
+        }
+        if seen.len() > MAX_MODULES {
+            return Err(PeerError::Limit("module graph count"));
+        }
+        let Some(bytes) = get(hash)? else {
+            if allow_missing {
+                continue;
+            }
+            return Err(PeerError::Missing(hash));
+        };
+        bytes_left = bytes_left
+            .checked_sub(bytes.len())
+            .ok_or(PeerError::Limit("module graph bytes"))?;
+        match inspect(hash, &bytes)? {
+            (Kind::JavaScript, imports) => pending.extend(imports),
+            (Kind::Aeb, _) if hash == root => {}
+            _ => {
+                return Err(PeerError::Value(
+                    "unexpected block kind in module graph".into(),
+                ));
+            }
+        }
+        graph.push((hash, bytes));
+    }
+    Ok(graph)
+}
+
 /// Converts JSON into pp2 data. Integers must be exactly representable in JavaScript.
 pub fn data_from_json(value: Value) -> Result<Data> {
     fn convert(value: Value, depth: usize) -> Result<Data> {

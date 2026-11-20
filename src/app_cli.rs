@@ -20,6 +20,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const USAGE: &str = "Usage: pp2 app <command>
+  install DB PEER_CERT SUBSCRIPTIONS_JSON
+  status DB APPLICATION
+  unsubscribe DB APPLICATION SUBSCRIPTION
+  remove DB APPLICATION
   init MANIFEST DIRECTORY
   run DIRECTORY [INPUT_JSON]
   serve PEER_DIRECTORY
@@ -117,6 +121,25 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
         .collect::<std::result::Result<_, _>>()?;
     match args.as_slice() {
         [] | ["--help" | "-h"] => println!("{USAGE}"),
+        ["install", db, cert, manifest] => PeerStore::open(db)?.install_application(
+            Credentials::fingerprint(cert)?,
+            read_json(Path::new(manifest))?,
+        )?,
+        ["status", db, application] => {
+            let status = PeerStore::open(db)?.application_status(application)?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        ["unsubscribe", db, application, subscription] => {
+            PeerStore::open(db)?.revoke_subscription(application, subscription)?;
+        }
+        ["remove", db, application] => {
+            let mut store = PeerStore::open(db)?;
+            store.remove_application(application)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.application_status(application)?)?
+            );
+        }
         ["init", manifest, directory] => init(Path::new(manifest), Path::new(directory))?,
         ["run", directory, rest @ ..] if rest.len() <= 1 => {
             run_local(Path::new(directory), rest.first().copied())?;

@@ -50,6 +50,7 @@ pub(super) enum Request {
     Submit(Submission),
     JobStatus(Hash),
     CancelJob(Hash),
+    SubmitReaction(Submission),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
