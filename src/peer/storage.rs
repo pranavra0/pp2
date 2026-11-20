@@ -194,12 +194,15 @@ impl PeerStore {
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(busy)?;
         let version = database_version(&conn)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        let journal: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if journal != "wal" && path != Path::new(":memory:") {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+        }
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // Bound the main database. Short transactions keep WAL readers from pinning old pages.
         conn.pragma_update(None, "max_page_count", 65_536)?;
-        if version < 6 {
+        if version < 7 {
             let tx = conn.transaction_with_behavior(Immediate)?;
             let version = database_version(&tx)?;
             if version == 0 {
@@ -219,6 +222,9 @@ impl PeerStore {
             }
             if version < 6 {
                 tx.execute_batch(replicas::SCHEMA)?;
+            }
+            if version < 7 {
+                tx.execute_batch(replicas::RETENTION_SCHEMA)?;
             }
             tx.commit()?;
         }
@@ -745,15 +751,17 @@ impl PeerStore {
     /// Drops blocks unreachable from references and publications in one transaction.
     pub fn collect(&mut self) -> Result<usize> {
         Ok(self.0.execute(
-            "WITH RECURSIVE live(hash) AS (
-            SELECT hash FROM refs UNION SELECT hash FROM blocks WHERE published=1
-            UNION SELECT id FROM replica_versions
-            UNION SELECT tip FROM replica_pending
-            UNION SELECT hash FROM job_blocks
-            UNION SELECT package FROM native_installations
-            UNION SELECT s.program FROM subscriptions s JOIN subscription_authority a USING(id)
+            "WITH RECURSIVE live(hash, full_graph) AS (
+            SELECT hash, 1 FROM refs UNION SELECT hash, 1 FROM blocks WHERE published=1
+            UNION SELECT id, 0 FROM replica_versions
+            UNION SELECT tip, 0 FROM replica_pending
+            UNION SELECT hash, 1 FROM job_blocks
+            UNION SELECT package, 1 FROM native_installations
+            UNION SELECT s.program, 1 FROM subscriptions s JOIN subscription_authority a USING(id)
                   WHERE s.expires>?1
-            UNION SELECT edges.child FROM edges JOIN live ON edges.parent=live.hash
+            UNION SELECT edges.child, live.full_graph FROM edges JOIN live ON edges.parent=live.hash
+                  WHERE live.full_graph=1 OR NOT EXISTS(SELECT 1 FROM replica_versions v
+                      WHERE v.id=edges.parent AND v.root=edges.child AND v.retained=0)
         ) DELETE FROM blocks WHERE NOT EXISTS(SELECT 1 FROM live WHERE live.hash=blocks.hash)",
             [unix_ms() as i64],
         )?)
@@ -844,7 +852,9 @@ impl Collection<'_> {
                 )?;
                 json!(deleted != 0)
             }
-            Effect::Evaluate(_) | Effect::Host(..) => return Err(PeerError::Denied),
+            Effect::Evaluate(_) | Effect::EvaluateBatch(_) | Effect::Host(..) => {
+                return Err(PeerError::Denied);
+            }
         };
         content::data_from_json(result)?
             .to_bytes()
@@ -1087,7 +1097,7 @@ fn database_version(conn: &Connection) -> Result<i64> {
     )?;
     match (application, version, entries) {
         (0, 0, 0) => Ok(0),
-        (APPLICATION_ID, 1..=6, _) => Ok(version),
+        (APPLICATION_ID, 1..=7, _) => Ok(version),
         (APPLICATION_ID, _, _) => Err(PeerError::Unsupported("peer database version")),
         _ => Err(PeerError::Unsupported(
             "expected a pp2 database or an empty file",

@@ -146,6 +146,8 @@ The demo installs the same native package in three independent workspaces. Two d
 
 Owners can also share resources in `immutable` and `single-writer` modes. Use `store` for a copy that can synchronize, `read` to allow local execution, and `write` to also allow local updates on multi-writer resources. Use `pp2 peer replica --help` for placement, status, history, and revocation commands.
 
+For a single-writer resource, `pp2 peer replica retain HOME RESOURCE 32` keeps up to 32 recent snapshots in that workspace. `pp2 peer gc HOME/peer.db` collects unreferenced payload blocks. History still lists signed revisions and indicates which snapshots retain their payloads. A fresh or stale upgraded peer can synchronize from a compacted source. Use `sync --once` to run one bounded transfer pass. [Retention and compatibility](docs/architecture.md#snapshot-retention)
+
 ## Write a guest with effects
 
 The default export of a collection program receives `(pp2, input)`.
@@ -155,9 +157,10 @@ The default export of a collection program receives `(pp2, input)`.
 - `pp2.storage.get(key)` resolves to `{found: false}` or `{found: true, value}`. Values may be null.
 - `pp2.storage.scan({prefix, after, limit})` resolves to `{entries, next}`. Each entry is a key-value pair. Pass `next` as the exclusive `after` cursor for the next page, until it is null. The host orders keys by their UTF-8 bytes and caps each page by rows and encoded size.
 - `pp2.evaluate(capability, input, {calls, delegate, timeoutMs, update, consistency})` resolves to `{revision, value}` and includes `view` for replicated resources. Pass a capability from `pp2.capabilities`. Its grant determines which collection and program the target peer authorizes. Set `calls: 0` for a leaf. An optional `delegate` array supplies the only capabilities available to the child. An optional `timeoutMs` shortens that branch's inherited deadline.
+- `pp2.evaluateAll([{capability, input, timeoutMs, consistency}])` returns one to four leaf read results in input order. Each leaf consumes one graph call. Synchronous read graphs can run the leaves concurrently. Durable jobs, native invocations, and update graphs run the batch in order.
 - On a write invocation, `pp2.storage.put(key, value)` and `pp2.storage.delete(key)` change the local collection. The program returns its ordinary result. The peer commits the changes, revision, and retry receipt together. A remote update requires a writable capability and explicit `update: {revision, operation}`, where `operation` is a 64-character hexadecimal operation ID. Updates are leaves.
 
-Capabilities can be passed to functions, stored in objects, and passed to child invocations through `delegate`. The executing peer keeps the network settings and grant tokens outside the worker. It obtains recipient-bound grants for the requested subset and sends them to the child. Effect failures reject their promises. The API supports normal JavaScript control flow and promise composition. Each worker currently services its submitted effects in order.
+Capabilities can be passed to functions, stored in objects, and passed to child invocations through `delegate`. The executing peer keeps the network settings and grant tokens outside the worker. It obtains recipient-bound grants for the requested subset and sends them to the child. Effect failures reject their promises. Workers service effects in submission order.
 
 Collection programs can inspect `pp2.storage.view`. The default `consistency: 'authoritative'` requires an authoritative state. Specify `'replica'` to allow the local view at the peer named in the capability, or pass an immutable revision ID for an exact read. Multi-writer commits use replica consistency. When a replica view reports multiple heads, read those revisions and submit an update with `merge: true` and the current numeric revision. The leaf program writes the merged state through the same collection effects.
 
@@ -260,11 +263,15 @@ inventory release inventory.json 1 order-42
 ## Verification
 
 ~~~sh
+cargo test --locked --all-targets
+cargo build --locked --release --bin pp2 --examples
 scripts/validate-peers.py --isolated-networks
 scripts/validate-peers.py --samples 40
 scripts/benchmark-graph.py --isolated-networks --samples 40
+python3 scripts/demo-replicated-notes.py --pp2 target/release/pp2 --isolated-networks \
+  --fault-rounds 10 --operations-per-writer 25 --seed 761
 ~~~
 
-The validation script uses Python 3.9 or later, OpenSSL, and the TypeScript toolchain from `npm ci`. The network namespace run also uses Linux user namespaces, `unshare`, `nsenter`, and `ip`. The snapshot comparison uses Python's SQLite build with FTS5. The graph comparison uses the same stock queries on three pp2 peers and a conventional mTLS service. [Runtime design and measurements](docs/architecture.md)
+The validation script uses Python 3.9 or later, OpenSSL, and the TypeScript toolchain from `npm ci`. The network namespace runs also use Linux user namespaces, `unshare`, `nsenter`, and `ip`. The snapshot comparison uses Python's SQLite build with FTS5. The graph comparison uses the same stock queries on three pp2 peers and a conventional mTLS service. Add `--trace-dir` with a directory path to collect per-peer timing traces, or repeat `--load-clients` with counts such as 4, 16, and 24 to measure pp2 under load. [Runtime design and measurements](docs/architecture.md#three-peer-graph-measurements)
 
 Use `pp2 eval` for local binary IR evaluation and `pp2 demo placement` for the simulated filter-and-fold workload. The other simulator scenarios are `sandbox`, `locality`, `gossip`, and `gc`.

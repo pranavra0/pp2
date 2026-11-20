@@ -12,6 +12,31 @@ use crate::peer::{
 };
 
 type Inbound = StreamOwned<ServerConnection, Socket>;
+const TRACE_EXPORTER: &[u8] = b"EXPORTER-pp2-graph-trace-v1";
+
+fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("PP2_TRACE_GRAPH").as_deref() == Ok("1"))
+}
+
+fn failure_class<T>(result: &Result<T>) -> Option<&'static str> {
+    use PeerError::*;
+    result.as_ref().err().map(|error| match error {
+        Denied => "denied",
+        PeerUnavailable(_) => "peer-unavailable",
+        Tls(_) => "authentication",
+        Conflict(_) => "conflict",
+        Missing(_) => "missing",
+        Timeout => "timeout",
+        Cancelled => "cancelled",
+        Busy => "busy",
+        Storage(_) => "storage",
+        Guest(_) => "guest",
+        Limit(_) => "limit",
+        Io(_) => "io",
+        _ => "invalid",
+    })
+}
 
 pub struct GraphEvaluation<'a> {
     pub evaluation: Evaluation<'a>,
@@ -205,36 +230,78 @@ impl Client {
             return Err(PeerError::Cancelled);
         }
         active.check()?;
-        let (mut stream, _registration) = self.connect_active(active, cancellation)?;
-        traffic.sent += protocol::send(&mut stream, &request)?;
-        let mut code = None;
-        let mut requested = BTreeSet::new();
-        loop {
-            let (reply, bytes) = protocol::receive::<Reply>(&mut stream)?;
-            traffic.received += bytes;
-            match reply {
-                Reply::NeedProgram(hash) => {
-                    if requested.len() >= MAX_MODULES || !requested.insert(hash) {
-                        return Err(PeerError::Protocol("invalid program negotiation".into()));
-                    }
-                    let code = match &mut code {
-                        Some(code) => code,
-                        None => code.insert(
-                            load_code(program, true, &mut get)?
-                                .into_iter()
-                                .collect::<BTreeMap<_, _>>(),
-                        ),
-                    };
-                    traffic.sent += protocol::send(&mut stream, &code.remove(&hash))?;
-                }
-                Reply::Graph { .. } | Reply::ResourceGraph { .. } | Reply::Job(_) => {
-                    stream.sock.activity.check()?;
-                    return Ok(reply);
-                }
-                Reply::Failed(error) => return Err(error.into()),
-                _ => return Err(unexpected_reply()),
+        let started = Instant::now();
+        let traced = trace_enabled();
+        let parent = active.invocation;
+        let job = match &request {
+            Request::Submit(submission) | Request::SubmitReaction(submission) => {
+                Some(submission.id)
             }
+            _ => None,
+        };
+        let mut invocation = None;
+        let mut connection = None;
+        let mut connect_us = None;
+        let mut modules = BTreeSet::new();
+        let result = (|| {
+            let (mut stream, _registration, timing) = self.connect_active(active, cancellation)?;
+            connect_us = Some(protocol::elapsed_us(started));
+            connection = Some(timing);
+            if traced {
+                invocation = stream
+                    .conn
+                    .export_keying_material([0; 32], TRACE_EXPORTER, None)
+                    .ok()
+                    .map(Hash);
+            }
+            traffic.send(&mut stream, &request)?;
+            let mut code = None;
+            loop {
+                match traffic.receive(&mut stream)? {
+                    Reply::NeedProgram(hash) => {
+                        if modules.len() >= MAX_MODULES || !modules.insert(hash) {
+                            return Err(PeerError::Protocol("invalid program negotiation".into()));
+                        }
+                        let code = match &mut code {
+                            Some(code) => code,
+                            None => code.insert(
+                                load_code(program, true, &mut get)?
+                                    .into_iter()
+                                    .collect::<BTreeMap<_, _>>(),
+                            ),
+                        };
+                        traffic.send(&mut stream, &code.remove(&hash))?;
+                    }
+                    reply @ (Reply::Graph { .. } | Reply::ResourceGraph { .. } | Reply::Job(_)) => {
+                        stream.sock.activity.check()?;
+                        return Ok(reply);
+                    }
+                    Reply::Failed(error) => return Err(error.into()),
+                    _ => return Err(unexpected_reply()),
+                }
+            }
+        })();
+        if traced {
+            let peer = match &self.destination {
+                Destination::Identity { id, .. } => Some(*id),
+                Destination::Certificate { fingerprint, .. } => *fingerprint,
+            };
+            let _ = writeln!(
+                io::stderr().lock(),
+                "{}",
+                serde_json::json!({
+                    "event": "graph_exchange", "program": program.to_string(),
+                    "peer": peer.map(|id| id.to_string()), "invocation": invocation.map(|id| id.to_string()),
+                    "parent": parent.map(|id| id.to_string()),
+                    "job": job.map(|id| id.to_string()),
+                    "elapsed_us": protocol::elapsed_us(started), "connect_us": connect_us,
+                    "connection": connection, "postcard_us": traffic.codec_us,
+                    "request_bytes": traffic.sent, "response_bytes": traffic.received,
+                    "requested_modules": modules.len(), "failure": failure_class(&result),
+                })
+            );
         }
+        result
     }
 }
 
@@ -353,8 +420,29 @@ pub(super) fn dial(
 pub(super) struct Traffic {
     pub(super) sent: u64,
     pub(super) received: u64,
+    codec_us: u64,
 }
 
+impl Traffic {
+    fn send(&mut self, stream: &mut Outbound, value: &impl serde::Serialize) -> Result<()> {
+        let started = Instant::now();
+        let bytes = protocol::encode(value)?;
+        self.codec_us += protocol::elapsed_us(started);
+        self.sent += protocol::write_payload(stream, &bytes)?;
+        Ok(())
+    }
+
+    fn receive(&mut self, stream: &mut Outbound) -> Result<Reply> {
+        let bytes = protocol::read_payload(stream)?;
+        self.received += (8 + bytes.len()) as u64;
+        let started = Instant::now();
+        let decoded = protocol::decode(&bytes)?;
+        self.codec_us += protocol::elapsed_us(started);
+        Ok(decoded)
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(super) enum Execution<'a> {
     Synchronous,
     Durable(&'a Attempt),
@@ -552,6 +640,96 @@ impl Invocation<'_> {
                 Err(error)
             }
         }
+    }
+
+    fn invoke_batch(
+        &mut self,
+        reads: Vec<Remote>,
+        scope: &mut Scope,
+        active: &Activity,
+        durable: Option<&Attempt>,
+    ) -> Result<Vec<u8>> {
+        let mut remaining = scope.clone();
+        for read in &reads {
+            remaining.allocate(read)?;
+        }
+        let results = if durable.is_some() || self.native || self.call.update.is_some() {
+            reads
+                .into_iter()
+                .map(|read| match durable {
+                    Some(attempt) => self.invoke_durable(read, scope, active.clone(), attempt),
+                    None => self.invoke(read, scope, active.clone()),
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            self.packages.confirm_collection(self.call)?;
+            active.check()?;
+            let budget = scope.budget;
+            *scope = remaining;
+            let server = self.server;
+            let call = self.call;
+            let deadline = active.deadline;
+            let invocation = active.invocation;
+            let results = thread::scope(|threads| {
+                let workers = reads
+                    .into_iter()
+                    .map(|read| {
+                        let sockets = active.sockets.clone();
+                        let routes = BTreeMap::from([(
+                            read.target.clone(),
+                            self.routes[&read.target].clone(),
+                        )]);
+                        thread::Builder::new().spawn_scoped(threads, move || {
+                            let active = Activity {
+                                deadline,
+                                sockets,
+                                job: None,
+                                invocation,
+                            };
+                            let mut scope = Scope {
+                                budget: GraphBudget { calls: 1, ..budget },
+                                bindings: vec![read.target.clone()],
+                            };
+                            let mut invocation = Invocation {
+                                server,
+                                routes,
+                                packages: PeerStore::open_with_timeout(
+                                    &server.database,
+                                    active.storage_wait()?,
+                                )?,
+                                call,
+                                native: false,
+                                metrics: GraphMetrics::default(),
+                            };
+                            let value = invocation.invoke(read, &mut scope, active);
+                            Ok((value, invocation.metrics))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                workers
+                    .into_iter()
+                    .map(|worker| -> Result<_> {
+                        worker?.join().map_err(|_| {
+                            PeerError::Protocol("parallel read thread exited".into())
+                        })?
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let results = results
+                .into_iter()
+                .map(|result| {
+                    let (result, metrics) = result?;
+                    self.metrics.add_descendant(metrics);
+                    result
+                })
+                .collect::<Vec<_>>();
+            results.into_iter().collect::<Result<Vec<_>>>()?
+        };
+        let values = results
+            .iter()
+            .map(|bytes| Data::from_bytes(bytes))
+            .collect::<crate::Result<_>>()?;
+        Ok(Data::List(values).to_bytes()?)
     }
 
     fn invoke_durable(
@@ -813,7 +991,7 @@ impl Client {
     }
 
     fn forward(&self, request: Forward, active: Activity, traffic: &mut Traffic) -> Result<Hash> {
-        let (mut stream, _) = self.connect_active(active, None)?;
+        let (mut stream, _, _) = self.connect_active(active, None)?;
         traffic.sent += protocol::send(&mut stream, &Request::Forward(request))?;
         let (reply, received) = protocol::receive::<Reply>(&mut stream)?;
         traffic.received += received;
@@ -897,13 +1075,21 @@ impl Server {
             return Ok(graph_reply(receipt, GraphMetrics::default()));
         }
         let code = self.receive_code(stream, store, call)?;
+        let mut active = stream.sock.active();
+        if trace_enabled() {
+            active.invocation = stream
+                .conn
+                .export_keying_material([0; 32], TRACE_EXPORTER, None)
+                .ok()
+                .map(Hash);
+        }
         let (receipt, metrics) = self.execute_graph(
             store,
             call,
             code,
             job.input,
             bindings,
-            stream.sock.active(),
+            active,
             Execution::Synchronous,
         )?;
         Ok(graph_reply(receipt, metrics))
@@ -917,8 +1103,53 @@ impl Server {
         code: Vec<(Hash, Vec<u8>)>,
         input: Vec<u8>,
         bindings: BTreeMap<String, BoundCapability>,
+        mut active: Activity,
+        execution: Execution<'_>,
+    ) -> Result<(super::super::storage::Receipt, GraphMetrics)> {
+        let started = Instant::now();
+        let mut trace = GraphTrace {
+            stage: "setup",
+            ..GraphTrace::default()
+        };
+        if let Execution::Durable(attempt) = execution {
+            active.invocation = Some(attempt.key.id);
+        }
+        let invocation = active.invocation;
+        let result = self.execute_graph_inner(
+            store, call, code, input, bindings, active, execution, &mut trace,
+        );
+        if trace_enabled() {
+            let job = match execution {
+                Execution::Durable(attempt) => Some(attempt.key.id.to_string()),
+                _ => None,
+            };
+            let _ = writeln!(
+                io::stderr().lock(),
+                "{}",
+                serde_json::json!({
+                    "event": "graph_execution", "peer": self.identity.to_string(),
+                    "program": call.program.to_string(), "holder": call.holder.to_string(),
+                    "invocation": invocation.map(|id| id.to_string()), "job": job,
+                    "elapsed_us": protocol::elapsed_us(started), "trace": trace,
+                    "metrics": result.as_ref().ok().map(|(_, metrics)| metrics),
+                    "failure": failure_class(&result),
+                })
+            );
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_graph_inner(
+        &self,
+        store: &mut PeerStore,
+        call: Call,
+        code: Vec<(Hash, Vec<u8>)>,
+        input: Vec<u8>,
+        bindings: BTreeMap<String, BoundCapability>,
         active: Activity,
         execution: Execution<'_>,
+        trace: &mut GraphTrace,
     ) -> Result<(super::super::storage::Receipt, GraphMetrics)> {
         if !code[0].1.starts_with(content::MAGIC) {
             return Err(PeerError::Value(
@@ -943,10 +1174,13 @@ impl Server {
                 metrics: GraphMetrics::default(),
             })
         };
+        trace.stage = "storage_open";
+        let started = Instant::now();
         let storage = match store.scoped(call, active.storage_wait()?)? {
             ScopedStart::Collection(storage) => storage,
             ScopedStart::Replayed(receipt) => return Ok((receipt, GraphMetrics::default())),
         };
+        trace.storage_open_us = protocol::elapsed_us(started);
         let persisted = if event.is_none() {
             storage.host_resource()?
         } else {
@@ -986,6 +1220,7 @@ impl Server {
         };
         let mut storage_effects = 0;
         let mut storage_us = 0;
+        trace.stage = "worker";
         let output = worker::run(
             &self.worker,
             Work {
@@ -1003,43 +1238,51 @@ impl Server {
             || active.check(),
             |effect| {
                 effect.validate()?;
-                let bytes = match effect {
-                    Effect::Evaluate(remote) => {
-                        let invocation = invocation.as_mut().ok_or(PeerError::Denied)?;
-                        match durable {
-                            Some(attempt) => invocation.invoke_durable(
-                                remote,
-                                &mut scope,
-                                active.clone(),
-                                attempt,
-                            )?,
-                            None => invocation.invoke(remote, &mut scope, active.clone())?,
+                let bytes =
+                    match effect {
+                        Effect::Evaluate(remote) => {
+                            let invocation = invocation.as_mut().ok_or(PeerError::Denied)?;
+                            match durable {
+                                Some(attempt) => invocation.invoke_durable(
+                                    remote,
+                                    &mut scope,
+                                    active.clone(),
+                                    attempt,
+                                )?,
+                                None => invocation.invoke(remote, &mut scope, active.clone())?,
+                            }
                         }
-                    }
-                    Effect::Host(operation, input) => {
-                        let (provider, resource) = resource.ok_or(PeerError::Denied)?;
-                        confirm_host()?;
-                        let value = provider.read(
-                            &resource.configuration,
-                            &operation,
-                            Data::from_bytes(&input)?,
-                            &confirm_host,
-                        );
-                        confirm_host()?;
-                        value?.to_bytes()?
-                    }
-                    storage_effect => {
-                        storage_effects += 1;
-                        let started = Instant::now();
-                        let result = storage.effect(storage_effect);
-                        storage_us += started.elapsed().as_micros() as u64;
-                        result?
-                    }
-                };
+                        Effect::EvaluateBatch(reads) => invocation
+                            .as_mut()
+                            .ok_or(PeerError::Denied)?
+                            .invoke_batch(reads, &mut scope, &active, durable)?,
+                        Effect::Host(operation, input) => {
+                            let (provider, resource) = resource.ok_or(PeerError::Denied)?;
+                            confirm_host()?;
+                            let value = provider.read(
+                                &resource.configuration,
+                                &operation,
+                                Data::from_bytes(&input)?,
+                                &confirm_host,
+                            );
+                            confirm_host()?;
+                            value?.to_bytes()?
+                        }
+                        storage_effect => {
+                            storage_effects += 1;
+                            let started = Instant::now();
+                            let result = storage.effect(storage_effect);
+                            storage_us += started.elapsed().as_micros() as u64;
+                            result?
+                        }
+                    };
                 effects::check_response(&bytes)?;
                 Ok(bytes)
             },
         )?;
+        trace.worker = Some(output.timing);
+        trace.guest_memory_bytes = Some(output.metrics.memory);
+        trace.storage_effect_us = storage_us;
         if let Some(attempt) = durable {
             attempt.check_effects()?;
         }
@@ -1053,12 +1296,16 @@ impl Server {
             worker_startup_us: output.startup_us,
             ..GraphMetrics::default()
         });
+        trace.stage = "storage_finish";
+        let started = Instant::now();
         let receipt = storage.finish(
             output.value,
             || active.check(),
             durable.map(|job| (job.key, metrics)),
             self.network.as_ref().map(PeerNetwork::identity),
         )?;
+        trace.storage_finish_us = protocol::elapsed_us(started);
+        trace.stage = "release";
         if call.update.is_none() {
             if let Some(view) = &receipt.view {
                 store.confirm(call, view)?;
@@ -1067,8 +1314,19 @@ impl Server {
             }
             active.check()?;
         }
+        trace.stage = "complete";
         Ok((receipt, metrics))
     }
+}
+
+#[derive(Default, serde::Serialize)]
+struct GraphTrace {
+    stage: &'static str,
+    storage_open_us: u64,
+    storage_effect_us: u64,
+    storage_finish_us: u64,
+    worker: Option<worker::WorkerTiming>,
+    guest_memory_bytes: Option<u64>,
 }
 
 fn graph_reply(receipt: crate::peer::storage::Receipt, metrics: GraphMetrics) -> Reply {

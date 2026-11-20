@@ -45,6 +45,14 @@ ALTER TABLE jobs ADD COLUMN replica_grant BLOB;
 PRAGMA user_version = 6;
 ";
 
+pub(super) const RETENTION_SCHEMA: &str = "
+ALTER TABLE replicas ADD COLUMN retain_snapshots INTEGER;
+ALTER TABLE replica_versions ADD COLUMN retained INTEGER NOT NULL DEFAULT 1;
+CREATE INDEX replica_retained ON replica_versions(resource, id) WHERE retained=1;
+ALTER TABLE replica_pending ADD COLUMN proofs_only INTEGER NOT NULL DEFAULT 0;
+PRAGMA user_version = 7;
+";
+
 pub(in crate::peer) struct Replica {
     pub id: Hash,
     pub owner: Hash,
@@ -345,6 +353,28 @@ impl PeerStore {
         })
     }
 
+    /// Keeps full state for at most this many revisions on the single-writer chain.
+    /// The signed records remain available for ancestry verification.
+    pub fn retain_replica_snapshots(&mut self, resource: Hash, keep: u16) -> Result<usize> {
+        if keep == 0 {
+            return Err(PeerError::Limit("minimum retained snapshots"));
+        }
+        let tx = self.0.transaction_with_behavior(Immediate)?;
+        let replica = by_id(&tx, resource)?;
+        if replica.policy()?.mode != ResourceMode::SingleWriter {
+            return Err(PeerError::Value(
+                "snapshot retention requires a single-writer resource".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE replicas SET retain_snapshots=?2 WHERE id=?1",
+            params![&resource.0[..], keep],
+        )?;
+        let pruned = prune_snapshots(&tx, resource, &replica.heads)?;
+        tx.commit()?;
+        Ok(pruned)
+    }
+
     /// Lists verified changes in address order for local administration and audit.
     pub fn replica_history(
         &self,
@@ -358,7 +388,7 @@ impl PeerStore {
         let tx = self.0.unchecked_transaction()?;
         by_id(&tx, resource)?;
         let mut query = tx.prepare_cached(
-            "SELECT v.id, v.valid, b.bytes FROM replica_versions v JOIN blocks b ON b.hash=v.id
+            "SELECT v.id, v.valid, b.bytes, v.retained FROM replica_versions v JOIN blocks b ON b.hash=v.id
              WHERE v.resource=?1 AND (?2 IS NULL OR v.id>?2) ORDER BY v.id LIMIT ?3",
         )?;
         let rows = query.query_map(
@@ -368,11 +398,12 @@ impl PeerStore {
                     Hash(row.get(0)?),
                     row.get::<_, bool>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, bool>(3)?,
                 ))
             },
         )?;
         rows.map(|row| {
-            let (id, valid, bytes) = row?;
+            let (id, valid, bytes, retained) = row?;
             if Hash::digest(&bytes) != id {
                 return Err(PeerError::Denied);
             }
@@ -384,6 +415,7 @@ impl PeerStore {
                 root: change.body.root,
                 parents: change.body.parents,
                 authored_at_ms: change.body.authored,
+                retained,
             })
         })
         .collect()
@@ -529,13 +561,16 @@ impl PeerStore {
         let reachable = tx.query_row(
             "WITH RECURSIVE ancestors(hash) AS (
                 VALUES (?1) UNION SELECT edges.parent FROM edges JOIN ancestors ON edges.child=ancestors.hash
+                WHERE NOT EXISTS(SELECT 1 FROM replica_versions v
+                    WHERE v.resource=?2 AND v.id=edges.parent AND v.root=edges.child
+                      AND v.retained=0)
              ) SELECT EXISTS(SELECT 1 FROM ancestors JOIN replica_versions v ON v.id=ancestors.hash
                              WHERE v.resource=?2 AND v.valid=1)",
             params![&hash.0[..], &replica.id.0[..]],
             |row| row.get::<_, bool>(0),
         )?;
         if !reachable {
-            return Err(PeerError::Denied);
+            return Err(PeerError::Missing(hash));
         }
         let bytes = get(&tx, hash, false)?.ok_or(PeerError::Missing(hash))?;
         content::inspect(hash, &bytes)?;
@@ -583,7 +618,13 @@ impl PeerStore {
                 }
             }
             recompute_validity(&tx, incoming)?;
-            project(&tx, &by_id(&tx, resource)?, true, false)?;
+            project(
+                &tx,
+                &by_id(&tx, resource)?,
+                heads(&tx, resource)?,
+                true,
+                false,
+            )?;
         }
         let current = by_id(&tx, resource)?;
         let policy = current.policy()?;
@@ -651,7 +692,7 @@ impl PeerStore {
         for tip in &offer.heads {
             if !known(&tx, resource, *tip)? {
                 tx.execute(
-                    "INSERT OR IGNORE INTO replica_pending VALUES (?1, ?2, ?3)",
+                    "INSERT OR IGNORE INTO replica_pending(resource, peer, tip) VALUES (?1, ?2, ?3)",
                     params![&resource.0[..], &peer.0[..], &tip.0[..]],
                 )?;
             }
@@ -663,9 +704,33 @@ impl PeerStore {
     pub(in crate::peer) fn missing_replica_block(
         &self,
         resource: Hash,
+        peer: Hash,
         tip: Hash,
     ) -> Result<Option<Hash>> {
-        missing_block(&self.0, resource, tip)
+        let tx = self.0.unchecked_transaction()?;
+        missing_block(&tx, resource, peer, tip)
+    }
+
+    // A source can have discarded an older snapshot. A single-writer receiver can
+    // still verify the signed chain, provided it obtains the offered head's full state.
+    pub(in crate::peer) fn retry_replica_with_proofs(
+        &mut self,
+        resource: Hash,
+        peer: Hash,
+        tip: Hash,
+    ) -> Result<bool> {
+        let tx = self.0.transaction_with_behavior(Immediate)?;
+        let replica = by_id(&tx, resource)?;
+        if replica.policy()?.mode != ResourceMode::SingleWriter {
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "UPDATE replica_pending SET proofs_only=1
+             WHERE resource=?1 AND peer=?2 AND tip=?3 AND proofs_only=0",
+            params![&resource.0[..], &peer.0[..], &tip.0[..]],
+        )?;
+        tx.commit()?;
+        Ok(changed != 0)
     }
 
     pub(in crate::peer) fn stage_replica_block(
@@ -678,6 +743,10 @@ impl PeerStore {
     ) -> Result<()> {
         let tx = self.0.transaction_with_behavior(Immediate)?;
         if !pending(&tx, resource, peer, tip)? {
+            if known(&tx, resource, tip)? {
+                // Another synchronization pass admitted the tip while this request was in flight.
+                return Ok(());
+            }
             return Err(PeerError::Denied);
         }
         let replica = by_id(&tx, resource)?;
@@ -712,11 +781,12 @@ impl PeerStore {
         if !pending(&tx, resource, peer, tip)? {
             return Ok(0);
         }
-        if missing_block(&tx, resource, tip)?.is_some() {
+        if missing_block(&tx, resource, peer, tip)?.is_some() {
             return Err(PeerError::Denied);
         }
         let replica = by_id(&tx, resource)?;
         let policy = replica.policy()?;
+        let proofs_only = pending_proofs_only(&tx, resource, peer, tip)?;
         if replica.local != replica.owner {
             replica.local_lease(unix_ms())?;
         }
@@ -731,7 +801,8 @@ impl PeerStore {
                 continue;
             }
             if let Some(change) = inspected {
-                add_version(&tx, policy, id, &change)?;
+                let retain = !proofs_only || id == tip;
+                record_version(&tx, policy, id, &change, retain)?;
                 added += 1;
                 reaction &= change.body.reaction;
                 continue;
@@ -746,13 +817,16 @@ impl PeerStore {
         if !policy.retired.is_empty() {
             recompute_validity(&tx, policy)?;
         }
-        project(&tx, &replica, true, reaction)?;
+        project(&tx, &replica, heads(&tx, resource)?, true, reaction)?;
         tx.execute(
             "DELETE FROM replica_pending WHERE resource=?1 AND EXISTS(
                  SELECT 1 FROM replica_versions v WHERE v.resource=?1 AND v.id=tip
              )",
             [&resource.0[..]],
         )?;
+        if replica.local != replica.owner {
+            replica.local_lease(unix_ms())?;
+        }
         tx.commit()?;
         Ok(added)
     }
@@ -844,7 +918,42 @@ fn known(conn: &Connection, resource: Hash, id: Hash) -> Result<bool> {
     )?)
 }
 
-fn missing_block(conn: &Connection, resource: Hash, tip: Hash) -> Result<Option<Hash>> {
+fn pending_proofs_only(conn: &Connection, resource: Hash, peer: Hash, tip: Hash) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT proofs_only FROM replica_pending WHERE resource=?1 AND peer=?2 AND tip=?3",
+            params![&resource.0[..], &peer.0[..], &tip.0[..]],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+fn missing_block(conn: &Connection, resource: Hash, peer: Hash, tip: Hash) -> Result<Option<Hash>> {
+    if pending_proofs_only(conn, resource, peer, tip)? {
+        if known(conn, resource, tip)? {
+            return Ok(None);
+        }
+        let Some(bytes) = get(conn, tip, false)? else {
+            return Ok(Some(tip));
+        };
+        let head = Change::decode(&bytes)?;
+        let mut parent = head.body.parents.first().copied();
+        while let Some(id) = parent {
+            if known(conn, resource, id)? {
+                break;
+            }
+            let Some(bytes) = get(conn, id, false)? else {
+                return Ok(Some(id));
+            };
+            parent = Change::decode(&bytes)?.body.parents.first().copied();
+        }
+        return missing_graph_block(conn, resource, head.body.root);
+    }
+    missing_graph_block(conn, resource, tip)
+}
+
+fn missing_graph_block(conn: &Connection, resource: Hash, tip: Hash) -> Result<Option<Hash>> {
     Ok(conn
         .query_row(
             "WITH RECURSIVE graph(hash) AS (
@@ -881,13 +990,45 @@ fn heads(conn: &Connection, resource: Hash) -> Result<Vec<Hash>> {
 }
 
 fn add_version(conn: &Connection, policy: &Policy, id: Hash, change: &Change) -> Result<()> {
+    record_version(conn, policy, id, change, true)
+}
+
+fn record_version(
+    conn: &Connection,
+    policy: &Policy,
+    id: Hash,
+    change: &Change,
+    retained: bool,
+) -> Result<()> {
     let placement = change.verify(policy, id)?;
     let root = change.body.root;
+    if retained {
+        validate_state(conn, policy.shape, root)?;
+    }
+    conn.execute(
+        "INSERT INTO replica_versions(resource, id, root, placement, retained) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            &policy.resource.0[..],
+            &id.0[..],
+            &root.0[..],
+            placement.map(|id| id.0),
+            retained,
+        ],
+    )?;
+    let mut insert_parent =
+        conn.prepare_cached("INSERT INTO replica_parents VALUES (?1, ?2, ?3)")?;
+    for parent in &change.body.parents {
+        insert_parent.execute(params![&policy.resource.0[..], &id.0[..], &parent.0[..]])?;
+    }
+    Ok(())
+}
+
+fn validate_state(conn: &Connection, shape: Shape, root: Hash) -> Result<()> {
     let bytes = get(conn, root, false)?.ok_or(PeerError::Missing(root))?;
     if content::inspect(root, &bytes)?.0 != Kind::Data {
         return Err(PeerError::Denied);
     }
-    match policy.shape {
+    match shape {
         Shape::Collection => {
             for (key, hash) in decode_manifest(&bytes)? {
                 check_entry(&key, &entry_block(conn, hash)?)?;
@@ -907,21 +1048,31 @@ fn add_version(conn: &Connection, policy: &Policy, id: Hash, change: &Change) ->
             }
         }
     }
-    conn.execute(
-        "INSERT INTO replica_versions(resource, id, root, placement) VALUES (?1, ?2, ?3, ?4)",
-        params![
-            &policy.resource.0[..],
-            &id.0[..],
-            &root.0[..],
-            placement.map(|id| id.0)
-        ],
-    )?;
-    let mut insert_parent =
-        conn.prepare_cached("INSERT INTO replica_parents VALUES (?1, ?2, ?3)")?;
-    for parent in &change.body.parents {
-        insert_parent.execute(params![&policy.resource.0[..], &id.0[..], &parent.0[..]])?;
-    }
     Ok(())
+}
+
+fn prune_snapshots(conn: &Connection, resource: Hash, heads: &[Hash]) -> Result<usize> {
+    let [head] = heads else {
+        return Ok(0);
+    };
+    let keep = conn.query_row(
+        "SELECT retain_snapshots FROM replicas WHERE id=?1",
+        [&resource.0[..]],
+        |row| row.get::<_, Option<u16>>(0),
+    )?;
+    let Some(keep) = keep else {
+        return Ok(0);
+    };
+    Ok(conn.execute(
+        "WITH RECURSIVE recent(id) AS (
+             VALUES (?2)
+             UNION ALL SELECT p.parent FROM recent r JOIN replica_parents p
+                ON p.resource=?1 AND p.child=r.id
+             LIMIT ?3
+         ) UPDATE replica_versions SET retained=0 WHERE resource=?1 AND retained=1
+            AND id NOT IN (SELECT id FROM recent)",
+        params![&resource.0[..], &head.0[..], keep],
+    )?)
 }
 
 fn recompute_validity(conn: &Connection, policy: &Policy) -> Result<()> {
@@ -964,7 +1115,7 @@ fn recompute_validity(conn: &Connection, policy: &Policy) -> Result<()> {
 
 fn root_at(conn: &Connection, resource: Hash, id: Hash) -> Result<Hash> {
     conn.query_row(
-        "SELECT root FROM replica_versions WHERE resource=?1 AND id=?2 AND valid=1",
+        "SELECT root FROM replica_versions WHERE resource=?1 AND id=?2 AND valid=1 AND retained=1",
         params![&resource.0[..], &id.0[..]],
         |row| Ok(Hash(row.get(0)?)),
     )
@@ -972,8 +1123,13 @@ fn root_at(conn: &Connection, resource: Hash, id: Hash) -> Result<Hash> {
     .ok_or(PeerError::Missing(id))
 }
 
-fn project(conn: &Connection, replica: &Replica, materialize: bool, reaction: bool) -> Result<()> {
-    let heads = heads(conn, replica.id)?;
+fn project(
+    conn: &Connection,
+    replica: &Replica,
+    heads: Vec<Hash>,
+    materialize: bool,
+    reaction: bool,
+) -> Result<()> {
     if heads == replica.heads {
         return Ok(());
     }
@@ -1019,6 +1175,7 @@ fn project(conn: &Connection, replica: &Replica, materialize: bool, reaction: bo
         "UPDATE replicas SET heads=?2 WHERE id=?1",
         params![&replica.id.0[..], protocol::encode(&heads)?],
     )?;
+    prune_snapshots(conn, replica.id, &heads)?;
     applications::record_change(conn, &replica.reference, number, reaction)?;
     Ok(())
 }
@@ -1205,7 +1362,9 @@ pub(super) fn commit(
     let id = Hash::digest(&bytes);
     insert(conn, id, &bytes)?;
     add_version(conn, policy, id, &Change::decode(&bytes)?)?;
-    project(conn, &replica, false, call.reaction)?;
+    // The new revision names every current head as a parent and was authorized
+    // against that same view inside the write transaction.
+    project(conn, &replica, vec![id], false, call.reaction)?;
     if replica.local != replica.owner {
         replica.local_lease(unix_ms())?;
     }
@@ -1244,7 +1403,14 @@ pub(super) fn subscription_mode(
 
 pub(super) fn validate_release(conn: &Connection, view: &ResourceView) -> Result<()> {
     if let (Some(resource), Some(revision)) = (view.resource, view.revision) {
-        root_at(conn, resource, revision)?;
+        let valid = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM replica_versions WHERE resource=?1 AND id=?2 AND valid=1)",
+            params![&resource.0[..], &revision.0[..]],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !valid {
+            return Err(PeerError::Missing(revision));
+        }
     }
     Ok(())
 }
@@ -1298,13 +1464,21 @@ mod tests {
     ) -> Vec<Hash> {
         let peer = source_key.id();
         let mut received = Vec::new();
-        while let Some(hash) = target.missing_replica_block(resource, tip).unwrap() {
+        while let Some(hash) = target.missing_replica_block(resource, peer, tip).unwrap() {
             let request = target
                 .replica_request(resource, local, peer, Some(hash))
                 .unwrap();
-            let bytes = source
-                .serve_replica_block(peer, local, &request, hash)
-                .unwrap();
+            let bytes = match source.serve_replica_block(peer, local, &request, hash) {
+                Err(PeerError::Missing(missing))
+                    if missing == hash
+                        && target
+                            .retry_replica_with_proofs(resource, peer, tip)
+                            .unwrap() =>
+                {
+                    continue;
+                }
+                result => result.unwrap(),
+            };
             target
                 .stage_replica_block(resource, peer, tip, hash, &bytes)
                 .unwrap();
@@ -1421,7 +1595,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             origin.serve_replica_block(owner.id(), replica.id(), &get, unrelated),
-            Err(PeerError::Denied)
+            Err(PeerError::Missing(hash)) if hash == unrelated
         ));
         let bytes = origin
             .serve_replica_block(owner.id(), replica.id(), &get, tip)
@@ -1514,6 +1688,234 @@ mod tests {
         assert!(!fetched.contains(&first));
         assert_eq!(copy.replica_status(id).unwrap().heads, [second]);
         assert!(!pending(&copy.0, id, owner.id(), first).unwrap());
+    }
+
+    #[test]
+    fn version_six_history_survives_upgrade_and_compaction_keeps_receipts_and_proofs() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = key(dir.path(), "owner");
+        let follower = key(dir.path(), "follower");
+        let path = dir.path().join("owner.db");
+        let mut origin = PeerStore::open(&path).unwrap();
+        origin.create_ref("source", &Data::Int(0)).unwrap();
+        let resource = origin
+            .share_replica(&owner, "source", ResourceMode::SingleWriter)
+            .unwrap();
+        origin
+            .approve_replica(&owner, resource, follower.id(), ReplicaAccess::Read, None)
+            .unwrap();
+        let genesis = origin.replica_status(resource).unwrap().heads[0];
+        let genesis_root = origin.replica_history(resource, None, 128).unwrap()[0].root;
+        let program = Hash::digest(b"update");
+        let grant = origin
+            .issue("source", owner.id(), Access::Write, Some(program))
+            .unwrap();
+        let writer = call(owner.id(), grant, program, Consistency::Authoritative);
+        let first = update(&origin, writer, false);
+        let before = snapshot(&mut origin, first);
+        let receipt = origin
+            .commit(
+                first,
+                &before,
+                Some(&owner),
+                &Block::Data(Data::Int(1)).to_bytes().unwrap(),
+                Data::Int(1).to_bytes().unwrap(),
+            )
+            .unwrap();
+        let first_id = receipt.view.as_ref().unwrap().revision.unwrap();
+        let first_root = root_at(&origin.0, resource, first_id).unwrap();
+        origin
+            .create_ref("independent", &Data::Link(genesis))
+            .unwrap();
+        let second = write(&mut origin, &owner, writer, 2);
+        drop(origin);
+
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "DROP INDEX replica_retained;
+                 ALTER TABLE replica_versions DROP COLUMN retained;
+                 ALTER TABLE replicas DROP COLUMN retain_snapshots;
+                 ALTER TABLE replica_pending DROP COLUMN proofs_only;
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        drop(legacy);
+        let mut origin = PeerStore::open(&path).unwrap();
+        assert_eq!(origin.replica_status(resource).unwrap().heads, [second]);
+        let records = origin.replica_history(resource, None, 128).unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|record| record.retained && record.valid));
+        assert_eq!(origin.retain_replica_snapshots(resource, 2).unwrap(), 1);
+        let third = write(&mut origin, &owner, writer, 3);
+        origin.collect().unwrap();
+        assert!(origin.get(genesis_root).unwrap().is_some());
+        assert!(origin.get(genesis).unwrap().is_some());
+        assert!(origin.get(first_root).unwrap().is_none());
+        assert!(
+            matches!(root_at(&origin.0, resource, first_id), Err(PeerError::Missing(id)) if id == first_id)
+        );
+        assert!(matches!(
+            origin.begin(Call { consistency: Consistency::Revision(genesis), ..writer }),
+            Err(PeerError::Missing(id)) if id == genesis
+        ));
+        assert!(
+            matches!(origin.begin(first), Ok(EvaluationStart::Replayed(old)) if old.revision == receipt.revision)
+        );
+        let history = origin.replica_history(resource, None, 128).unwrap();
+        assert_eq!(history.len(), 4);
+        assert_eq!(history.iter().filter(|entry| entry.retained).count(), 2);
+
+        let path = dir.path().join("follower.db");
+        let mut copy = PeerStore::open(&path).unwrap();
+        copy.follow_replica(follower.id(), owner.id(), resource, "copy")
+            .unwrap();
+        assert_eq!(
+            request(&origin, &owner, &mut copy, follower.id(), resource),
+            [third]
+        );
+        assert!(
+            copy.retry_replica_with_proofs(resource, owner.id(), third)
+                .unwrap()
+        );
+        copy.collect().unwrap();
+        drop(copy);
+        let mut copy = PeerStore::open(path).unwrap();
+        assert!(pending_proofs_only(&copy.0, resource, owner.id(), third).unwrap());
+        download(&origin, &owner, &mut copy, follower.id(), resource, third);
+        assert_eq!(copy.replica_status(resource).unwrap().heads, [third]);
+        let history = copy.replica_history(resource, None, 128).unwrap();
+        assert_eq!(history.len(), 4);
+        assert!(history.iter().all(|entry| entry.valid));
+        assert_eq!(history.iter().filter(|entry| entry.retained).count(), 1);
+        assert!(pull(&origin, &owner, &mut copy, follower.id(), resource).is_empty());
+        let grant = copy
+            .issue("copy", follower.id(), Access::Read, Some(program))
+            .unwrap();
+        let read = call(follower.id(), grant, program, Consistency::Replica);
+        assert_eq!(
+            Block::from_bytes(&snapshot(&mut copy, read).bytes).unwrap(),
+            Block::Data(Data::Int(3))
+        );
+    }
+
+    #[test]
+    fn a_placement_lease_bounds_local_access_and_only_attests_claimed_revision_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = key(dir.path(), "owner");
+        let writer = key(dir.path(), "writer");
+        let mut origin = PeerStore::open(":memory:").unwrap();
+        origin.create_ref("source", &Data::Int(0)).unwrap();
+        let resource = origin
+            .share_replica(&owner, "source", ResourceMode::MultiWriter)
+            .unwrap();
+        origin
+            .approve_replica(&owner, resource, writer.id(), ReplicaAccess::Write, None)
+            .unwrap();
+        let replica = by_id(&origin.0, resource).unwrap();
+        let policy = replica.policy().unwrap();
+        let issued = 1000;
+        let expires = 2000;
+        let lease = Signed::new(
+            LEASE,
+            Lease {
+                resource,
+                placement: policy.placement(writer.id()).unwrap().clone(),
+                issued,
+                expires,
+            },
+            &owner,
+        )
+        .unwrap();
+        for (clock, accepted) in [
+            (issued - 1, false),
+            (issued, true),
+            (expires - 1, true),
+            (expires, false),
+        ] {
+            assert_eq!(
+                check_lease(policy, writer.id(), &lease, clock).is_ok(),
+                accepted
+            );
+        }
+        let bytes = Change::encode(
+            RevisionBody {
+                resource,
+                root: Hash::digest(b"state"),
+                parents: replica.heads.clone(),
+                authored: issued,
+                program: None,
+                lease: Some(lease),
+                reaction: false,
+                nonce: Hash::digest(b"revision"),
+            },
+            &writer,
+        )
+        .unwrap();
+        let change = Change::decode(&bytes).unwrap();
+        assert!(unix_ms() > expires);
+        // Signing the record after expiration still verifies its claimed date.
+        assert_eq!(
+            change.verify(policy, Hash::digest(&bytes)).unwrap(),
+            Some(policy.placement(writer.id()).unwrap().id)
+        );
+    }
+
+    #[test]
+    fn storage_exhaustion_preserves_the_last_acknowledged_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = key(dir.path(), "owner");
+        let path = dir.path().join("store.db");
+        let mut store = PeerStore::open(&path).unwrap();
+        store.create_ref("source", &Data::Int(0)).unwrap();
+        let resource = store
+            .share_replica(&owner, "source", ResourceMode::SingleWriter)
+            .unwrap();
+        let program = Hash::digest(b"update");
+        let grant = store
+            .issue("source", owner.id(), Access::Write, Some(program))
+            .unwrap();
+        let writer = call(owner.id(), grant, program, Consistency::Authoritative);
+        let acknowledged = write(&mut store, &owner, writer, 1);
+        let pending = update(&store, writer, false);
+        let before = snapshot(&mut store, pending);
+        let pages = store
+            .0
+            .query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        store
+            .0
+            .pragma_update(None, "max_page_count", pages + 1)
+            .unwrap();
+        let payload = Block::Data(Data::Text("x".repeat(120_000)))
+            .to_bytes()
+            .unwrap();
+        let Err(failure) = store.commit(pending, &before, Some(&owner), &payload, Vec::new())
+        else {
+            panic!("update succeeded at the database page limit");
+        };
+        assert!(
+            matches!(protocol::Failure::from(failure), protocol::Failure::Invalid(message) if message.contains("full"))
+        );
+        drop(store);
+        let mut store = PeerStore::open(path).unwrap();
+        assert_eq!(
+            store.replica_status(resource).unwrap().heads,
+            [acknowledged]
+        );
+        assert_eq!(store.replica_history(resource, None, 128).unwrap().len(), 2);
+        assert!(store.get(Hash::digest(&payload)).unwrap().is_none());
+        assert!(matches!(
+            store.begin(pending),
+            Ok(EvaluationStart::Snapshot(_))
+        ));
+        assert_eq!(
+            store
+                .commit(pending, &before, Some(&owner), &payload, Vec::new())
+                .unwrap()
+                .revision,
+            2
+        );
     }
 
     #[test]

@@ -30,7 +30,7 @@ impl Client {
         let mut report = SyncReport::default();
         for tip in tips {
             loop {
-                let Some(hash) = store.missing_replica_block(resource, tip)? else {
+                let Some(hash) = store.missing_replica_block(resource, peer, tip)? else {
                     report.revisions += store.finish_replica_tip(resource, peer, tip)?;
                     break;
                 };
@@ -43,6 +43,11 @@ impl Client {
                 if matches!(reply, Err(PeerError::Timeout)) {
                     report.pending = true;
                     return Ok(report);
+                }
+                if matches!(reply, Err(PeerError::Missing(missing)) if missing == hash)
+                    && store.retry_replica_with_proofs(resource, peer, tip)?
+                {
+                    continue;
                 }
                 let Reply::Block(bytes) = reply? else {
                     return Err(unexpected_reply());
@@ -66,7 +71,7 @@ impl Client {
     }
 
     fn replica_exchange(&self, request: SyncRequest, active: Activity) -> Result<Reply> {
-        let (mut stream, _) = self.connect_active(active, None)?;
+        let (mut stream, _, _) = self.connect_active(active, None)?;
         protocol::send(&mut stream, &Request::Replica(request))?;
         match protocol::receive::<Reply>(&mut stream)?.0 {
             Reply::Failed(error) => Err(error.into()),

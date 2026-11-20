@@ -16,9 +16,10 @@ const USAGE: &str = "Usage: pp2 peer replica <command>
   revoke HOME RESOURCE PEER_ID
   follow HOME RESOURCE OWNER_ID[@ADDRESS] LOCAL_REFERENCE
   route HOME RESOURCE PEER_ID ADDRESS
-  sync HOME RESOURCE PEER_ID[@ADDRESS]
+  sync HOME RESOURCE PEER_ID[@ADDRESS] [--once]
   status HOME RESOURCE
   history HOME RESOURCE [AFTER_REVISION_ID]
+  retain HOME RESOURCE SNAPSHOTS
   grant HOME LOCAL_REFERENCE reader|writer PROGRAM";
 
 pub(crate) fn run(args: &[&str]) -> Result<()> {
@@ -70,7 +71,8 @@ pub(crate) fn run(args: &[&str]) -> Result<()> {
         ["route", home, resource, peer, address] => {
             store(home)?.route_replica(resource.parse()?, peer.parse()?, address.parse()?)?;
         }
-        ["sync", home, resource, peer] => {
+        ["sync", home, resource, peer] | ["sync", home, resource, peer, "--once"] => {
+            let once = args.last() == Some(&"--once");
             let resource = resource.parse()?;
             let (id, address) = target(peer)?;
             let client = Client::for_peer(&network(Path::new(home))?, id, address);
@@ -81,7 +83,7 @@ pub(crate) fn run(args: &[&str]) -> Result<()> {
                 blocks += pass.blocks;
                 revisions += pass.revisions;
                 bytes += pass.bytes;
-                if !pass.pending || pass.blocks == 0 {
+                if once || !pass.pending || pass.blocks == 0 {
                     break pass.pending;
                 }
             };
@@ -112,9 +114,14 @@ pub(crate) fn run(args: &[&str]) -> Result<()> {
                         "parents": version.parents.into_iter().map(|id| id.to_string()).collect::<Vec<_>>(),
                         "author": version.author.to_string(), "authored_at_ms": version.authored_at_ms,
                         "valid": version.valid,
+                        "retained": version.retained,
                     })
                 );
             }
+        }
+        ["retain", home, resource, keep] => {
+            let pruned = store(home)?.retain_replica_snapshots(resource.parse()?, keep.parse()?)?;
+            println!("{}", json!({ "pruned_snapshots": pruned }));
         }
         ["grant", home, reference, level, program] => {
             let peer = identity(home)?.id();

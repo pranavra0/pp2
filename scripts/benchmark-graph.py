@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Run the three-peer stock application and compare it with SQLite and mTLS/JSON."""
 import argparse
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 import hashlib
 import json
@@ -17,20 +19,25 @@ import sys
 import tempfile
 import time
 
+from peer_topology import topology
+
 ROOT = Path(__file__).resolve().parents[1]
 ROLES = ("office", "west", "east")
 
 
-def command(*args):
-    result = subprocess.run(args, text=True, capture_output=True, timeout=25)
+def command(*args, env=None, trace=None):
+    result = subprocess.run(args, text=True, capture_output=True, timeout=25, env=env)
+    if trace is not None:
+        trace.write(result.stderr)
+        trace.flush()
     if result.returncode:
         raise RuntimeError(f"{args[0]} exited with status {result.returncode}\n{result.stderr.strip()}")
     return result.stdout.strip()
 
 
 @contextmanager
-def process(*args):
-    with subprocess.Popen(args, text=True, stdout=subprocess.PIPE) as child:
+def process(*args, env=None, stderr=None):
+    with subprocess.Popen(args, text=True, stdout=subprocess.PIPE, env=env, stderr=stderr) as child:
         try:
             ready = child.stdout.readline().strip()
             if not ready:
@@ -39,31 +46,6 @@ def process(*args):
         finally:
             child.kill()
             child.wait()
-
-
-@contextmanager
-def topology(isolated):
-    if not isolated:
-        yield {role: ("127.0.0.1", ()) for role in ROLES}
-        return
-    command("ip", "link", "set", "lo", "up")
-    with ExitStack() as stack:
-        nodes = {"office": ("10.92.0.1", ())}
-        for i, role in enumerate(("west", "east")):
-            child, _ = stack.enter_context(process("unshare", "-n", "sh", "-c",
-                                                   "echo ready; exec sleep infinity"))
-            prefix = ("nsenter", "--target", str(child.pid), "--net", "--")
-            host, peer = f"10.92.0.{4*i+1}", f"10.92.0.{4*i+2}"
-            dev = f"pp2-{role}"
-            command("ip", "link", "add", dev, "type", "veth", "peer", "name", "uplink")
-            command("ip", "link", "set", "uplink", "netns", str(child.pid))
-            command("ip", "address", "add", f"{host}/30", "dev", dev)
-            command("ip", "link", "set", dev, "up")
-            command(*prefix, "ip", "link", "set", "lo", "up")
-            command(*prefix, "ip", "address", "add", f"{peer}/30", "dev", "uplink")
-            command(*prefix, "ip", "link", "set", "uplink", "up")
-            nodes[role] = (peer, prefix)
-        yield nodes
 
 
 def endpoints(nodes, port):
@@ -147,11 +129,11 @@ def receive(conn):
         return json.loads(data), len(data) + 4
 
 
-def fetch(context, role, endpoint, sku):
+def fetch(context, role, endpoint, sku, parallel=False):
     with socket.create_connection(address(endpoint), timeout=3) as tcp:
         tcp.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         with context.wrap_socket(tcp, server_hostname=f"pp2-{role}") as conn:
-            request = frame({"sku": sku})
+            request = frame({"sku": sku, "parallel": True} if parallel else {"sku": sku})
             conn.sendall(request)
             reply, received = receive(conn)
     return reply, len(request), received
@@ -163,7 +145,7 @@ def baseline_peer(role, work, workspace, endpoints):
     holder = "client" if role == "office" else "office"
     certificate = (workspace / holder / "peer.pem").read_text()
     fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(certificate)).digest()
-    with socket.create_server(address(endpoints[role])) as listener:
+    with socket.create_server(address(endpoints[role])) as listener, ThreadPoolExecutor(2) as workers:
         print(listener.getsockname(), flush=True)
         while True:
             tcp, _ = listener.accept()
@@ -181,8 +163,15 @@ def baseline_peer(role, work, workspace, endpoints):
                         continue
                     counts = {}
                     sent = received = 0
-                    for leaf in ("west", "east"):
-                        counts[leaf], request, response = fetch(outbound, leaf, endpoints[leaf], sku)
+                    leaves = ("west", "east")
+                    if query.get("parallel"):
+                        pending = {leaf: workers.submit(fetch, outbound, leaf, endpoints[leaf], sku)
+                                   for leaf in leaves}
+                        branches = ((leaf, pending[leaf].result()) for leaf in leaves)
+                    else:
+                        branches = ((leaf, fetch(outbound, leaf, endpoints[leaf], sku)) for leaf in leaves)
+                    for leaf, (count, request, response) in branches:
+                        counts[leaf] = count
                         sent += request
                         received += response
                     conn.sendall(frame({
@@ -195,41 +184,59 @@ def percentile(samples, fraction):
     return sorted(samples)[max(0, math.ceil(len(samples) * fraction) - 1)]
 
 
-def measure(work, nodes, binary, rows, samples):
+def measure(work, nodes, binary, rows, samples, trace_dir, load_clients):
     pp2_addresses = endpoints(nodes, 18630)
     baseline_addresses = endpoints(nodes, 18631)
     manifest = prepare(work, rows, pp2_addresses)
     workspace = work / "deployment"
-    command(binary, "app", "init", manifest, workspace)
+    command(binary, "app", "init", manifest, workspace, "--discovery")
+    for role in (*ROLES, "client"):
+        (workspace / role / "discovery.json").write_text('{"lan":false}')
+    baseline_workspace = work / "baseline-deployment"
+    baseline_manifest = json.loads(manifest.read_text())
+    for peer in baseline_manifest["peers"].values():
+        peer["collections"] = dict.fromkeys(peer["collections"])
+    baseline_path = work / "baseline.json"
+    baseline_path.write_text(json.dumps(baseline_manifest))
+    command(binary, "app", "init", baseline_path, baseline_workspace)
     sizes = {role: (workspace / role / "peer.db").stat().st_size for role in ("west", "east")}
     assert all(size > 256 * 1024 for size in sizes.values())
     expected = combine(lookup(work / "office.sqlite", "office", "lamp"), {
         role: lookup(work / f"{role}.sqlite", role, "lamp") for role in ("west", "east")
     })
 
-    def run(via_west=False):
-        input = json.dumps({"sku": "lamp", "viaWest": via_west})
-        return json.loads(command(binary, "app", "invoke", workspace / "client", input))
-
     with ExitStack() as stack:
+        traced_env = None
+        traces = {}
+        if trace_dir is not None:
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            traced_env = {**os.environ, "PP2_TRACE_GRAPH": "1"}
+            traces = {role: stack.enter_context((trace_dir / f"{role}.jsonl").open("x"))
+                      for role in (*ROLES, "client")}
+
+        def run(via_west=False, serial=False):
+            query = json.dumps({"sku": "lamp", "viaWest": via_west, "serial": serial})
+            return json.loads(command(binary, "app", "invoke", workspace / "client", query,
+                                      env=traced_env, trace=traces.get("client")))
+
         for role, (_, prefix) in nodes.items():
-            stack.enter_context(process(*prefix, binary, "app", "serve", workspace / role))
+            stack.enter_context(process(*prefix, binary, "app", "serve", workspace / role,
+                                        env=traced_env, stderr=traces.get(role)))
             stack.enter_context(process(*prefix, sys.executable, __file__,
-                                        "--baseline-peer", role, work, workspace,
+                                        "--baseline-peer", role, work, baseline_workspace,
                                         json.dumps(baseline_addresses)))
-        cold = run()
+        first = run()
         nested = run(via_west=True)
-        assert cold["value"] == nested["value"] == expected
-        assert cold["graph"]["remote_calls"] == nested["graph"]["remote_calls"] == 2
-        assert cold["graph"]["storage_effects"] == nested["graph"]["storage_effects"] == 5
-        context = tls(workspace / "client", server=False)
+        assert first["value"] == nested["value"] == expected
+        assert first["graph"]["remote_calls"] == nested["graph"]["remote_calls"] == 2
+        assert first["graph"]["storage_effects"] == nested["graph"]["storage_effects"] == 5
+        context = tls(baseline_workspace / "client", server=False)
 
         native_times = []
-        tls_times = []
-        pp2_times = []
-        graphs = []
-        tls_traffic = []
-        for _ in range(samples):
+        tls_times = {False: [], True: []}
+        graphs = {False: [], True: []}
+        tls_traffic = {False: [], True: []}
+        for sample in range(samples):
             started = time.perf_counter_ns()
             quantities = {
                 role: lookup(work / f"{role}.sqlite", role, "lamp") for role in ("west", "east")
@@ -238,17 +245,53 @@ def measure(work, nodes, binary, rows, samples):
             native_times.append((time.perf_counter_ns() - started) / 1000)
             assert result == expected
 
-            started = time.perf_counter_ns()
-            conventional, sent, received = fetch(context, "office", baseline_addresses["office"], "lamp")
-            tls_times.append((time.perf_counter_ns() - started) / 1000)
-            assert conventional["value"] == expected
-            tls_traffic.append(sent + received + conventional["remote_request_bytes"]
-                               + conventional["remote_response_bytes"])
+            modes = (True, False) if sample % 2 else (False, True)
+            for parallel in modes:
+                started = time.perf_counter_ns()
+                conventional, sent, received = fetch(context, "office", baseline_addresses["office"],
+                                                      "lamp", parallel)
+                tls_times[parallel].append((time.perf_counter_ns() - started) / 1000)
+                assert conventional["value"] == expected
+                tls_traffic[parallel].append(sent + received + conventional["remote_request_bytes"]
+                                             + conventional["remote_response_bytes"])
 
-            report = run()
+                report = run(serial=not parallel)
+                assert report["value"] == expected
+                assert report["graph"]["remote_calls"] == 2
+                assert report["graph"]["storage_effects"] == 5
+                graphs[parallel].append(report)
+
+        def load_query(_):
+            try:
+                report = run()
+            except RuntimeError as failure:
+                message = str(failure)
+                for needle, category in (("no authenticated route", "peer_unavailable"),
+                                         ("deadline", "deadline"),
+                                         ("timed out", "deadline"),
+                                         ("Connection reset", "connection_closed"),
+                                         ("failed to fill whole buffer", "connection_closed")):
+                    if needle in message:
+                        return None, category
+                raise
             assert report["value"] == expected
-            pp2_times.append(report["elapsed_us"])
-            graphs.append(report)
+            return report["elapsed_us"], None
+
+        load = []
+        for clients in load_clients:
+            queries = max(samples, clients * 3)
+            started = time.perf_counter()
+            with ThreadPoolExecutor(clients) as pool:
+                results = list(pool.map(load_query, range(queries)))
+            seconds = time.perf_counter() - started
+            succeeded = [elapsed for elapsed, _ in results if elapsed is not None]
+            failures = Counter(failure for _, failure in results if failure is not None)
+            assert run()["value"] == expected
+            load.append({
+                "clients": clients, "requests": queries, "failures": dict(failures),
+                "successful_queries_per_second": round(len(succeeded) / seconds, 1),
+                "successful_p95_us": percentile(succeeded, .95) if succeeded else None,
+            })
 
     def timing(values):
         return {"median_us": round(statistics.median(values)), "p95_us": round(percentile(values, .95))}
@@ -258,16 +301,50 @@ def measure(work, nodes, binary, rows, samples):
                 + report["graph"]["remote_request_bytes"] + report["graph"]["remote_response_bytes"])
 
     metrics = ("storage_us", "worker_busy_us", "worker_elapsed_us", "worker_startup_us")
-    print(json.dumps({
+    def pp2_timing(reports):
+        return {**timing([r["elapsed_us"] for r in reports]),
+                "median_application_bytes": statistics.median(map(traffic, reports)),
+                **{f"median_{key}": round(statistics.median(r["graph"][key] for r in reports))
+                   for key in metrics}}
+
+    summary = {
         "result": expected, "storage_database_bytes": sizes, "samples": samples,
         "sqlite_in_process": timing(native_times),
-        "conventional_mtls": {**timing(tls_times), "median_application_bytes": statistics.median(tls_traffic)},
-        "pp2": {**timing(pp2_times), "median_application_bytes": statistics.median(map(traffic, graphs)),
-                "cold_application_bytes": traffic(cold), "cold_elapsed_us": cold["elapsed_us"],
-                "delegated_elapsed_us": nested["elapsed_us"],
-                **{f"median_{key}": round(statistics.median(r["graph"][key] for r in graphs))
-                   for key in metrics}},
-    }, indent=2))
+        "first_pp2_application_bytes": traffic(first), "first_pp2_elapsed_us": first["elapsed_us"],
+        "delegated_pp2_elapsed_us": nested["elapsed_us"],
+    }
+    for parallel, name in ((False, "serial"), (True, "parallel")):
+        summary[f"conventional_mtls_{name}"] = {
+            **timing(tls_times[parallel]),
+            "median_application_bytes": statistics.median(tls_traffic[parallel]),
+        }
+        summary[f"pp2_{name}"] = pp2_timing(graphs[parallel])
+    if load:
+        summary["pp2_load_including_cli_startup"] = load
+    if trace_dir is not None:
+        events = []
+        for path in traces.values():
+            for line in Path(path.name).read_text().splitlines():
+                if line.startswith("{"):
+                    events.append(json.loads(line))
+        exchanges = [event for event in events if event["event"] == "graph_exchange"]
+        executions = [event for event in events if event["event"] == "graph_execution"]
+        executed = {event["invocation"] for event in executions}
+        assert {event["invocation"] for event in exchanges} == executed
+        assert all(event["parent"] is None or event["parent"] in executed for event in exchanges)
+        assert all(event["failure"] is None for event in events)
+        summary["trace_median_us_per_exchange"] = {
+            **{key: round(statistics.median(event["connection"][key] for event in exchanges))
+               for key in ("dial_us", "authentication_us")},
+            "postcard_us": round(statistics.median(event["postcard_us"] for event in exchanges)),
+        }
+        summary["trace_median_us_per_execution"] = {
+            **{key: round(statistics.median(event["trace"]["worker"][key] for event in executions))
+               for key in ("spawn_us", "module_us", "guest_us", "codec_us")},
+            **{key: round(statistics.median(event["trace"][key] for event in executions))
+               for key in ("storage_open_us", "storage_effect_us", "storage_finish_us")},
+        }
+    print(json.dumps(summary, indent=2))
 
 
 def main():
@@ -280,14 +357,22 @@ def main():
     parser.add_argument("--samples", type=int, default=40)
     parser.add_argument("--rows", type=int, default=20000, help="unmatched rows per warehouse")
     parser.add_argument("--binary", type=Path, default=ROOT / "target" / "release" / "pp2")
+    parser.add_argument("--trace-dir", type=Path, help="write per-peer JSON timing traces to a new directory")
+    parser.add_argument("--load-clients", type=int, action="append", default=[],
+                        help="run a pp2 load check with this many concurrent clients; repeat for more levels")
     args = parser.parse_args()
     if args.samples < 1 or args.rows < 10000:
         parser.error("expected at least one sample and 10000 unmatched rows")
+    if any(not 1 <= clients <= 32 for clients in args.load_clients):
+        parser.error("--load-clients must be between 1 and 32")
+    if args.trace_dir is not None and args.load_clients:
+        parser.error("collect traces and measure concurrent client load in separate runs")
     if args.isolated_networks and not args.inside_netns:
         os.execvp("unshare", ["unshare", "-Urn", sys.executable, __file__,
                               *sys.argv[1:], "--inside-netns"])
-    with tempfile.TemporaryDirectory(prefix="pp2-graph-") as temp, topology(args.isolated_networks) as nodes:
-        measure(Path(temp), nodes, args.binary.resolve(), args.rows, args.samples)
+    with tempfile.TemporaryDirectory(prefix="pp2-graph-") as temp, topology(ROLES, args.isolated_networks) as nodes:
+        measure(Path(temp), nodes, args.binary.resolve(), args.rows, args.samples, args.trace_dir,
+                args.load_clients)
 
 
 if __name__ == "__main__":

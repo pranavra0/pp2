@@ -245,7 +245,7 @@ impl PeerNetwork {
         &'scope self,
         scope: &'scope thread::Scope<'scope, '_>,
         stop: &'scope AtomicBool,
-        accept: &'scope (impl Fn(std::net::TcpStream) -> Result<()> + Sync),
+        accept: &'scope (impl Fn(std::net::TcpStream) + Sync),
     ) {
         if self.0.settings.relay
             && let Some(address) = self.0.settings.rendezvous
@@ -254,9 +254,7 @@ impl PeerNetwork {
                 scope.spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
                         match rendezvous::offer(address, self.identity()) {
-                            Ok(tcp) => {
-                                let _ = accept(tcp);
-                            }
+                            Ok(tcp) => accept(tcp),
                             Err(_) => thread::sleep(Duration::from_millis(200)),
                         }
                     }

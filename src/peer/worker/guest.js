@@ -120,6 +120,22 @@
                 update === null ? '' : text(update.operation), text(consistency), merge,
             );
         },
+        async evaluateAll(reads) {
+            if (!isArray(reads) || reads.length < 1 || reads.length > 4) {
+                throw new Type('expected one to four leaf reads');
+            }
+            const requests = [];
+            for (let i = 0; i < reads.length; i++) {
+                const {capability, input, timeoutMs = null, consistency = 'authoritative',
+                    update, delegate, calls} = reads[i];
+                if (update !== undefined || delegate !== undefined || calls !== undefined) {
+                    throw new Type('a batch accepts leaf reads');
+                }
+                if (timeoutMs === 0) throw new Type('expected a positive child deadline');
+                requests[i] = [slot(capability), input, timeoutMs === null ? null : bounded(timeoutMs), text(consistency)];
+            }
+            return request('evaluateBatch', '', stringify(requests, replacer), '', 0, 0, '', '');
+        },
     });
 
     return [guest, replacer, () => {

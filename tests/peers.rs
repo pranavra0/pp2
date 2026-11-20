@@ -810,7 +810,7 @@ fn three_peers_enforce_delegation_budgets_and_cancel_a_descendant() {
     fs::write(
         temp.0.join("stock.mjs"),
         r#"
-        export default async ({capabilities, storage, evaluate}, input) => {
+        export default async ({capabilities, storage, evaluate, evaluateAll}, input) => {
             const {east, west} = capabilities;
             switch (input.task) {
             case 'get':
@@ -824,6 +824,16 @@ fn three_peers_enforce_delegation_budgets_and_cancel_a_descendant() {
                 })).value;
             case 'forgery':
                 return await evaluate({}, {task:'get'}, {calls: 0});
+            case 'batch':
+                try {
+                    const results = await evaluateAll([
+                        {capability: east, input: {task:'get'}},
+                        {capability: input.forge ? {} : west, input: {task:'get'}},
+                    ]);
+                    return results.map(result => result.value);
+                } catch (err) {
+                    return {error: err.code ?? 'invalid'};
+                }
             case 'serialize':
                 return [east];
             case 'write':
@@ -923,6 +933,16 @@ fn three_peers_enforce_delegation_budgets_and_cancel_a_descendant() {
     assert_eq!(direct.value, Data::Int(12));
     assert_eq!(direct.graph.remote_calls, 2);
     assert_eq!(direct.graph.storage_effects, 2);
+    let batch = request(grant, j!({"task":"batch"}), 2, 1, None).unwrap();
+    assert_eq!(batch.value, json(j!([7, 5])));
+    assert_eq!(batch.graph.remote_calls, 2);
+    assert_eq!(batch.graph.storage_effects, 2);
+    let too_many = request(grant, j!({"task":"batch"}), 1, 1, None).unwrap();
+    assert_eq!(too_many.value, json(j!({"error":"invalid"})));
+    assert_eq!(too_many.graph.remote_calls, 0);
+    let forged = request(grant, j!({"task":"batch","forge":true}), 2, 1, None).unwrap();
+    assert_eq!(forged.value, json(j!({"error":"invalid"})));
+    assert_eq!(forged.graph.remote_calls, 0);
     let delegated = request(grant, j!({"task":"delegate","share":true}), 2, 2, None).unwrap();
     assert_eq!(delegated.value, direct.value);
     assert_eq!(delegated.graph.remote_calls, 2);
@@ -1046,6 +1066,9 @@ fn three_peers_enforce_delegation_budgets_and_cancel_a_descendant() {
     let east_grant =
         serde_json::from_value(east_profile["routes"]["east"]["grant"].clone()).unwrap();
     assert!(east_store.revoke(east_grant).unwrap());
+    let denied = request(grant, j!({"task":"batch"}), 2, 1, None).unwrap();
+    assert_eq!(denied.value, json(j!({"error":"denied"})));
+    assert_eq!(denied.graph.remote_failures, 1);
     assert!(matches!(
         request(grant, j!({"task":"delegate","share":true}), 2, 2, None),
         Err(PeerError::Guest(message)) if message.contains("denied")
@@ -1618,36 +1641,34 @@ fn autonomous_job_recovers_between_independently_administered_peers() {
         terminal(&client_a, expires_id),
         JobStatus::Expired
     ));
+    let enqueue = |n| {
+        let mut result = Err(PeerError::Busy);
+        until(|| {
+            result = submit(
+                &client_a,
+                grant_b,
+                Hash([n; 32]),
+                &empty,
+                binding.clone(),
+                budget,
+                expires,
+            );
+            !matches!(result, Err(PeerError::Busy))
+        });
+        result
+    };
     for n in 50..82 {
-        submit(
-            &client_a,
-            grant_b,
-            Hash([n; 32]),
-            &empty,
-            binding.clone(),
-            budget,
-            expires,
-        )
-        .unwrap();
+        enqueue(n).unwrap();
     }
     assert!(matches!(
-        submit(&client_a, grant_b, Hash([82; 32]), &empty, binding.clone(), budget, expires),
+        enqueue(82),
         Err(PeerError::Value(message)) if message.contains("active jobs")
     ));
     assert!(matches!(
         client_a.cancel_job(Hash([50; 32])).unwrap(),
         JobStatus::Cancelled
     ));
-    submit(
-        &client_a,
-        grant_b,
-        Hash([82; 32]),
-        &empty,
-        binding,
-        budget,
-        expires,
-    )
-    .unwrap();
+    enqueue(82).unwrap();
     assert!(matches!(
         client_a.job_status(Hash([50; 32])).unwrap(),
         JobStatus::Cancelled

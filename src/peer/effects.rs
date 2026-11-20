@@ -9,6 +9,7 @@ use super::{Consistency, EvaluationMode, PeerError, Result};
 pub(super) const MAX_EFFECTS: u16 = 128;
 pub(super) const MAX_EFFECT_BYTES: usize = 128 * 1024;
 pub(super) const MAX_BINDINGS: usize = 16;
+pub(super) const MAX_PARALLEL_READS: usize = 4;
 pub(super) const MAX_KEY_BYTES: usize = 512;
 pub(super) const MAX_SCAN_ROWS: u16 = 128;
 pub(super) const MAX_JOB_LIFETIME_MS: u64 = 5 * 60 * 1000;
@@ -100,6 +101,7 @@ pub(super) enum Effect {
     Put(String, Vec<u8>),
     Delete(String),
     Host(String, Vec<u8>),
+    EvaluateBatch(Vec<Remote>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -139,9 +141,28 @@ pub(super) struct Scan {
 }
 
 impl Effect {
+    pub(super) fn count(&self) -> usize {
+        match self {
+            Self::EvaluateBatch(reads) => reads.len(),
+            _ => 1,
+        }
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
         match self {
             Self::Evaluate(remote) => remote.validate(),
+            Self::EvaluateBatch(reads) => {
+                if !(1..=MAX_PARALLEL_READS).contains(&reads.len()) {
+                    return Err(PeerError::Limit("parallel read count"));
+                }
+                for read in reads {
+                    read.validate()?;
+                    if read.update.is_some() || read.allowance != 0 || !read.delegate.is_empty() {
+                        return Err(PeerError::Denied);
+                    }
+                }
+                Ok(())
+            }
             Self::Host(operation, input) => {
                 validate_binding_name(operation)?;
                 if input.len() > MAX_EFFECT_BYTES {
@@ -209,6 +230,7 @@ pub fn validate_binding_names(names: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub(super) struct Scope {
     pub budget: GraphBudget,
     pub bindings: Vec<String>,

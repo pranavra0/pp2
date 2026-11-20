@@ -67,6 +67,7 @@ pub struct ResourceRevision {
     pub author: Hash,
     pub authored_at_ms: u64,
     pub valid: bool,
+    pub retained: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -234,6 +235,7 @@ impl Change {
         let author = self.author()?;
         if body.resource != policy.resource
             || (body.parents.is_empty() != (id == policy.genesis))
+            || body.parents.binary_search(&body.root).is_ok()
             || (policy.mode == ResourceMode::Immutable && id != policy.genesis)
             || (policy.mode == ResourceMode::SingleWriter && body.parents.len() > 1)
         {

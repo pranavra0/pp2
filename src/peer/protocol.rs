@@ -235,6 +235,11 @@ impl From<PeerError> for Failure {
             {
                 Self::Busy
             }
+            PeerError::Storage(ref error)
+                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) =>
+            {
+                Self::Invalid("peer database or filesystem is full".into())
+            }
             _ => Self::Internal,
         }
     }
@@ -272,7 +277,10 @@ pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 
 /// The counter reports application framing bytes, including the eight-byte header.
 pub(super) fn send(out: &mut impl Write, value: &impl Serialize) -> Result<u64> {
-    let payload = encode(value)?;
+    write_payload(out, &encode(value)?)
+}
+
+pub(super) fn write_payload(out: &mut impl Write, payload: &[u8]) -> Result<u64> {
     if payload.len() > MAX_FRAME {
         return Err(PeerError::Limit("frame bytes"));
     }
@@ -280,12 +288,17 @@ pub(super) fn send(out: &mut impl Write, value: &impl Serialize) -> Result<u64> 
     header[..4].copy_from_slice(MAGIC);
     header[4..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
     out.write_all(&header)?;
-    out.write_all(&payload)?;
+    out.write_all(payload)?;
     out.flush()?;
     Ok((8 + payload.len()) as u64)
 }
 
 pub(super) fn receive<T: DeserializeOwned>(input: &mut impl Read) -> Result<(T, u64)> {
+    let bytes = read_payload(input)?;
+    Ok((decode(&bytes)?, (8 + bytes.len()) as u64))
+}
+
+pub(super) fn read_payload(input: &mut impl Read) -> Result<Vec<u8>> {
     let mut header = [0; 8];
     input.read_exact(&mut header)?;
     if &header[..4] != MAGIC {
@@ -297,16 +310,39 @@ pub(super) fn receive<T: DeserializeOwned>(input: &mut impl Read) -> Result<(T, 
     }
     let mut bytes = vec![0; len];
     input.read_exact(&mut bytes)?;
-    Ok((decode(&bytes)?, (8 + len) as u64))
+    Ok(bytes)
 }
 
 pub(super) fn elapsed_ms(start: Instant) -> u64 {
     start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
+pub(super) fn elapsed_us(start: Instant) -> u64 {
+    start.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_one_replica_block_request_keeps_its_wire_layout() {
+        let mut expected = b"PPN1\0\0\0\x43\x0b".to_vec();
+        expected.extend([7; 32]);
+        expected.extend([0, 1]);
+        expected.extend([9; 32]);
+        let (request, size) = receive::<Request>(&mut expected.as_slice()).unwrap();
+        let Request::Replica(sync) = &request else {
+            panic!("expected a replica request");
+        };
+        assert_eq!(sync.resource, Hash([7; 32]));
+        assert!(sync.lease.is_none());
+        assert_eq!(sync.block, Some(Hash([9; 32])));
+        assert_eq!(size, expected.len() as u64);
+        let mut written = Vec::new();
+        send(&mut written, &request).unwrap();
+        assert_eq!(written, expected);
+    }
 
     #[test]
     fn rejects_incomplete_oversized_and_unknown_frames() {

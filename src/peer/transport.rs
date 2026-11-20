@@ -93,6 +93,7 @@ struct Activity {
     deadline: Instant,
     sockets: Vec<Arc<TcpStream>>,
     job: Option<Rc<jobs::Attempt>>,
+    invocation: Option<Hash>,
 }
 
 impl Activity {
@@ -101,6 +102,7 @@ impl Activity {
             deadline,
             sockets: Vec::new(),
             job: None,
+            invocation: None,
         }
     }
 
@@ -232,7 +234,13 @@ enum Destination {
 }
 
 type Outbound = StreamOwned<ClientConnection, Socket>;
-type Connected<'a> = (Outbound, Option<Registration<'a>>);
+type Connected<'a> = (Outbound, Option<Registration<'a>>, ConnectionTiming);
+
+#[derive(serde::Serialize)]
+struct ConnectionTiming {
+    dial_us: u64,
+    authentication_us: u64,
+}
 
 /// A cancellation handle for one evaluation at a time. Once cancelled it stays cancelled.
 #[derive(Clone, Default)]
@@ -387,9 +395,9 @@ impl Client {
                     .deadline
                     .min(Instant::now() + Duration::from_millis(450));
                 match self.try_route(route, attempt, cancellation) {
-                    Ok((mut stream, registration)) => {
+                    Ok((mut stream, registration, timing)) => {
                         stream.sock.activity = active.clone();
-                        return Ok(Some((stream, registration)));
+                        return Ok(Some((stream, registration, timing)));
                     }
                     Err(
                         error @ (PeerError::Denied | PeerError::Cancelled | PeerError::Value(_)),
@@ -446,6 +454,7 @@ impl Client {
         activity: Activity,
         cancellation: Option<&'a Cancellation>,
     ) -> Result<Connected<'a>> {
+        let started = Instant::now();
         let tcp = match route {
             Route::Direct(address) => graph::dial(address, &activity, cancellation)?,
             Route::Relay(address) => {
@@ -458,7 +467,14 @@ impl Client {
         let registration = cancellation
             .map(|handle| handle.register(&tcp))
             .transpose()?;
-        Ok((self.handshake(tcp, activity)?, registration))
+        let dial_us = protocol::elapsed_us(started);
+        let authentication = Instant::now();
+        let stream = self.handshake(tcp, activity)?;
+        let timing = ConnectionTiming {
+            dial_us,
+            authentication_us: protocol::elapsed_us(authentication),
+        };
+        Ok((stream, registration, timing))
     }
 
     fn handshake(&self, tcp: TcpStream, activity: Activity) -> Result<Outbound> {
@@ -571,7 +587,7 @@ impl Client {
         cancellation: Option<&Cancellation>,
     ) -> Result<RemoteReport> {
         let started = Instant::now();
-        let (mut stream, _registration) =
+        let (mut stream, _registration, _) =
             self.connect_active(Activity::new(started + DEADLINE), cancellation)?;
         let mut sent = protocol::send(
             &mut stream,
@@ -794,13 +810,16 @@ impl Server {
             for _ in 0..jobs::WORKERS {
                 scope.spawn(|| server.work_jobs(&stop));
             }
-            let result = listener.incoming().try_for_each(|tcp| accept(tcp?));
+            let result = listener.incoming().try_for_each(|tcp| {
+                accept(tcp?);
+                Ok(())
+            });
             stop.store(true, Ordering::Relaxed);
             result
         })
     }
 
-    fn accept(self: &Arc<Self>, tcp: TcpStream, active: &Arc<AtomicUsize>) -> Result<()> {
+    fn accept(self: &Arc<Self>, tcp: TcpStream, active: &Arc<AtomicUsize>) {
         if active
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 (n < MAX_CONNECTIONS).then_some(n + 1)
@@ -809,14 +828,20 @@ impl Server {
         {
             let slot = Slot(active.clone());
             let server = self.clone();
-            thread::Builder::new()
+            if let Err(error) = thread::Builder::new()
                 .name("pp2-peer".into())
                 .spawn(move || {
                     let _slot = slot;
                     let _ = server.handle(tcp);
-                })?;
+                })
+            {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "pp2 peer could not start a connection handler ({:?})",
+                    error.kind()
+                );
+            }
         }
-        Ok(())
     }
 
     fn handle(&self, tcp: TcpStream) -> Result<()> {

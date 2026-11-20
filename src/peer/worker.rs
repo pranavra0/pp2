@@ -39,6 +39,15 @@ pub(super) struct Output {
     pub elapsed_us: u64,
     pub busy_us: u64,
     pub startup_us: u64,
+    pub timing: WorkerTiming,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+pub(super) struct WorkerTiming {
+    pub spawn_us: u64,
+    pub module_us: u64,
+    pub guest_us: u64,
+    pub codec_us: u64,
 }
 
 #[cfg(target_os = "linux")]

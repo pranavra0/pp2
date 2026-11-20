@@ -25,7 +25,7 @@ use crate::{
     Block, Cluster, Data, Grant, Hash, Limits, LocalityPolicy, StoreAccess, capability::Authority,
 };
 
-use super::{Output, PeerError, Result, Work, WorkContext};
+use super::{Output, PeerError, Result, Work, WorkContext, WorkerTiming};
 use crate::peer::{
     content::{self, JavaScript, Kind, MAX_CODE, MAX_MODULES},
     effects::{Effect, Remote, Scan},
@@ -39,7 +39,7 @@ const MAX_DIAGNOSTIC: usize = 2048;
 
 #[derive(Serialize, Deserialize)]
 enum WorkerReply {
-    Complete(Vec<u8>, Metrics, u64, u64),
+    Complete(Vec<u8>, Metrics, u64, u64, WorkerTiming),
     Effect(Effect),
     Failed(String),
     Timeout,
@@ -62,6 +62,7 @@ pub(super) fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
+    let spawn_us = micros(started.elapsed());
     let mut to = child.stdin.take().expect("stdin is piped");
     let mut from = child.stdout.take().expect("stdout is piped");
     thread::scope(|scope| {
@@ -101,8 +102,8 @@ pub(super) fn run(
                 };
                 match receiver.recv_timeout(time) {
                     Ok(Ok(WorkerReply::Effect(effect))) if graph => {
-                        calls += 1;
-                        if calls > crate::peer::effects::MAX_EFFECTS {
+                        calls += effect.count();
+                        if calls > usize::from(crate::peer::effects::MAX_EFFECTS) {
                             return Err(PeerError::Limit("effects per worker"));
                         }
                         let reply = effects(effect);
@@ -123,13 +124,17 @@ pub(super) fn run(
         let _ = child.kill();
         child.wait()?;
         match result? {
-            WorkerReply::Complete(value, metrics, elapsed_us, busy_us) => Ok(Output {
-                value,
-                metrics,
-                elapsed_us,
-                busy_us,
-                startup_us: micros(started.elapsed()).saturating_sub(elapsed_us),
-            }),
+            WorkerReply::Complete(value, metrics, elapsed_us, busy_us, mut timing) => {
+                timing.spawn_us = spawn_us;
+                Ok(Output {
+                    value,
+                    metrics,
+                    elapsed_us,
+                    busy_us,
+                    startup_us: micros(started.elapsed()).saturating_sub(elapsed_us),
+                    timing,
+                })
+            }
             WorkerReply::Effect(_) => Err(worker_exit()),
             WorkerReply::Failed(message) => Err(PeerError::Guest(message)),
             WorkerReply::Timeout => Err(PeerError::Timeout),
@@ -158,8 +163,9 @@ pub(super) fn main(parent: u32) -> Result<()> {
             metrics,
             elapsed_us,
             busy_us,
+            timing,
             ..
-        }) => WorkerReply::Complete(value, metrics, elapsed_us, busy_us),
+        }) => WorkerReply::Complete(value, metrics, elapsed_us, busy_us, timing),
         Err(PeerError::Timeout | PeerError::Runtime(crate::Error::Timeout)) => WorkerReply::Timeout,
         Err(error) => {
             let mut message = error.to_string();
@@ -275,6 +281,7 @@ fn evaluate(mut work: Work) -> Result<Output> {
         .position(|(hash, _)| *hash == work.program)
         .ok_or(PeerError::Missing(work.program))?;
     let (_, root) = work.code.swap_remove(at);
+    let mut timing = WorkerTiming::default();
     let (value, fuel, memory) = match content::inspect(work.program, &root)?.0 {
         Kind::Data | Kind::Native | Kind::Revision => {
             return Err(PeerError::Value("expected program".into()));
@@ -316,10 +323,15 @@ fn evaluate(mut work: Work) -> Result<Output> {
                 report.allocated_bytes as u64,
             )
         }
-        Kind::JavaScript => evaluate_javascript(work, &root, started, waiting.clone())?,
+        Kind::JavaScript => {
+            evaluate_javascript(work, &root, started, waiting.clone(), &mut timing)?
+        }
     };
+    let codec = Instant::now();
+    let value = value.to_bytes()?;
+    timing.codec_us += micros(codec.elapsed());
     Ok(Output {
-        value: value.to_bytes()?,
+        value,
         metrics: Metrics {
             fuel,
             memory,
@@ -328,6 +340,7 @@ fn evaluate(mut work: Work) -> Result<Output> {
         elapsed_us: micros(started.elapsed()),
         busy_us: micros(started.elapsed().saturating_sub(waiting.get())),
         startup_us: 0,
+        timing,
     })
 }
 
@@ -377,7 +390,9 @@ fn evaluate_javascript(
     root: &[u8],
     started: Instant,
     waiting: Rc<Cell<Duration>>,
+    timing: &mut WorkerTiming,
 ) -> Result<(Data, Option<u64>, u64)> {
+    let modules_started = Instant::now();
     let mut modules = BTreeMap::new();
     let root_name = format!("pp2:{}", work.program);
     modules.insert(root_name.clone(), JavaScript::from_bytes(root)?);
@@ -391,6 +406,7 @@ fn evaluate_javascript(
         entry.insert(JavaScript::from_bytes(&bytes)?);
     }
     let modules = Rc::new(modules);
+    let codec = Instant::now();
     let input = content::data_to_json(&Data::from_bytes(&work.input)?)?.to_string();
     let state = match &work.context {
         WorkContext::Snapshot { bytes, .. } => {
@@ -401,6 +417,8 @@ fn evaluate_javascript(
         }
         WorkContext::Graph(_) => None,
     };
+    let input_codec = codec.elapsed();
+    timing.codec_us += micros(input_codec);
     let runtime = Runtime::new().map_err(js_error)?;
     runtime.set_memory_limit(JS_MEMORY);
     runtime.set_max_stack_size(512 * 1024);
@@ -411,7 +429,7 @@ fn evaluate_javascript(
     runtime.set_loader(Manifest(modules.clone()), Manifest(modules.clone()));
     let context = Context::full(&runtime).map_err(js_error)?;
     let bytes = context.with(|ctx| {
-        let invoke = || -> rquickjs::Result<String> {
+        let mut invoke = || -> rquickjs::Result<String> {
             let mut replacer: Function = ctx.eval(r#"(() => {
                 'use strict';
                 for (const key of ['Date', 'Temporal', 'performance', 'SharedArrayBuffer', 'Atomics', 'WeakRef', 'FinalizationRegistry']) delete globalThis[key];
@@ -443,7 +461,12 @@ fn evaluate_javascript(
             let (module, loaded) = Module::declare(ctx.clone(), root_name.as_str(), modules[&root_name].source.as_bytes())?.eval()?;
             loaded.finish::<()>()?;
             let entry: Function = module.get("default")?;
+            timing.module_us = micros(modules_started.elapsed().saturating_sub(input_codec));
+            let codec = Instant::now();
             let input = ctx.json_parse(input.as_bytes())?;
+            timing.codec_us += micros(codec.elapsed());
+            let guest_started = Instant::now();
+            let idle_before = waiting.get();
             let result: Value = match &guest {
                 Some((api, _)) => entry.call((api.clone(), input))?,
                 None => {
@@ -465,7 +488,11 @@ fn evaluate_javascript(
             if let Some((_, complete)) = guest {
                 complete.call::<_, ()>(())?;
             }
-            ctx.json_stringify_replacer(result, replacer)?.ok_or(rquickjs::Error::Unknown)?.to_string()
+            timing.guest_us = micros(guest_started.elapsed().saturating_sub(waiting.get() - idle_before));
+            let codec = Instant::now();
+            let result = ctx.json_stringify_replacer(result, replacer)?.ok_or(rquickjs::Error::Unknown)?.to_string()?;
+            timing.codec_us += micros(codec.elapsed());
+            Ok(result)
         };
         invoke().catch(&ctx).map_err(js_error)
     });
@@ -476,8 +503,10 @@ fn evaluate_javascript(
     if bytes.len() > Block::MAX_BYTES {
         return Err(PeerError::Limit("JSON result bytes"));
     }
+    let codec = Instant::now();
     let json = serde_json::from_str(&bytes).map_err(|err| PeerError::Value(err.to_string()))?;
     let value = content::data_from_json(json)?;
+    timing.codec_us += micros(codec.elapsed());
     Ok((
         value,
         None,
@@ -509,6 +538,14 @@ fn exchange_effect(args: Array<'_>, waiting: &Cell<Duration>) -> rquickjs::Resul
                 serde_json::from_str(payload).map_err(|err| PeerError::Value(err.to_string()))?;
             Ok(content::data_from_json(json)?.to_bytes()?)
         };
+        let consistency_from = |value: &str| -> Result<_> {
+            use crate::peer::Consistency;
+            Ok(match value {
+                "authoritative" => Consistency::Authoritative,
+                "replica" => Consistency::Replica,
+                id => Consistency::Revision(id.parse()?),
+            })
+        };
         let effect = match kind.as_str() {
             "evaluate" => Effect::Evaluate(Remote {
                 target: key,
@@ -520,11 +557,7 @@ fn exchange_effect(args: Array<'_>, waiting: &Cell<Duration>) -> rquickjs::Resul
                 } else {
                     aux.split(',').map(str::to_owned).collect()
                 },
-                consistency: match consistency.as_str() {
-                    "authoritative" => crate::peer::Consistency::Authoritative,
-                    "replica" => crate::peer::Consistency::Replica,
-                    id => crate::peer::Consistency::Revision(id.parse()?),
-                },
+                consistency: consistency_from(&consistency)?,
                 merge,
                 update: if revision.is_empty() {
                     None
@@ -537,6 +570,35 @@ fn exchange_effect(args: Array<'_>, waiting: &Cell<Duration>) -> rquickjs::Resul
                     ))
                 },
             }),
+            "evaluateBatch" => {
+                use crate::peer::effects::{MAX_EFFECT_BYTES, MAX_PARALLEL_READS};
+                if payload.len() > MAX_PARALLEL_READS * MAX_EFFECT_BYTES * 6 {
+                    return Err(PeerError::Limit("batch input bytes"));
+                }
+                type Read = (String, serde_json::Value, Option<u16>, String);
+                let reads: Vec<Read> = serde_json::from_str(&payload)
+                    .map_err(|err| PeerError::Value(err.to_string()))?;
+                if !(1..=MAX_PARALLEL_READS).contains(&reads.len()) {
+                    return Err(PeerError::Limit("parallel read count"));
+                }
+                Effect::EvaluateBatch(
+                    reads
+                        .into_iter()
+                        .map(|(target, input, timeout_ms, consistency)| {
+                            Ok(Remote {
+                                target,
+                                input: content::data_from_json(input)?.to_bytes()?,
+                                allowance: 0,
+                                timeout_ms,
+                                delegate: Vec::new(),
+                                update: None,
+                                consistency: consistency_from(&consistency)?,
+                                merge: false,
+                            })
+                        })
+                        .collect::<Result<_>>()?,
+                )
+            }
             "get" => Effect::Get(key),
             "scan" => Effect::Scan(Scan {
                 prefix: key,
