@@ -552,6 +552,7 @@ fn exchange_effect(args: Array<'_>, waiting: &Cell<Duration>) -> rquickjs::Resul
                 Failure::Conflict(revision) => ("conflict", Some(revision)),
                 Failure::Busy => ("busy", None),
                 Failure::Missing(_) => ("missing", None),
+                Failure::PeerUnavailable(_) => ("peer-unavailable", None),
                 Failure::Invalid(_) => ("invalid", None),
                 Failure::Guest(_) => ("guest", None),
                 Failure::Internal => ("internal", None),

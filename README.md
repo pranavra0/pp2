@@ -16,7 +16,7 @@ Install the peer CLI with `cargo install --locked --path .`. The application cli
 
 ## Run a three-peer application
 
-The stock example reads the reorder threshold at the office, evaluates a warehouse program at each location, and combines the totals. The manifest specifies each capability's peer, collection, program, and maximum access. OpenSSL provisions development identities and grants during initialization. JavaScript packaging and execution use the installed `pp2` binary.
+The stock example reads the reorder threshold at the office, evaluates a warehouse program at each location, and combines the totals. The manifest specifies each capability's peer, collection, program, and maximum access. Initialization provisions development credentials and grants. JavaScript packaging and execution use the installed `pp2` binary.
 
 ~~~sh
 pp2 app init examples/federated-stock/app.json ./stock-deployment
@@ -26,7 +26,41 @@ pp2 app run ./stock-deployment '{"sku":"lamp","viaWest":true}'
 
 Both invocations return 10 lamps, with 7 at the west warehouse and 3 at the east warehouse. The second invocation explicitly passes the east capability and one descendant call to the west computation. `app run` starts three independent peer processes with separate databases and authenticated loopback connections. The deployment directory persists across invocations.
 
-To deploy the same application across hosts, set a reachable IP address and port in each manifest peer's `address` field before running `app init`. For example, set `"address": "192.0.2.11:7340"` on the office peer. Copy each generated peer directory to its corresponding host and start `pp2 app serve PEER_DIRECTORY` there. Copy the `client` directory to the invocation machine and run `pp2 app invoke CLIENT_DIRECTORY '{"sku":"lamp"}'`. Keep peer and client directories private to their operators. The `admin` directory contains the development CA signing key. The office needs TCP reachability to both warehouses. The delegated invocation also requires west to reach east directly. [Stock program](examples/federated-stock/stock.mjs), [warehouse program](examples/federated-stock/warehouse.mjs), [application manifest](examples/federated-stock/app.json)
+## Deploy with network discovery
+
+Generate identities and grants for the stock application, then copy each peer directory to its host. Keep each `identity.key` private to the operator of that peer. Copy the `client` directory to the machine invoking the application.
+
+~~~sh
+pp2 app init examples/federated-stock/app.json ./stock-deployment --discovery
+pp2 app serve PEER_DIRECTORY 0.0.0.0:7340
+pp2 app invoke CLIENT_DIRECTORY '{"sku":"lamp","viaWest":true}'
+~~~
+
+On a shared LAN, peers announce their current endpoint over IPv4 multicast on UDP port 47342. Open the selected TCP listener port for direct connections. The bind address is a daemon setting. The same deployment can run on one machine with `pp2 app run ./stock-deployment`.
+
+Across networks, run `pp2 peer rendezvous 0.0.0.0:7341 --relay` on a reachable host. Put the service address in `discovery.json` in each peer and client directory. Set `relay` on listening peers to accept incoming connections through the service when a direct path is unavailable.
+
+~~~json
+{
+  "rendezvous": "192.0.2.10:7341",
+  "relay": true
+}
+~~~
+
+A node can set `advertise` to a list of reachable TCP addresses for direct cross-network connections. The optional `lan_interface` selects a local IPv4 address, and `lan: false` disables multicast. Operators can supply pinned static addresses in a deployment manifest or in a `peer serve-network` graph configuration. A stable route in that configuration has an `id` and an `address`. IDs in JSON use arrays of 32 bytes.
+
+Use `pp2 peer node-init NODE_DIRECTORY` to provision a standalone node, and `pp2 peer identity NODE_DIRECTORY/identity.key` to print its ID. Resource owners use `pp2 peer issue` and `pp2 peer issue-reaction-writer` with a recipient's stable ID. The same ID is accepted by `pp2 app install`, `peer delegate`, and `peer attenuate`. Run existing remote operations through `pp2 peer connect NODE_DIRECTORY PEER_ID OPERATION ...`, omitting their address and TLS credential arguments. Use `PEER_ID@ADDRESS` to also supply a pinned route.
+
+Use `pp2 peer find NODE_DIRECTORY CACHE_DB HASH` to locate explicitly published immutable data or code. `find-program` verifies a program and its declared imports. Add `--publish` to make the verified copies available from the cache's own daemon.
+
+~~~sh
+cargo build --locked --bin pp2
+python3 scripts/demo-network-discovery.py
+~~~
+
+The demo installs a persistent application and runs a delegated stock query across three isolated Linux networks. It moves a peer while a delivery is pending, checks recovery using the same program and grants, and retrieves code from a nearby cache after shutting down the publisher and rendezvous service. It also verifies that a forged lease, mismatched identity, stolen grant, and private-content fetch fail. [Demo script](scripts/demo-network-discovery.py), [identity lifecycle and discovery limits](docs/architecture.md#peer-identity-and-discovery)
+
+For a certificate-pinned deployment, set the participating peers' reachable addresses in the manifest before running `app init` in its default mode. The `admin` directory contains the deployment CA signing key. [Application manifest](examples/federated-stock/app.json)
 
 ## Run a computation that survives disconnection
 
@@ -37,9 +71,9 @@ scripts/demo-autonomous.py
 
 The demo starts three peer processes with their own certificates, databases, and grant policies. A obtains an attenuated grant from C for B, submits to B, and disconnects while C is offline. When C returns, B reads its local collection and calls C directly. B persists the sum of 13 before A reconnects to retrieve it. [Demo script](scripts/demo-autonomous.py), [guest programs](examples/autonomous)
 
-Use `pp2 peer attenuate` to obtain a grant for a recipient peer. `pp2 peer job-submit` takes a client-generated 64-digit hexadecimal job ID, an absolute expiration in Unix milliseconds, a program hash, an input file, and a graph budget. Supply named bindings from B's local configuration or use `--delegated FILE` with grants addressed to B. The file is a JSON object keyed by guest capability name. Each entry contains `peer` (the issuer certificate fingerprint), `grant`, `program`, and `access` (`Read` or `Write`). JSON fingerprints and hashes are arrays of 32 bytes. B's peer directory must include the presenter and each issuer.
+Use `pp2 peer attenuate` to obtain a grant for a recipient peer. `pp2 peer job-submit` takes a client-generated 64-digit hexadecimal job ID, an absolute expiration in Unix milliseconds, a program hash, an input file, and a graph budget. Supply named bindings from B's local configuration or use `--delegated FILE` with grants addressed to B. The file is a JSON object keyed by guest capability name. Each entry contains `peer` (the issuer ID or certificate fingerprint), `grant`, `program`, and `access` (`Read` or `Write`). JSON fingerprints and hashes are arrays of 32 bytes. In certificate mode, B’s peer directory includes the presenter and each issuer.
 
-Use `job-status` and `job-cancel` with the submitting certificate. After an ambiguous submission reply, resubmit the same job ID and arguments. Jobs can live for up to five minutes. The peer keeps each terminal result in its database, and cancellation or expiration can leave any already accepted child work running within its own deadline. [Lifecycle and authority](docs/architecture.md#durable-computations)
+Use `job-status` and `job-cancel` with the submitting identity. After an ambiguous submission reply, resubmit the same job ID and arguments. Jobs can live for up to five minutes. The peer keeps each terminal result in its database, and cancellation or expiration can leave any already accepted child work running within its own deadline. [Lifecycle and authority](docs/architecture.md#durable-computations)
 
 For an existing stock deployment, keep the peer databases, certificates, and grants. Add a `directory` object to each peer's `profile.json`, keyed by peer name, with an `address` and SHA-256 certificate `fingerprint` for each participating peer. For `peer serve` configurations, use `peers` entries with `address`, TLS `name`, and `fingerprint`, and reference the fingerprint in each binding's `peer` field. Upgrade all peers that participate in a graph together.
 
@@ -52,9 +86,9 @@ python3 scripts/demo-persistent-inventory.py
 
 The warehouse accepts a stock update while the office is offline. The demo kills and restarts the warehouse daemon, then starts the office. The warehouse's installed handler resumes automatically and updates the office's inventory projection. The office skips the projection write when delivering its own subscription. The demo also checks that the office can revoke the warehouse's write grant and that removing the warehouse installation stops local delivery. [Demo script](scripts/demo-persistent-inventory.py) and [guest programs](examples/persistent-inventory).
 
-Package the handler and its imports into the serving peer's database. Use `pp2 peer issue DB REFERENCE PEER_CERT reader PROGRAM` to grant the handler a watch on one local reference. For an indexed collection, the same grant can also give the handler read access to its entries. For a snapshot reference, issue a separate read grant on an indexed collection for the handler's storage context.
+Package the handler and its imports into the serving peer's database. Use `pp2 peer issue DB REFERENCE HOLDER reader PROGRAM` to grant the handler a watch on one local reference. For an indexed collection, the same grant can also give the handler read access to its entries. For a snapshot reference, issue a separate read grant on an indexed collection for the handler's storage context.
 
-Use `pp2 app install DB PEER_CERT SUBSCRIPTIONS_JSON` with a JSON object containing `name` and a `subscriptions` object keyed by subscription name. Each subscription specifies `program`, `watch_grant`, `budget`, and `expires_at_ms`. Optional `entry_grant` selects a separate collection and optional `capabilities` lists explicit bindings using the same shape as durable job bindings above. The serving daemon uses its own certificate and must have a directory entry for each destination. Remote resource owners issue their own grants. Use `pp2 peer issue-reaction-writer DB COLLECTION EXECUTOR_CERT PROGRAM` at the destination to allow a handler's durable child to update that collection.
+Use `pp2 app install DB HOLDER SUBSCRIPTIONS_JSON` with a JSON object containing `name` and a `subscriptions` object keyed by subscription name. Each subscription specifies `program`, `watch_grant`, `budget`, and `expires_at_ms`. Optional `entry_grant` selects a separate collection and optional `capabilities` lists explicit bindings using the same shape as durable job bindings above. The serving daemon uses its own identity for the installation. Remote resource owners issue their own grants. Use `pp2 peer issue-reaction-writer DB COLLECTION EXECUTOR PROGRAM` at the destination to allow a handler's durable child to update that collection.
 
 The handler receives `{id, reference, revision}`. The ID is a stable hex string and the revision is a decimal string. `pp2 app status DB APPLICATION` shows each cursor, pending revision, missed count, and most recent terminal outcome. Use `pp2 app unsubscribe DB APPLICATION SUBSCRIPTION` to revoke one subscription or `pp2 app remove DB APPLICATION` to stop the installation. Status reports `removing` while already dispatched children may still hold live deadlines. [Delivery and lifecycle semantics](docs/architecture.md#persistent-applications)
 

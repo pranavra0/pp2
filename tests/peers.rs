@@ -15,8 +15,8 @@ use std::{
 use pp2::{
     Block, Data, Expr, Hash, Program,
     peer::{
-        self, Access, Cancellation, Client, Credentials, Evaluation, EvaluationMode, JavaScript,
-        PeerError, PeerStore, RemoteReport,
+        self, Access, Cancellation, Client, Credentials, DiscoveryConfig, Evaluation,
+        EvaluationMode, JavaScript, PeerError, PeerIdentity, PeerNetwork, PeerStore, RemoteReport,
     },
 };
 
@@ -39,7 +39,7 @@ impl Drop for Temp {
 struct Daemon(Child, SocketAddr);
 impl Daemon {
     fn launch(path: &Path, db: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_pp2"))
+        let child = Command::new(env!("CARGO_BIN_EXE_pp2"))
             .args(["peer", "serve"])
             .arg(db)
             .arg("127.0.0.1:0")
@@ -48,6 +48,10 @@ impl Daemon {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
+        Self::from_child(child)
+    }
+
+    fn from_child(mut child: Child) -> Self {
         let mut ready = String::new();
         BufReader::new(child.stdout.take().unwrap())
             .read_line(&mut ready)
@@ -145,6 +149,107 @@ fn database_identity_rejects_unrelated_files() {
         Err(PeerError::Unsupported(_))
     ));
     assert_eq!(fs::read(database).unwrap(), original);
+}
+
+#[test]
+fn stable_grant_survives_transport_certificate_replacement_and_respects_identity_revocation() {
+    let dir = Temp::new();
+    let path = &dir.0;
+    certificates(path);
+    let database = path.join("storage.db");
+    let server_id = PeerIdentity::generate(path.join("identity.key")).unwrap();
+    let caller_key = path.join("caller.key");
+    let caller_id = PeerIdentity::generate(&caller_key).unwrap();
+    let caller = PeerNetwork::new(
+        PeerIdentity::load(caller_key).unwrap(),
+        DiscoveryConfig {
+            lan: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut store = PeerStore::open(&database).unwrap();
+    let revision = store.create_ref("private", &Data::Int(7)).unwrap();
+    let program = pack(
+        &mut store,
+        "export default state => state;",
+        BTreeSet::new(),
+    );
+    store.publish(program).unwrap();
+    let grant = store
+        .issue("private", caller_id, Access::Read, Some(program))
+        .unwrap();
+    let launch = |certificate: &str, revoked: BTreeSet<Hash>| {
+        fs::copy(
+            path.join(format!("{certificate}.pem")),
+            path.join("peer.pem"),
+        )
+        .unwrap();
+        fs::copy(
+            path.join(format!("{certificate}.key")),
+            path.join("peer.key"),
+        )
+        .unwrap();
+        let settings = DiscoveryConfig {
+            lan: false,
+            revoked,
+            ..Default::default()
+        };
+        fs::write(
+            path.join("discovery.json"),
+            serde_json::to_vec(&settings).unwrap(),
+        )
+        .unwrap();
+        Daemon::from_child(
+            Command::new(env!("CARGO_BIN_EXE_pp2"))
+                .args(["peer", "serve-network"])
+                .arg(&database)
+                .arg("127.0.0.1:0")
+                .arg(path)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    for certificate in ["server", "rogue"] {
+        let daemon = launch(certificate, BTreeSet::new());
+        let client = Client::for_peer(&caller, server_id, Some(daemon.1));
+        assert_eq!(
+            run(
+                &client,
+                grant,
+                program,
+                None,
+                &Data::Nil,
+                EvaluationMode::Read
+            )
+            .unwrap()
+            .value,
+            Data::Int(7),
+        );
+        assert!(
+            matches!(client.fetch(revision.hash), Err(PeerError::Missing(hash)) if hash == revision.hash)
+        );
+        let wrong_peer = Client::for_peer(&caller, caller_id, Some(daemon.1));
+        assert!(
+            matches!(wrong_peer.fetch(program), Err(PeerError::PeerUnavailable(id)) if id == caller_id)
+        );
+    }
+
+    let daemon = launch("rogue", BTreeSet::from([caller_id]));
+    let client = Client::for_peer(&caller, server_id, Some(daemon.1));
+    assert!(matches!(
+        run(
+            &client,
+            grant,
+            program,
+            None,
+            &Data::Nil,
+            EvaluationMode::Read
+        ),
+        Err(PeerError::Denied),
+    ));
 }
 
 #[test]

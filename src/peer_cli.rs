@@ -4,7 +4,7 @@ use std::{
     ffi::OsString,
     fs::{self, File},
     io::Read,
-    net::TcpListener,
+    net::{SocketAddr, TcpListener},
     path::Path,
 };
 
@@ -12,13 +12,23 @@ use pp2::{
     Block, Hash,
     peer::{
         Access, BindingSet, Client, Credentials, DurableEvaluation, Evaluation, EvaluationMode,
-        GraphBudget, GraphEvaluation, JavaScript, JobStatus, PeerEndpoint, PeerStore, Server,
-        compile_typescript, data_from_json, data_to_json,
+        GraphBudget, GraphEvaluation, JavaScript, JobStatus, PeerEndpoint, PeerIdentity, PeerStore,
+        Server, compile_typescript, data_from_json, data_to_json, serve_rendezvous,
     },
 };
 
+use crate::app_cli::{holder_id, network, node_init};
+
 const USAGE: &str = "Usage: pp2 peer <command>
   serve DB BIND CA CERT KEY [GRAPH_CONFIG]
+  serve-network DB BIND NODE_DIRECTORY [GRAPH_CONFIG]
+  rendezvous BIND [--relay]
+  node-init NODE_DIRECTORY
+  identity-new IDENTITY_KEY
+  identity IDENTITY_KEY
+  connect NODE_DIRECTORY PEER_ID[@ADDRESS] OPERATION [OPERATION_ARGS ...]
+  find NODE_DIRECTORY DB HASH [--publish]
+  find-program NODE_DIRECTORY DB HASH [--publish]
   fingerprint CERT
   pack SOURCE OUTPUT [HASH | SPECIFIER=HASH ...]
   put DB BLOCK [--publish]
@@ -28,10 +38,10 @@ const USAGE: &str = "Usage: pp2 peer <command>
   fetch-program DB ADDRESS NAME CA CERT KEY HASH [--publish]
   ref-init DB REFERENCE JSON_FILE
   collection-init DB REFERENCE [ENTRIES_NDJSON]
-  issue DB REFERENCE HOLDER_CERT reader|writer [PROGRAM]
-  issue-reaction-writer DB REFERENCE HOLDER_CERT PROGRAM
-  delegate ADDRESS NAME CA CERT KEY GRANT HOLDER_CERT reader|writer [PROGRAM]
-  attenuate ADDRESS NAME CA CERT KEY GRANT HOLDER_CERT reader|writer PROGRAM BUDGET_JSON EXPIRES_AT_MS
+  issue DB REFERENCE PEER_ID|HOLDER_CERT reader|writer [PROGRAM]
+  issue-reaction-writer DB REFERENCE PEER_ID|HOLDER_CERT PROGRAM
+  delegate ADDRESS NAME CA CERT KEY GRANT PEER_ID|HOLDER_CERT reader|writer [PROGRAM]
+  attenuate ADDRESS NAME CA CERT KEY GRANT PEER_ID|HOLDER_CERT reader|writer PROGRAM BUDGET_JSON EXPIRES_AT_MS
   revoke DB GRANT
   gc DB
   read DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE
@@ -49,7 +59,43 @@ pub fn run(args: &[OsString]) -> Result<()> {
         .iter()
         .map(|arg| arg.to_str().ok_or("expected UTF-8 argument"))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    match args.as_slice() {
+    if let ["connect", directory, target, command, operands @ ..] = args.as_slice() {
+        let (id, fallback) = if let Some((id, address)) = target.split_once('@') {
+            (id.parse()?, Some(address.parse::<SocketAddr>()?))
+        } else {
+            (target.parse()?, None)
+        };
+        let mut args = vec![*command];
+        let operands = match *command {
+            "fetch" | "fetch-program" | "read" | "update" | "graph-read" | "graph-update"
+            | "job-submit" => {
+                let (db, rest) = operands.split_first().ok_or(USAGE)?;
+                args.push(*db);
+                rest
+            }
+            "delegate" | "attenuate" | "job-status" | "job-cancel" => operands,
+            _ => return Err(USAGE.into()),
+        };
+        args.extend(["-"; 5]);
+        args.extend(operands);
+        let client = Client::for_peer(&network(Path::new(directory))?, id, fallback);
+        return run_command(&args, Some(client));
+    }
+    run_command(&args, None)
+}
+
+fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
+    let client = |address: &str, name: &str, ca: &str, cert: &str, key: &str| -> Result<Client> {
+        if let Some(client) = &stable {
+            return Ok(client.clone());
+        }
+        Ok(Client::new(
+            address.parse()?,
+            name,
+            &credentials(ca, cert, key),
+        )?)
+    };
+    match args {
         [] | ["--help" | "-h"] => println!("{USAGE}"),
         ["serve", db, bind, ca, cert, key, config @ ..] if config.len() <= 1 => {
             let creds = credentials(ca, cert, key);
@@ -61,6 +107,52 @@ pub fn run(args: &[OsString]) -> Result<()> {
             let listener = TcpListener::bind(bind)?;
             println!("listening on {}", listener.local_addr()?);
             server.serve(listener)?;
+        }
+        ["serve-network", db, bind, directory, config @ ..] if config.len() <= 1 => {
+            let directory = Path::new(directory);
+            let creds = crate::app_cli::credentials(directory);
+            let mut server =
+                Server::new_discovered(db, std::env::current_exe()?, &creds, network(directory)?)?;
+            if let Some(path) = config.first() {
+                let graph: GraphConfig = serde_json::from_slice(&read(path)?)?;
+                server = server.with_graph(&creds, graph.bindings, graph.peers)?;
+            }
+            let listener = TcpListener::bind(bind)?;
+            println!("listening on {}", listener.local_addr()?);
+            server.serve(listener)?;
+        }
+        ["rendezvous", bind, flags @ ..] if matches!(flags, [] | ["--relay"]) => {
+            let listener = TcpListener::bind(bind)?;
+            println!("listening on {}", listener.local_addr()?);
+            serve_rendezvous(listener, !flags.is_empty())?;
+        }
+        ["node-init", directory] => println!("{}", node_init(Path::new(directory))?),
+        ["identity-new", key] => println!("{}", PeerIdentity::generate(key)?),
+        ["identity", key] => println!("{}", PeerIdentity::load(key)?.id()),
+        [
+            command @ ("find" | "find-program"),
+            directory,
+            db,
+            hash,
+            flags @ ..,
+        ] if matches!(flags, [] | ["--publish"]) => {
+            let mut cache = PeerStore::open(db)?;
+            let network = network(Path::new(directory))?;
+            let hash = hash.parse()?;
+            if *command == "find-program" {
+                for hash in Client::fetch_discovered_program(&mut cache, &network, hash)? {
+                    if !flags.is_empty() {
+                        cache.publish(hash)?;
+                    }
+                    println!("{hash}");
+                }
+            } else {
+                let bytes = Client::fetch_discovered(&mut cache, &network, hash)?;
+                if !flags.is_empty() {
+                    cache.publish(hash)?;
+                }
+                println!("{} bytes", bytes.len());
+            }
         }
         ["fingerprint", cert] => println!("{}", Credentials::fingerprint(cert)?),
         ["pack", source, output, imports @ ..] => {
@@ -148,7 +240,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
         ["issue", db, reference, holder, level, program @ ..] if program.len() <= 1 => {
             let token = PeerStore::open(db)?.issue(
                 reference,
-                Credentials::fingerprint(holder)?,
+                holder_id(holder)?,
                 access(level)?,
                 optional_hash(program)?,
             )?;
@@ -157,7 +249,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
         ["issue-reaction-writer", db, reference, holder, program] => {
             let token = PeerStore::open(db)?.issue_reaction_writer(
                 reference,
-                Credentials::fingerprint(holder)?,
+                holder_id(holder)?,
                 program.parse()?,
             )?;
             println!("{token}");
@@ -176,7 +268,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
         ] if program.len() <= 1 => {
             let token = client(address, name, ca, cert, key)?.delegate(
                 grant.parse()?,
-                Credentials::fingerprint(holder)?,
+                holder_id(holder)?,
                 access(level)?,
                 optional_hash(program)?,
             )?;
@@ -199,7 +291,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
         ] => {
             let token = client(address, name, ca, cert, key)?.attenuate(
                 grant.parse()?,
-                Credentials::fingerprint(holder)?,
+                holder_id(holder)?,
                 access(level)?,
                 program.parse()?,
                 serde_json::from_str(budget)?,
@@ -421,14 +513,6 @@ fn credentials(ca: &str, cert: &str, key: &str) -> Credentials {
         certificate: cert.into(),
         key: key.into(),
     }
-}
-
-fn client(address: &str, name: &str, ca: &str, cert: &str, key: &str) -> Result<Client> {
-    Ok(Client::new(
-        address.parse()?,
-        name,
-        &credentials(ca, cert, key),
-    )?)
 }
 
 fn access(input: &str) -> Result<Access> {

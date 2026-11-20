@@ -128,7 +128,7 @@ impl Client {
         .try_into()
     }
 
-    /// Reads the status or the result of a job submitted under this certificate.
+    /// Reads the status or the result of a job submitted under this identity.
     pub fn job_status(&self, id: Hash) -> Result<JobStatus> {
         self.job_control(Request::JobStatus(id))
     }
@@ -220,7 +220,7 @@ impl Server {
         let call = job.call(holder, reaction)?;
         store.confirm_collection(call)?;
         let bindings = self.graph.resolve(call, job.bindings.clone())?;
-        let code = receive_code(stream, store, call)?;
+        let code = self.receive_code(stream, store, call)?;
         if !code[0].1.starts_with(content::MAGIC) {
             return Err(PeerError::Value(
                 "graph evaluation requires JavaScript".into(),
@@ -289,6 +289,9 @@ impl Server {
         let mut call = None;
         let mut watch = None;
         let run = || -> Result<JobState> {
+            if let Some(network) = &self.network {
+                network.check_identity(key.holder)?;
+            }
             let invocation = graph.call(key.holder, reaction)?;
             call = Some(invocation);
             store.confirm_collection(invocation)?;
@@ -333,7 +336,7 @@ impl Server {
 
 pub(super) fn retryable(error: &PeerError) -> bool {
     match error {
-        PeerError::Busy | PeerError::Io(_) => true,
+        PeerError::Busy | PeerError::Io(_) | PeerError::PeerUnavailable(_) => true,
         PeerError::Storage(error) => matches!(
             error.sqlite_error_code(),
             Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)

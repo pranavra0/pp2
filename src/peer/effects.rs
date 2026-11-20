@@ -55,7 +55,7 @@ pub(super) enum GraphBindings {
     Forwarded(BTreeMap<String, Binding>),
 }
 
-/// A certificate-bound capability. Only the local host's peer directory can route it.
+/// A capability addressed to its issuing peer. The host resolves the peer before dispatch.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
@@ -71,12 +71,14 @@ pub(super) struct BoundCapability {
     pub delegated_by: Option<Hash>,
 }
 
-/// An administrator-approved network route to an exact peer certificate.
+/// An explicit route pinned to a stable identity or a legacy leaf certificate.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerEndpoint {
     pub address: std::net::SocketAddr,
+    #[serde(default)]
     pub name: String,
+    #[serde(alias = "id")]
     pub fingerprint: Hash,
 }
 

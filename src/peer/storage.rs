@@ -25,7 +25,7 @@ pub(super) use jobs::{JobKey, JobOutcome, QueuedJob};
 
 const MAX_DELEGATION_DEPTH: u8 = 8;
 const MAX_GRANTS_PER_REF: u32 = 1024;
-const MAX_CACHE_BYTES_PER_CERTIFICATE: i64 = 16 * 1024 * 1024;
+const MAX_CACHE_BYTES_PER_HOLDER: i64 = 16 * 1024 * 1024;
 const APPLICATION_ID: i64 = 0x70703231;
 /// A successful update remains replayable for this many revisions, while its grant is live.
 pub const RECEIPT_WINDOW: u64 = 1024;
@@ -265,7 +265,7 @@ impl PeerStore {
         )?;
         for (hash, bytes) in blocks {
             let size = bytes.len() as i64;
-            if used + size > MAX_CACHE_BYTES_PER_CERTIFICATE {
+            if used + size > MAX_CACHE_BYTES_PER_HOLDER {
                 continue;
             }
             if insert(&tx, *hash, bytes)? == Kind::Data {
@@ -356,7 +356,7 @@ impl PeerStore {
         Ok(next)
     }
 
-    /// Creates a grant bound to a TLS certificate fingerprint and optionally one program hash.
+    /// Creates a grant bound to an authenticated holder and optionally one program hash.
     pub fn issue(
         &mut self,
         reference: &str,

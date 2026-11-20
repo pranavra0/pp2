@@ -23,8 +23,9 @@ use crate::{Block, Data, Hash};
 
 pub use super::protocol::EvaluationMode;
 use super::{
-    Access, PeerError, PeerStore, Result,
+    Access, PeerError, PeerNetwork, PeerStore, Result,
     content::{self, MAX_MODULES, load_code},
+    discovery::{IDENTITY_ALPN, Route, prove_transport, verify_transport},
     effects::{BindingSet, PeerEndpoint},
     protocol::{self, Job, Reply, Request},
     storage::{self, Call, EvaluationStart, Update},
@@ -33,13 +34,17 @@ use super::{
 };
 
 const ALPN: &[u8] = b"pp2/1";
+const SERVER_EXPORTER: &[u8] = b"EXPORTER-pp2-server-identity-v1";
+const CLIENT_EXPORTER: &[u8] = b"EXPORTER-pp2-client-identity-v1";
 const DEADLINE: Duration = Duration::from_secs(8);
 const MAX_CONNECTIONS: usize = 16;
 
 mod graph;
 mod jobs;
+mod packages;
 pub use graph::{GraphEvaluation, GraphReport};
 pub use jobs::{DurableEvaluation, JobStatus};
+use packages::ContentSources;
 
 /// TLS root certificates and one peer certificate with its private key.
 #[derive(Clone, Debug)]
@@ -62,7 +67,7 @@ impl Credentials {
         Ok(roots)
     }
 
-    fn identity(&self) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    fn transport_keys(&self) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
         let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(&self.key)?))?
             .ok_or_else(|| PeerError::Tls("missing private key".into()))?;
         Ok((certificates(&self.certificate)?, key))
@@ -207,11 +212,26 @@ impl Write for Socket {
 
 #[derive(Clone)]
 pub struct Client {
-    endpoint: SocketAddr,
-    name: ServerName<'static>,
+    destination: Destination,
     tls: Arc<ClientConfig>,
-    fingerprint: Option<Hash>,
 }
+
+#[derive(Clone)]
+enum Destination {
+    Certificate {
+        address: SocketAddr,
+        name: ServerName<'static>,
+        fingerprint: Option<Hash>,
+    },
+    Identity {
+        network: PeerNetwork,
+        id: Hash,
+        fallback: Option<SocketAddr>,
+    },
+}
+
+type Outbound = StreamOwned<ClientConnection, Socket>;
+type Connected<'a> = (Outbound, Option<Registration<'a>>);
 
 /// A cancellation handle for one evaluation at a time. Once cancelled it stays cancelled.
 #[derive(Clone, Default)]
@@ -290,7 +310,7 @@ pub struct RemoteReport {
 
 impl Client {
     pub fn new(endpoint: SocketAddr, name: impl Into<String>, creds: &Credentials) -> Result<Self> {
-        let (certs, key) = creds.identity()?;
+        let (certs, key) = creds.transport_keys()?;
         let name = ServerName::try_from(name.into()).map_err(tls)?;
         let mut config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_root_certificates(creds.roots()?)
@@ -299,86 +319,206 @@ impl Client {
         config.alpn_protocols = vec![ALPN.to_vec()];
         config.resumption = rustls::client::Resumption::disabled();
         Ok(Self {
-            endpoint,
-            name,
+            destination: Destination::Certificate {
+                address: endpoint,
+                name,
+                fingerprint: None,
+            },
             tls: Arc::new(config),
-            fingerprint: None,
         })
     }
 
-    fn connect(&self, started: Instant) -> Result<StreamOwned<ClientConnection, Socket>> {
-        let tcp = TcpStream::connect_timeout(&self.endpoint, DEADLINE)?;
-        self.handshake(tcp, Activity::new(started + DEADLINE))
+    /// Addresses the destination by its stable identity, with an optional pinned route.
+    pub fn for_peer(network: &PeerNetwork, id: Hash, fallback: Option<SocketAddr>) -> Self {
+        Self {
+            destination: Destination::Identity {
+                network: network.clone(),
+                id,
+                fallback,
+            },
+            tls: network.tls(),
+        }
     }
 
-    fn handshake(
+    fn pin_certificate(&mut self, expected: Hash) {
+        if let Destination::Certificate { fingerprint, .. } = &mut self.destination {
+            *fingerprint = Some(expected);
+        }
+    }
+
+    fn connect(&self, started: Instant) -> Result<Outbound> {
+        Ok(self
+            .connect_active(Activity::new(started + DEADLINE), None)?
+            .0)
+    }
+
+    fn connect_active<'a>(
         &self,
-        tcp: TcpStream,
+        active: Activity,
+        cancellation: Option<&'a Cancellation>,
+    ) -> Result<Connected<'a>> {
+        let Destination::Identity {
+            network,
+            id,
+            fallback,
+        } = &self.destination
+        else {
+            let Destination::Certificate { address, .. } = self.destination else {
+                unreachable!()
+            };
+            return self.try_route(Route::Direct(address), active, cancellation);
+        };
+        network.check_identity(*id)?;
+        let mut tried = Vec::new();
+        let mut try_routes = |routes: Vec<Route>| -> Result<Option<Connected<'a>>> {
+            for route in routes {
+                active.check()?;
+                if cancellation.is_some_and(Cancellation::requested) {
+                    return Err(PeerError::Cancelled);
+                }
+                if tried.contains(&route) {
+                    continue;
+                }
+                tried.push(route);
+                let mut attempt = active.clone();
+                attempt.deadline = attempt
+                    .deadline
+                    .min(Instant::now() + Duration::from_millis(450));
+                match self.try_route(route, attempt, cancellation) {
+                    Ok((mut stream, registration)) => {
+                        stream.sock.activity = active.clone();
+                        return Ok(Some((stream, registration)));
+                    }
+                    Err(
+                        error @ (PeerError::Denied | PeerError::Cancelled | PeerError::Value(_)),
+                    ) => {
+                        return Err(error);
+                    }
+                    Err(_) => {}
+                }
+            }
+            Ok(None)
+        };
+        if let Some(stream) = try_routes(network.routes(*id, true))? {
+            return Ok(stream);
+        }
+        if let Some(address) = fallback
+            && let Some(stream) = try_routes(vec![Route::Direct(*address)])?
+        {
+            return Ok(stream);
+        }
+        if let Some(stream) = try_routes(network.routes(*id, false))? {
+            return Ok(stream);
+        }
+        active.check()?;
+        network.refresh_rendezvous(Some(*id), active.deadline);
+        if let Some(stream) = try_routes(network.routes(*id, true))? {
+            return Ok(stream);
+        }
+        if let Some(stream) = try_routes(network.routes(*id, false))? {
+            return Ok(stream);
+        }
+        let until = active
+            .deadline
+            .min(Instant::now() + Duration::from_millis(500));
+        while network.can_wait_for_lan() && Instant::now() < until {
+            active.check()?;
+            if cancellation.is_some_and(Cancellation::requested) {
+                return Err(PeerError::Cancelled);
+            }
+            if let Some(stream) = try_routes(network.routes(*id, true))? {
+                return Ok(stream);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        active.check()?;
+        if cancellation.is_some_and(Cancellation::requested) {
+            return Err(PeerError::Cancelled);
+        }
+        Err(PeerError::PeerUnavailable(*id))
+    }
+
+    fn try_route<'a>(
+        &self,
+        route: Route,
         activity: Activity,
-    ) -> Result<StreamOwned<ClientConnection, Socket>> {
+        cancellation: Option<&'a Cancellation>,
+    ) -> Result<Connected<'a>> {
+        let tcp = match route {
+            Route::Direct(address) => graph::dial(address, &activity, cancellation)?,
+            Route::Relay(address) => {
+                let Destination::Identity { network, id, .. } = &self.destination else {
+                    return Err(PeerError::Denied);
+                };
+                network.relay(address, *id, activity.deadline)?
+            }
+        };
+        let registration = cancellation
+            .map(|handle| handle.register(&tcp))
+            .transpose()?;
+        Ok((self.handshake(tcp, activity)?, registration))
+    }
+
+    fn handshake(&self, tcp: TcpStream, activity: Activity) -> Result<Outbound> {
         tcp.set_nodelay(true)?;
         let mut socket = Socket {
             tcp: Arc::new(tcp),
             activity,
         };
-        let mut conn = ClientConnection::new(self.tls.clone(), self.name.clone()).map_err(tls)?;
+        let (name, alpn) = match &self.destination {
+            Destination::Certificate { name, .. } => (name.clone(), ALPN),
+            Destination::Identity { .. } => (
+                ServerName::try_from("pp2.invalid").expect("constant DNS name"),
+                IDENTITY_ALPN,
+            ),
+        };
+        let mut conn = ClientConnection::new(self.tls.clone(), name).map_err(tls)?;
         conn.complete_io(&mut socket)?;
-        if conn.alpn_protocol() != Some(ALPN) {
-            return Err(PeerError::Protocol("peer did not negotiate pp2/1".into()));
+        if conn.alpn_protocol() != Some(alpn) {
+            return Err(PeerError::Protocol(
+                "peer did not negotiate the expected pp2 transport".into(),
+            ));
         }
-        if self.fingerprint.is_some_and(|expected| {
-            conn.peer_certificates()
-                .and_then(|certs| certs.first())
-                .is_none_or(|cert| Hash::digest(cert) != expected)
-        }) {
-            return Err(PeerError::Denied);
-        }
-        Ok(StreamOwned::new(conn, socket))
-    }
-
-    /// Fetches one published block and verifies its content address and format.
-    pub fn fetch(&self, hash: Hash) -> Result<Vec<u8>> {
-        let mut stream = self.connect(Instant::now())?;
-        protocol::send(&mut stream, &Request::Fetch(hash))?;
-        match protocol::receive::<Reply>(&mut stream)?.0 {
-            Reply::Block(bytes) => {
-                content::inspect(hash, &bytes)?;
-                Ok(bytes)
-            }
-            Reply::Failed(error) => Err(error.into()),
-            _ => Err(unexpected_reply()),
-        }
-    }
-
-    /// Checks the local cache, then tries sources in the caller's order of preference.
-    pub fn fetch_into(cache: &mut PeerStore, sources: &[Self], hash: Hash) -> Result<Vec<u8>> {
-        if let Some(bytes) = cache.get(hash)? {
-            return Ok(bytes);
-        }
-        let mut failure = PeerError::Missing(hash);
-        for source in sources {
-            match source.fetch(hash) {
-                Ok(bytes) => {
-                    cache.import(hash, &bytes)?;
-                    return Ok(bytes);
+        let mut stream = StreamOwned::new(conn, socket);
+        match &self.destination {
+            Destination::Certificate { fingerprint, .. } => {
+                if fingerprint.is_some_and(|expected| {
+                    stream
+                        .conn
+                        .peer_certificates()
+                        .and_then(|certs| certs.first())
+                        .is_none_or(|cert| Hash::digest(cert) != expected)
+                }) {
+                    return Err(PeerError::Denied);
                 }
-                Err(PeerError::Missing(_)) => {}
-                Err(error) => failure = error,
+            }
+            Destination::Identity { network, id, .. } => {
+                let exporter = stream
+                    .conn
+                    .export_keying_material([0; 32], SERVER_EXPORTER, None)
+                    .map_err(tls)?;
+                let verified = verify_transport(&mut stream, &exporter).map_err(tls)?;
+                if verified != *id {
+                    return Err(tls("unexpected pp2 peer identity"));
+                }
+                let exporter = stream
+                    .conn
+                    .export_keying_material([0; 32], CLIENT_EXPORTER, None)
+                    .map_err(tls)?;
+                prove_transport(network.identity(), &mut stream, &exporter)?;
+                let mut status = [0];
+                stream.read_exact(&mut status)?;
+                match status[0] {
+                    1 => {}
+                    0 => return Err(PeerError::Denied),
+                    _ => return Err(unexpected_reply()),
+                }
             }
         }
-        Err(failure)
+        Ok(stream)
     }
 
-    /// Resolves a program and its imports from a cache and ordered authenticated sources.
-    /// Returns the verified addresses so callers can retain or republish the package.
-    pub fn fetch_program(cache: &mut PeerStore, sources: &[Self], root: Hash) -> Result<Vec<Hash>> {
-        let graph = load_code(root, false, |hash| {
-            Self::fetch_into(cache, sources, hash).map(Some)
-        })?;
-        Ok(graph.into_iter().map(|(hash, _)| hash).collect())
-    }
-
-    /// Delegates a subset of a grant to the holder of another TLS certificate.
+    /// Delegates a subset of a grant to another authenticated identity.
     pub fn delegate(
         &self,
         grant: Hash,
@@ -429,11 +569,8 @@ impl Client {
         cancellation: Option<&Cancellation>,
     ) -> Result<RemoteReport> {
         let started = Instant::now();
-        let tcp = TcpStream::connect_timeout(&self.endpoint, DEADLINE)?;
-        let _registration = cancellation
-            .map(|handle| handle.register(&tcp))
-            .transpose()?;
-        let mut stream = self.handshake(tcp, Activity::new(started + DEADLINE))?;
+        let (mut stream, _registration) =
+            self.connect_active(Activity::new(started + DEADLINE), cancellation)?;
         let mut sent = protocol::send(
             &mut stream,
             &Request::Evaluate(Job {
@@ -498,6 +635,7 @@ pub struct Server {
     tls: Arc<ServerConfig>,
     graph: graph::Configuration,
     identity: Hash,
+    network: Option<PeerNetwork>,
 }
 
 impl Server {
@@ -507,38 +645,64 @@ impl Server {
         worker: impl AsRef<Path>,
         creds: &Credentials,
     ) -> Result<Self> {
+        Self::new_inner(database.as_ref(), worker.as_ref(), creds, None)
+    }
+
+    /// Serves the stable identity protocol using an independently replaceable TLS certificate.
+    pub fn new_discovered(
+        database: impl AsRef<Path>,
+        worker: impl AsRef<Path>,
+        creds: &Credentials,
+        network: PeerNetwork,
+    ) -> Result<Self> {
+        Self::new_inner(database.as_ref(), worker.as_ref(), creds, Some(network))
+    }
+
+    fn new_inner(
+        database: &Path,
+        worker: &Path,
+        creds: &Credentials,
+        network: Option<PeerNetwork>,
+    ) -> Result<Self> {
         if !cfg!(target_os = "linux") {
             return Err(PeerError::Unsupported("peer server requires Linux"));
         }
-        PeerStore::open(database.as_ref())?;
-        let (certs, key) = creds.identity()?;
-        let identity = Hash::digest(&certs[0]);
-        let verifier = WebPkiClientVerifier::builder(Arc::new(creds.roots()?))
-            .build()
-            .map_err(tls)?;
-        let mut config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(certs, key)
-            .map_err(tls)?;
-        config.alpn_protocols = vec![ALPN.to_vec()];
+        PeerStore::open(database)?;
+        let (certs, key) = creds.transport_keys()?;
+        let builder = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13]);
+        let (builder, alpn, identity) = if let Some(network) = &network {
+            (builder.with_no_client_auth(), IDENTITY_ALPN, network.id())
+        } else {
+            let verifier = WebPkiClientVerifier::builder(Arc::new(creds.roots()?))
+                .build()
+                .map_err(tls)?;
+            (
+                builder.with_client_cert_verifier(verifier),
+                ALPN,
+                Hash::digest(&certs[0]),
+            )
+        };
+        let mut config = builder.with_single_cert(certs, key).map_err(tls)?;
+        config.alpn_protocols = vec![alpn.to_vec()];
         config.send_tls13_tickets = 0;
         Ok(Self {
-            database: database.as_ref().canonicalize()?,
-            worker: worker.as_ref().canonicalize()?,
+            database: database.canonicalize()?,
+            worker: worker.canonicalize()?,
             tls: Arc::new(config),
-            graph: graph::Configuration::default(),
+            graph: graph::Configuration::new(creds, network.as_ref(), Vec::new(), Vec::new())?,
             identity,
+            network,
         })
     }
 
-    /// Configures named capabilities and the local directory of trusted peer endpoints.
+    /// Configures named capabilities and optional pinned routes.
     pub fn with_graph(
         mut self,
         creds: &Credentials,
         bindings: Vec<BindingSet>,
         endpoints: Vec<PeerEndpoint>,
     ) -> Result<Self> {
-        self.graph = graph::Configuration::new(creds, bindings, endpoints)?;
+        self.graph = graph::Configuration::new(creds, self.network.as_ref(), bindings, endpoints)?;
         Ok(self)
     }
 
@@ -551,31 +715,33 @@ impl Server {
             ))
         })?;
         PeerStore::open(&self.database)?.recover_jobs()?;
+        let bound = listener.local_addr()?;
         let server = Arc::new(self);
+        let active = Arc::new(AtomicUsize::new(0));
         let stop = AtomicBool::new(false);
+        let accept = |tcp| server.accept(tcp, &active);
         thread::scope(|scope| {
+            if let Some(network) = &server.network {
+                scope.spawn(|| network.maintain(bound, &stop));
+                network.spawn_relays(scope, &stop, &accept);
+            }
             scope.spawn(|| server.schedule_applications(&stop));
             for _ in 0..jobs::WORKERS {
                 scope.spawn(|| server.work_jobs(&stop));
             }
-            let result = server.serve_connections(listener);
+            let result = listener.incoming().try_for_each(|tcp| accept(tcp?));
             stop.store(true, Ordering::Relaxed);
             result
         })
     }
 
-    fn serve_connections(self: &Arc<Self>, listener: TcpListener) -> Result<()> {
-        let active = Arc::new(AtomicUsize::new(0));
-        for tcp in listener.incoming() {
-            let tcp = tcp?;
-            if active
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    (n < MAX_CONNECTIONS).then_some(n + 1)
-                })
-                .is_err()
-            {
-                continue;
-            }
+    fn accept(self: &Arc<Self>, tcp: TcpStream, active: &Arc<AtomicUsize>) -> Result<()> {
+        if active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < MAX_CONNECTIONS).then_some(n + 1)
+            })
+            .is_ok()
+        {
             let slot = Slot(active.clone());
             let server = self.clone();
             thread::Builder::new()
@@ -596,15 +762,39 @@ impl Server {
         };
         let mut conn = ServerConnection::new(self.tls.clone()).map_err(tls)?;
         conn.complete_io(&mut socket)?;
-        if conn.alpn_protocol() != Some(ALPN) {
+        let alpn = if self.network.is_some() {
+            IDENTITY_ALPN
+        } else {
+            ALPN
+        };
+        if conn.alpn_protocol() != Some(alpn) {
             return Err(PeerError::Denied);
         }
-        let cert = conn
-            .peer_certificates()
-            .and_then(|certs| certs.first())
-            .ok_or(PeerError::Denied)?;
-        let holder = Hash::digest(cert);
         let mut stream = StreamOwned::new(conn, socket);
+        let holder = if let Some(network) = &self.network {
+            let exporter = stream
+                .conn
+                .export_keying_material([0; 32], SERVER_EXPORTER, None)
+                .map_err(tls)?;
+            prove_transport(network.identity(), &mut stream, &exporter)?;
+            let exporter = stream
+                .conn
+                .export_keying_material([0; 32], CLIENT_EXPORTER, None)
+                .map_err(tls)?;
+            let id = verify_transport(&mut stream, &exporter)?;
+            let allowed = network.check_identity(id);
+            stream.write_all(&[u8::from(allowed.is_ok())])?;
+            stream.flush()?;
+            allowed?;
+            id
+        } else {
+            let cert = stream
+                .conn
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .ok_or(PeerError::Denied)?;
+            Hash::digest(cert)
+        };
         let (mut request, _) = protocol::receive(&mut stream)?;
         let outcome = (|| {
             let mut store = if let Request::Run(job) = &mut request {
@@ -701,7 +891,7 @@ impl Server {
             EvaluationStart::Snapshot(snapshot) => snapshot,
         };
         Data::from_bytes(&job.input)?;
-        let code = receive_code(stream, store, call)?;
+        let code = self.receive_code(stream, store, call)?;
         stream.sock.check_active()?;
         let output = worker::run(
             &self.worker,
@@ -745,36 +935,50 @@ impl Server {
             metrics: Some(output.metrics),
         })
     }
-}
 
-fn receive_code(
-    stream: &mut StreamOwned<ServerConnection, Socket>,
-    store: &mut PeerStore,
-    call: Call,
-) -> Result<Vec<(Hash, Vec<u8>)>> {
-    let mut supplied = BTreeSet::new();
-    let code = load_code(call.program, false, |hash| {
+    fn receive_code(
+        &self,
+        stream: &mut StreamOwned<ServerConnection, Socket>,
+        store: &mut PeerStore,
+        call: Call,
+    ) -> Result<Vec<(Hash, Vec<u8>)>> {
+        let mut supplied = BTreeSet::new();
+        let mut sources = self
+            .network
+            .as_ref()
+            .map(|network| ContentSources::new(network, stream.sock.active()));
+        let code = load_code(call.program, false, |hash| {
+            stream.sock.check_active()?;
+            if let Some(bytes) = store.executable(call.holder, hash)? {
+                return Ok(Some(bytes));
+            }
+            protocol::send(stream, &Reply::NeedProgram(hash))?;
+            let (mut bytes, _) = protocol::receive::<Option<Vec<u8>>>(stream)?;
+            if bytes.is_none()
+                && let Some(sources) = &mut sources
+            {
+                match sources.fetch(hash) {
+                    Ok(found) => bytes = Some(found),
+                    Err(PeerError::Missing(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if bytes.is_some() {
+                supplied.insert(hash);
+            }
+            Ok(bytes)
+        })?;
         stream.sock.check_active()?;
-        if let Some(bytes) = store.executable(call.holder, hash)? {
-            return Ok(Some(bytes));
+        if supplied.is_empty() {
+            store.confirm(call)?;
+        } else {
+            store.cache_code(
+                call,
+                code.iter().filter(|(hash, _)| supplied.contains(hash)),
+            )?;
         }
-        protocol::send(stream, &Reply::NeedProgram(hash))?;
-        let (bytes, _) = protocol::receive::<Option<Vec<u8>>>(stream)?;
-        if bytes.is_some() {
-            supplied.insert(hash);
-        }
-        Ok(bytes)
-    })?;
-    stream.sock.check_active()?;
-    if supplied.is_empty() {
-        store.confirm(call)?;
-    } else {
-        store.cache_code(
-            call,
-            code.iter().filter(|(hash, _)| supplied.contains(hash)),
-        )?;
+        Ok(code)
     }
-    Ok(code)
 }
 
 struct Slot(Arc<AtomicUsize>);

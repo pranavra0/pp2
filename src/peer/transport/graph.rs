@@ -28,22 +28,28 @@ pub struct GraphReport {
     pub graph: GraphMetrics,
 }
 
-#[derive(Default)]
 pub(super) struct Configuration {
     callers: BTreeMap<(Hash, Hash, Hash), BTreeMap<String, Binding>>,
     peers: BTreeMap<Hash, Client>,
+    stable: bool,
 }
 
 impl Configuration {
     pub(super) fn new(
         creds: &Credentials,
+        network: Option<&PeerNetwork>,
         bindings: Vec<BindingSet>,
         endpoints: Vec<PeerEndpoint>,
     ) -> Result<Self> {
         let mut peers = BTreeMap::new();
         for endpoint in endpoints {
-            let mut client = Client::new(endpoint.address, endpoint.name, creds)?;
-            client.fingerprint = Some(endpoint.fingerprint);
+            let client = if let Some(network) = network {
+                Client::for_peer(network, endpoint.fingerprint, Some(endpoint.address))
+            } else {
+                let mut client = Client::new(endpoint.address, endpoint.name, creds)?;
+                client.pin_certificate(endpoint.fingerprint);
+                client
+            };
             if peers.insert(endpoint.fingerprint, client).is_some() {
                 return Err(PeerError::Value("repeated peer directory entry".into()));
             }
@@ -51,10 +57,11 @@ impl Configuration {
         let mut callers = BTreeMap::new();
         for set in bindings {
             effects::validate_binding_names(&set.capabilities.keys().cloned().collect::<Vec<_>>())?;
-            if set
-                .capabilities
-                .values()
-                .any(|binding| !peers.contains_key(&binding.peer))
+            if network.is_none()
+                && set
+                    .capabilities
+                    .values()
+                    .any(|binding| !peers.contains_key(&binding.peer))
             {
                 return Err(PeerError::Value(
                     "missing capability peer directory entry".into(),
@@ -69,7 +76,11 @@ impl Configuration {
                 ));
             }
         }
-        Ok(Self { callers, peers })
+        Ok(Self {
+            callers,
+            peers,
+            stable: network.is_some(),
+        })
     }
 
     pub(super) fn resolve(
@@ -99,10 +110,11 @@ impl Configuration {
             }
             GraphBindings::Forwarded(bindings) => {
                 effects::validate_binding_names(&bindings.keys().cloned().collect::<Vec<_>>())?;
-                if !self.peers.contains_key(&call.holder)
-                    || bindings
-                        .values()
-                        .any(|binding| !self.peers.contains_key(&binding.peer))
+                if !self.stable
+                    && (!self.peers.contains_key(&call.holder)
+                        || bindings
+                            .values()
+                            .any(|binding| !self.peers.contains_key(&binding.peer)))
                 {
                     return Err(PeerError::Denied);
                 }
@@ -196,11 +208,7 @@ impl Client {
             return Err(PeerError::Cancelled);
         }
         active.check()?;
-        let tcp = dial(self.endpoint, &active, cancellation)?;
-        let _registration = cancellation
-            .map(|handle| handle.register(&tcp))
-            .transpose()?;
-        let mut stream = self.handshake(tcp, active)?;
+        let (mut stream, _registration) = self.connect_active(active, cancellation)?;
         traffic.sent += protocol::send(&mut stream, &request)?;
         let mut code = None;
         let mut requested = BTreeSet::new();
@@ -359,11 +367,14 @@ struct Invocation<'a> {
 }
 
 impl Invocation<'_> {
-    fn peer(&self, fingerprint: Hash) -> Result<&Client> {
+    fn peer(&self, id: Hash) -> Result<Client> {
+        if let Some(peer) = self.server.graph.peers.get(&id) {
+            return Ok(peer.clone());
+        }
         self.server
-            .graph
-            .peers
-            .get(&fingerprint)
+            .network
+            .as_ref()
+            .map(|network| Client::for_peer(network, id, None))
             .ok_or(PeerError::Denied)
     }
 
@@ -712,8 +723,7 @@ impl Client {
     }
 
     fn forward(&self, request: Forward, active: Activity, traffic: &mut Traffic) -> Result<Hash> {
-        let tcp = dial(self.endpoint, &active, None)?;
-        let mut stream = self.handshake(tcp, active)?;
+        let (mut stream, _) = self.connect_active(active, None)?;
         traffic.sent += protocol::send(&mut stream, &Request::Forward(request))?;
         let (reply, received) = protocol::receive::<Reply>(&mut stream)?;
         traffic.received += received;
@@ -739,7 +749,7 @@ impl Server {
         if let Some(receipt) = store.probe_collection(call)? {
             return Ok(graph_reply(receipt, GraphMetrics::default()));
         }
-        let code = receive_code(stream, store, call)?;
+        let code = self.receive_code(stream, store, call)?;
         let (receipt, metrics) = self.execute_graph(
             store,
             call,

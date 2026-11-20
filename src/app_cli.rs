@@ -10,9 +10,9 @@ use std::{
 use pp2::{
     Data, Hash,
     peer::{
-        Access, Binding, BindingSet, Client, Credentials, Evaluation, EvaluationMode, GraphBudget,
-        GraphEvaluation, JavaScript, PeerEndpoint, PeerError, PeerStore, Server,
-        compile_typescript, data_from_json,
+        Access, Binding, BindingSet, Client, Credentials, DiscoveryConfig, Evaluation,
+        EvaluationMode, GraphBudget, GraphEvaluation, JavaScript, PeerEndpoint, PeerError,
+        PeerIdentity, PeerNetwork, PeerStore, Server, compile_typescript, data_from_json,
     },
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -20,13 +20,13 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const USAGE: &str = "Usage: pp2 app <command>
-  install DB PEER_CERT SUBSCRIPTIONS_JSON
+  install DB PEER_ID|PEER_CERT SUBSCRIPTIONS_JSON
   status DB APPLICATION
   unsubscribe DB APPLICATION SUBSCRIPTION
   remove DB APPLICATION
-  init MANIFEST DIRECTORY
+  init MANIFEST DIRECTORY [--discovery]
   run DIRECTORY [INPUT_JSON]
-  serve PEER_DIRECTORY
+  serve PEER_DIRECTORY [BIND]
   invoke CLIENT_DIRECTORY [INPUT_JSON]";
 
 #[derive(Deserialize)]
@@ -81,17 +81,19 @@ struct Deployment {
 
 #[derive(Serialize, Deserialize)]
 struct PeerProfile {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    stable: bool,
     peer: String,
     address: Option<SocketAddr>,
     routes: BTreeMap<String, Route>,
     holder: Option<Hash>,
     grant: Option<Hash>,
     program: Option<Hash>,
-    directory: BTreeMap<String, PeerIdentity>,
+    directory: BTreeMap<String, PeerIdentityEntry>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct PeerIdentity {
+struct PeerIdentityEntry {
     address: Option<SocketAddr>,
     fingerprint: Hash,
 }
@@ -106,6 +108,8 @@ struct Route {
 
 #[derive(Serialize, Deserialize)]
 struct ClientProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root_id: Option<Hash>,
     root: String,
     address: Option<SocketAddr>,
     grant: Hash,
@@ -121,10 +125,8 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
         .collect::<std::result::Result<_, _>>()?;
     match args.as_slice() {
         [] | ["--help" | "-h"] => println!("{USAGE}"),
-        ["install", db, cert, manifest] => PeerStore::open(db)?.install_application(
-            Credentials::fingerprint(cert)?,
-            read_json(Path::new(manifest))?,
-        )?,
+        ["install", db, cert, manifest] => PeerStore::open(db)?
+            .install_application(holder_id(cert)?, read_json(Path::new(manifest))?)?,
         ["status", db, application] => {
             let status = PeerStore::open(db)?.application_status(application)?;
             println!("{}", serde_json::to_string_pretty(&status)?);
@@ -140,17 +142,29 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
                 serde_json::to_string_pretty(&store.application_status(application)?)?
             );
         }
-        ["init", manifest, directory] => init(Path::new(manifest), Path::new(directory))?,
+        ["init", manifest, directory, flags @ ..] if matches!(flags, [] | ["--discovery"]) => {
+            init(Path::new(manifest), Path::new(directory), !flags.is_empty())?;
+        }
         ["run", directory, rest @ ..] if rest.len() <= 1 => {
             run_local(Path::new(directory), rest.first().copied())?;
         }
-        ["serve", directory] => serve(Path::new(directory), false, BTreeMap::new())?,
+        ["serve", directory, bind @ ..] if bind.len() <= 1 => serve(
+            Path::new(directory),
+            false,
+            BTreeMap::new(),
+            bind.first().map(|bind| bind.parse()).transpose()?,
+        )?,
         ["invoke", directory, rest @ ..] if rest.len() <= 1 => {
             invoke(Path::new(directory), rest.first().copied(), None)?;
         }
         ["__serve", directory, addresses, parent] => {
             local_lifetime(parent.parse()?)?;
-            serve(Path::new(directory), true, serde_json::from_str(addresses)?)?;
+            serve(
+                Path::new(directory),
+                true,
+                serde_json::from_str(addresses)?,
+                None,
+            )?;
         }
         _ => return Err(USAGE.into()),
     }
@@ -174,7 +188,7 @@ fn local_lifetime(_: u32) -> Result<()> {
     Err("peer server requires Linux".into())
 }
 
-fn init(path: &Path, directory: &Path) -> Result<()> {
+fn init(path: &Path, directory: &Path, stable: bool) -> Result<()> {
     let manifest: Manifest = read_json(path)?;
     let sources = path.parent().unwrap_or(Path::new("."));
     let mut addresses = BTreeSet::new();
@@ -228,48 +242,53 @@ fn init(path: &Path, directory: &Path) -> Result<()> {
     private_dir(directory)?;
     let result = (|| -> Result<()> {
         let admin = directory.join("admin");
-        private_dir(&admin)?;
-        openssl(Command::new("openssl").current_dir(&admin).args([
-            "req",
-            "-new",
-            "-x509",
-            "-newkey",
-            "ec",
-            "-pkeyopt",
-            "ec_paramgen_curve:P-256",
-            "-nodes",
-            "-days",
-            "30",
-            "-subj",
-            "/CN=pp2-development",
-            "-keyout",
-            "ca.key",
-            "-out",
-            "ca.pem",
-        ]))?;
+        if !stable {
+            private_dir(&admin)?;
+            openssl(Command::new("openssl").current_dir(&admin).args([
+                "req",
+                "-new",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-nodes",
+                "-days",
+                "30",
+                "-subj",
+                "/CN=pp2-development",
+                "-keyout",
+                "ca.key",
+                "-out",
+                "ca.pem",
+            ]))?;
+        }
         let client_dir = directory.join("client");
         private_dir(&client_dir)?;
-        identity(&admin, &client_dir, "client", false)?;
-        for peer in peers.keys() {
+        let holder = if stable {
+            PeerIdentity::generate(client_dir.join("identity.key"))?
+        } else {
+            certificate(&admin, &client_dir, "client", false)?;
+            Credentials::fingerprint(client_dir.join("peer.pem"))?
+        };
+        let mut directory_entries = BTreeMap::new();
+        for (peer, spec) in &peers {
             let dir = directory.join(peer);
-            private_dir(&dir)?;
-            identity(&admin, &dir, peer, true)?;
+            let fingerprint = if stable {
+                node_init(&dir)?
+            } else {
+                private_dir(&dir)?;
+                certificate(&admin, &dir, peer, true)?;
+                Credentials::fingerprint(dir.join("peer.pem"))?
+            };
+            directory_entries.insert(
+                peer.clone(),
+                PeerIdentityEntry {
+                    address: spec.address,
+                    fingerprint,
+                },
+            );
         }
-        let holder = Credentials::fingerprint(client_dir.join("peer.pem"))?;
-        let directory_entries = peers
-            .iter()
-            .map(|(peer, spec)| {
-                Ok((
-                    peer.clone(),
-                    PeerIdentity {
-                        address: spec.address,
-                        fingerprint: Credentials::fingerprint(
-                            directory.join(peer).join("peer.pem"),
-                        )?,
-                    },
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
         let executor = directory_entries[&root.peer].fingerprint;
         for (peer, spec) in &peers {
             let mut store = PeerStore::open(directory.join(peer).join("peer.db"))?;
@@ -336,6 +355,7 @@ fn init(path: &Path, directory: &Path) -> Result<()> {
         write_json(
             &client_dir.join("profile.json"),
             &ClientProfile {
+                root_id: stable.then_some(executor),
                 root: root.peer.clone(),
                 address: peers[&root.peer].address,
                 grant,
@@ -349,6 +369,7 @@ fn init(path: &Path, directory: &Path) -> Result<()> {
             write_json(
                 &directory.join(peer).join("profile.json"),
                 &PeerProfile {
+                    stable,
                     peer: peer.clone(),
                     address: spec.address,
                     routes: if is_root {
@@ -450,7 +471,7 @@ fn private_dir(path: &Path) -> std::io::Result<()> {
     fs::create_dir(path)
 }
 
-fn identity(admin: &Path, directory: &Path, name: &str, is_peer: bool) -> Result<()> {
+fn certificate(admin: &Path, directory: &Path, name: &str, is_peer: bool) -> Result<()> {
     let admin = admin.canonicalize()?;
     fs::copy(admin.join("ca.pem"), directory.join("ca.pem"))?;
     openssl(Command::new("openssl").current_dir(directory).args([
@@ -508,7 +529,57 @@ fn openssl(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
-fn credentials(dir: &Path) -> Credentials {
+pub(crate) fn node_init(dir: &Path) -> Result<Hash> {
+    private_dir(dir)?;
+    let result = (|| -> Result<Hash> {
+        let id = PeerIdentity::generate(dir.join("identity.key"))?;
+        openssl(Command::new("openssl").current_dir(dir).args([
+            "req",
+            "-new",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-nodes",
+            "-days",
+            "30",
+            "-subj",
+            "/CN=pp2-transport",
+            "-keyout",
+            "peer.key",
+            "-out",
+            "peer.pem",
+        ]))?;
+        Ok(id)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(dir);
+    }
+    result
+}
+
+pub(crate) fn holder_id(holder: &str) -> Result<Hash> {
+    if let Ok(id) = holder.parse() {
+        Ok(id)
+    } else {
+        Ok(Credentials::fingerprint(holder)?)
+    }
+}
+
+pub(crate) fn network(dir: &Path) -> Result<PeerNetwork> {
+    let settings: DiscoveryConfig = match File::open(dir.join("discovery.json")) {
+        Ok(file) => read_document(file)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DiscoveryConfig::default(),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(PeerNetwork::new(
+        PeerIdentity::load(dir.join("identity.key"))?,
+        settings,
+    )?)
+}
+
+pub(crate) fn credentials(dir: &Path) -> Credentials {
     Credentials {
         ca: dir.join("ca.pem"),
         certificate: dir.join("peer.pem"),
@@ -516,15 +587,24 @@ fn credentials(dir: &Path) -> Credentials {
     }
 }
 
-fn serve(dir: &Path, local: bool, mut addresses: BTreeMap<String, SocketAddr>) -> Result<()> {
+fn serve(
+    dir: &Path,
+    local: bool,
+    mut addresses: BTreeMap<String, SocketAddr>,
+    bind: Option<SocketAddr>,
+) -> Result<()> {
     let profile: PeerProfile = read_json(&dir.join("profile.json"))?;
     let bind = if local {
         addresses
             .get(&profile.peer)
             .copied()
             .unwrap_or("127.0.0.1:0".parse()?)
+    } else if let Some(bind) = bind.or(profile.address) {
+        bind
+    } else if profile.stable {
+        "0.0.0.0:0".parse()?
     } else {
-        profile.address.ok_or("missing deployment address")?
+        return Err("missing deployment address".into());
     };
     let listener = TcpListener::bind(bind)?;
     if local {
@@ -573,8 +653,17 @@ fn serve(dir: &Path, local: bool, mut addresses: BTreeMap<String, SocketAddr>) -
             capabilities,
         });
     }
-    let server = Server::new(dir.join("peer.db"), std::env::current_exe()?, &credentials)?
-        .with_graph(&credentials, sets, endpoints)?;
+    let server = if profile.stable {
+        Server::new_discovered(
+            dir.join("peer.db"),
+            std::env::current_exe()?,
+            &credentials,
+            network(dir)?,
+        )?
+    } else {
+        Server::new(dir.join("peer.db"), std::env::current_exe()?, &credentials)?
+    }
+    .with_graph(&credentials, sets, endpoints)?;
     println!("{}", listener.local_addr()?);
     server.serve(listener)?;
     Ok(())
@@ -640,10 +729,16 @@ fn run_local(dir: &Path, input: Option<&str>) -> Result<()> {
 
 fn invoke(dir: &Path, input: Option<&str>, address: Option<SocketAddr>) -> Result<()> {
     let profile: ClientProfile = read_json(&dir.join("profile.json"))?;
-    let address = address
-        .or(profile.address)
-        .ok_or("missing deployment address for root peer")?;
-    let client = Client::new(address, format!("pp2-{}", profile.root), &credentials(dir))?;
+    let address = address.or(profile.address);
+    let client = if let Some(id) = profile.root_id {
+        Client::for_peer(&network(dir)?, id, address)
+    } else {
+        Client::new(
+            address.ok_or("missing deployment address for root peer")?,
+            format!("pp2-{}", profile.root),
+            &credentials(dir),
+        )?
+    };
     let input = match input {
         Some(input) => data_from_json(serde_json::from_str(input)?)?,
         None => Data::Nil,
@@ -679,4 +774,15 @@ fn write_json(path: &Path, data: &impl Serialize) -> Result<()> {
     }
     serde_json::to_writer_pretty(file.open(path)?, data)?;
     Ok(())
+}
+
+fn read_document<T: DeserializeOwned>(file: File) -> Result<T> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(pp2::Block::MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > pp2::Block::MAX_BYTES {
+        return Err("configuration exceeds block size".into());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }

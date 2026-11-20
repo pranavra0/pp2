@@ -136,12 +136,14 @@ pub(super) enum Failure {
     Cancelled,
     Busy,
     Internal,
+    PeerUnavailable(Hash),
 }
 
 impl From<PeerError> for Failure {
     fn from(err: PeerError) -> Self {
         match err {
             PeerError::Denied => Self::Denied,
+            PeerError::PeerUnavailable(id) => Self::PeerUnavailable(id),
             PeerError::Missing(hash) => Self::Missing(hash),
             PeerError::Conflict(revision) => Self::Conflict(revision),
             PeerError::Value(message) | PeerError::Protocol(message) => Self::Invalid(message),
@@ -166,6 +168,7 @@ impl From<Failure> for PeerError {
     fn from(err: Failure) -> Self {
         match err {
             Failure::Denied => Self::Denied,
+            Failure::PeerUnavailable(id) => Self::PeerUnavailable(id),
             Failure::Missing(hash) => Self::Missing(hash),
             Failure::Conflict(revision) => Self::Conflict(revision),
             Failure::Invalid(message) => Self::Value(message),

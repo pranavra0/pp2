@@ -1,6 +1,7 @@
 //! Authenticated peer execution, durable references, and immutable content exchange.
 
 mod content;
+mod discovery;
 mod effects;
 mod protocol;
 mod storage;
@@ -9,6 +10,7 @@ mod typescript;
 mod worker;
 
 pub use content::{JavaScript, data_from_json, data_to_json};
+pub use discovery::{DiscoveryConfig, PeerIdentity, PeerNetwork, serve_rendezvous};
 pub use effects::{
     Binding, BindingSet, GraphBudget, GraphMetrics, PeerEndpoint, validate_binding_names,
 };
@@ -38,6 +40,8 @@ pub enum PeerError {
     Protocol(String),
     #[error("capability denied")]
     Denied,
+    #[error("no authenticated route to peer {0}")]
+    PeerUnavailable(crate::Hash),
     #[error("content is unavailable: {0}")]
     Missing(crate::Hash),
     #[error("reference changed (current revision {0})")]
