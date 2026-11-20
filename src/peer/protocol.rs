@@ -31,6 +31,10 @@ pub enum EvaluationMode {
         operation: Hash,
         merge: bool,
     },
+    ReadResource {
+        resource: Hash,
+        consistency: Consistency,
+    },
 }
 
 impl EvaluationMode {
@@ -39,6 +43,14 @@ impl EvaluationMode {
             Self::Read | Self::Update { .. } => Consistency::Authoritative,
             Self::ReadReplica | Self::UpdateReplica { .. } => Consistency::Replica,
             Self::ReadRevision(id) => Consistency::Revision(id),
+            Self::ReadResource { consistency, .. } => consistency,
+        }
+    }
+
+    pub(super) fn resource(self) -> Option<Hash> {
+        match self {
+            Self::ReadResource { resource, .. } => Some(resource),
+            _ => None,
         }
     }
 
@@ -85,6 +97,7 @@ pub(super) enum Request {
     CancelJob(Hash),
     SubmitReaction(Submission),
     Replica(SyncRequest),
+    SyncReplica(SyncRequest),
 }
 
 #[derive(Clone, Serialize, Deserialize)]

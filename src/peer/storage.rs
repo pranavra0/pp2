@@ -110,6 +110,7 @@ const MIGRATIONS: &[&str] = &[
     native::SCHEMA,
     replicas::SCHEMA,
     replicas::RETENTION_SCHEMA,
+    replicas::LOCAL_READ_SCHEMA,
 ];
 
 /// Read permits evaluation against a reference. Write also permits atomic updates.
@@ -158,6 +159,7 @@ pub(super) struct Call {
     pub(super) graph: Option<GraphAccess>,
     pub(super) reaction: bool,
     pub(super) consistency: Consistency,
+    pub(super) resource: Option<Hash>,
     pub(super) executor: Option<Hash>,
 }
 
@@ -427,6 +429,15 @@ impl PeerStore {
 
     /// Permits one program to run without a private resource.
     pub fn issue_compute(&mut self, holder: Hash, program: Hash) -> Result<Hash> {
+        self.issue_compute_with_limit(holder, program, None)
+    }
+
+    pub(super) fn issue_compute_with_limit(
+        &mut self,
+        holder: Hash,
+        program: Hash,
+        graph: Option<GraphAccess>,
+    ) -> Result<Hash> {
         let tx = self.0.transaction_with_behavior(Immediate)?;
         let bytes = Block::Data(Data::Nil).to_bytes()?;
         let hash = Hash::digest(&bytes);
@@ -444,7 +455,7 @@ impl PeerStore {
                 access: Access::Read,
                 program: Some(program),
                 depth: 0,
-                graph: None,
+                graph,
                 reaction_writer: false,
             },
             None,
@@ -577,18 +588,12 @@ impl PeerStore {
         scope.program = Some(forwarded.program);
         scope.access = forwarded.access;
         scope.depth += 1;
+        scope.graph = Some(GraphAccess {
+            budget: forwarded.limit,
+            expires_at_ms: forwarded.expires_at_ms,
+            delegated_by: Some(caller),
+        });
         let id = insert_grant(&tx, forwarded.holder, &scope, Some(forwarded.grant))?;
-        tx.execute(
-            "INSERT INTO graph_grants VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                &id.0[..],
-                forwarded.expires_at_ms as i64,
-                forwarded.limit.timeout_ms,
-                forwarded.limit.calls,
-                forwarded.limit.depth,
-                &caller.0[..],
-            ],
-        )?;
         tx.execute(
             "INSERT INTO graph_forward_replays VALUES (?1, ?2, ?3)",
             params![&request.0[..], &id.0[..], forwarded.expires_at_ms as i64],
@@ -1370,6 +1375,20 @@ fn insert_grant(
     if scope.reaction_writer {
         conn.execute("INSERT INTO reaction_writers VALUES (?1)", [&id.0[..]])?;
     }
+    if let Some(graph) = scope.graph {
+        let presenter = graph.delegated_by.ok_or(PeerError::Denied)?;
+        conn.execute(
+            "INSERT INTO graph_grants VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &id.0[..],
+                graph.expires_at_ms as i64,
+                graph.budget.timeout_ms,
+                graph.budget.calls,
+                graph.budget.depth,
+                &presenter.0[..],
+            ],
+        )?;
+    }
     Ok(id)
 }
 
@@ -1438,7 +1457,7 @@ fn authorize(conn: &Connection, call: Call) -> Result<Authority> {
     {
         return Err(PeerError::Denied);
     }
-    replicas::authorize_executor(conn, &scope.reference, call.executor)?;
+    replicas::authorize_executor(conn, &scope.reference, call.executor, call.resource)?;
     replicas::authorize_view(
         conn,
         &scope.reference,

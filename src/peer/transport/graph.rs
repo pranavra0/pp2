@@ -1,8 +1,8 @@
 use super::jobs::{self, Attempt};
 use super::*;
 use crate::peer::{
-    Access, Binding, Consistency, GraphBudget, GraphMetrics, HostResource, NativePackage,
-    PeerEndpoint, TerminalResult,
+    Access, Binding, Consistency, GraphBudget, GraphMetrics, HostResource, PeerEndpoint,
+    TerminalResult,
     effects::{self, BoundCapability, Effect, GraphBindings, GraphJob, Remote, Scope},
     native::{self, STATE, Terminal},
     protocol::{Forward, JobState, Submission},
@@ -13,6 +13,11 @@ use crate::peer::{
 
 type Inbound = StreamOwned<ServerConnection, Socket>;
 const TRACE_EXPORTER: &[u8] = b"EXPORTER-pp2-graph-trace-v1";
+const LEAF_BUDGET: GraphBudget = GraphBudget {
+    timeout_ms: 3000,
+    calls: 0,
+    depth: 0,
+};
 
 fn trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -82,12 +87,14 @@ pub(super) struct Configuration {
     callers: BTreeMap<(Hash, Hash, Hash), BTreeMap<String, Binding>>,
     pub(super) peers: BTreeMap<Hash, Client>,
     stable: bool,
+    identity: Hash,
 }
 
 impl Configuration {
     pub(super) fn new(
         creds: &Credentials,
         network: Option<&PeerNetwork>,
+        identity: Hash,
         bindings: Vec<BindingSet>,
         endpoints: Vec<PeerEndpoint>,
     ) -> Result<Self> {
@@ -111,7 +118,7 @@ impl Configuration {
                 && set
                     .capabilities
                     .values()
-                    .any(|binding| !peers.contains_key(&binding.peer))
+                    .any(|binding| binding.peer != identity && !peers.contains_key(&binding.peer))
             {
                 return Err(PeerError::Value(
                     "missing capability peer directory entry".into(),
@@ -130,6 +137,7 @@ impl Configuration {
             callers,
             peers,
             stable: network.is_some(),
+            identity,
         })
     }
 
@@ -161,10 +169,10 @@ impl Configuration {
             GraphBindings::Forwarded(bindings) => {
                 effects::validate_binding_names(&bindings.keys().cloned().collect::<Vec<_>>())?;
                 if !self.stable
-                    && (!self.peers.contains_key(&call.holder)
-                        || bindings
-                            .values()
-                            .any(|binding| !self.peers.contains_key(&binding.peer)))
+                    && ((call.holder != self.identity && !self.peers.contains_key(&call.holder))
+                        || bindings.values().any(|binding| {
+                            binding.peer != self.identity && !self.peers.contains_key(&binding.peer)
+                        }))
                 {
                     return Err(PeerError::Denied);
                 }
@@ -418,17 +426,6 @@ struct Invocation<'a> {
 }
 
 impl Invocation<'_> {
-    fn peer(&self, id: Hash) -> Result<Client> {
-        if let Some(peer) = self.server.graph.peers.get(&id) {
-            return Ok(peer.clone());
-        }
-        self.server
-            .network
-            .as_ref()
-            .map(|network| Client::for_peer(network, id, None))
-            .ok_or(PeerError::Denied)
-    }
-
     fn prepare(
         &mut self,
         remote: &Remote,
@@ -471,19 +468,26 @@ impl Invocation<'_> {
                 depth: budget.depth.saturating_sub(1),
             };
             let mut traffic = Traffic::default();
-            let grant = self.peer(source.peer)?.forward(
-                Forward {
-                    grant: source.grant,
-                    delegated_by: capability.delegated_by,
-                    holder: route.peer,
-                    access: source.access,
-                    program: source.program,
-                    limit,
-                    expires_at_ms,
-                },
-                active.clone(),
-                &mut traffic,
-            );
+            let request = Forward {
+                grant: source.grant,
+                delegated_by: capability.delegated_by,
+                holder: route.peer,
+                access: source.access,
+                program: source.program,
+                limit,
+                expires_at_ms,
+            };
+            let grant = if source.peer == self.server.identity {
+                active.check()?;
+                if let Some(network) = &self.server.network {
+                    network.check_identity(self.server.identity)?;
+                }
+                self.packages.forward(self.server.identity, request)
+            } else {
+                self.server
+                    .peer(source.peer)?
+                    .forward(request, active.clone(), &mut traffic)
+            };
             self.metrics.remote_request_bytes += traffic.sent;
             self.metrics.remote_response_bytes += traffic.received;
             bindings.insert(
@@ -499,19 +503,22 @@ impl Invocation<'_> {
         } else {
             GraphBindings::Forwarded(bindings)
         };
-        Ok((
-            route.peer,
-            GraphJob {
-                grant: route.grant,
-                program: route.program,
-                mode,
-                input: remote.input.clone(),
-                budget,
-                expires_at_ms,
-                delegated_by: target.delegated_by,
-                bindings,
-            },
-        ))
+        let mut job = GraphJob {
+            grant: route.grant,
+            program: route.program,
+            mode,
+            input: remote.input.clone(),
+            budget,
+            expires_at_ms,
+            delegated_by: target.delegated_by,
+            bindings,
+        };
+        let peer = self
+            .server
+            .place_read(&self.packages, route, &mut job, |call| {
+                child_code(&self.packages, call, self.call.holder, self.native, active)
+            })?;
+        Ok((peer, job))
     }
 
     fn invoke(
@@ -538,9 +545,8 @@ impl Invocation<'_> {
         if state && !leaf {
             return Err(PeerError::Denied);
         }
-        let local = leaf && self.routes[&remote.target].binding.peer == self.server.identity;
-        if local {
-            let (_, job) = self.prepare(&remote, budget, expiry, &active)?;
+        let (peer, job) = self.prepare(&remote, budget, expiry, &active)?;
+        if peer == self.server.identity {
             let holder = if state {
                 self.call.holder
             } else {
@@ -551,19 +557,20 @@ impl Invocation<'_> {
                 false,
                 self.server.network.as_ref().map(PeerNetwork::id),
             )?;
-            let code = NativePackage::load_program(job.program, |hash| {
-                if self.native {
-                    self.packages.get(hash)
-                } else {
-                    self.packages.executable(holder, hash)
-                }
-            })?;
+            if let Some(network) = &self.server.network {
+                network.check_identity(holder)?;
+            }
+            let bindings = self.server.graph.resolve(call, job.bindings)?;
+            if let Some(receipt) = self.packages.probe_graph(call, !bindings.is_empty())? {
+                return remote_value(receipt.revision, &receipt.value, receipt.view.as_ref());
+            }
+            let code = child_code(&self.packages, call, self.call.holder, self.native, &active)?;
             let (receipt, metrics) = self.server.execute_graph(
                 &mut self.packages,
                 call,
                 code,
                 job.input,
-                BTreeMap::new(),
+                bindings,
                 active,
                 Execution::Synchronous,
             )?;
@@ -573,8 +580,7 @@ impl Invocation<'_> {
         let mut traffic = Traffic::default();
         self.metrics.remote_calls += 1;
         let result = (|| {
-            let (peer, job) = self.prepare(&remote, budget, expiry, &active)?;
-            let reply = self.peer(peer)?.exchange_program(
+            let reply = self.server.peer(peer)?.exchange_program(
                 job.program,
                 Request::Run(job),
                 active,
@@ -703,7 +709,6 @@ impl Invocation<'_> {
     ) -> Result<Vec<u8>> {
         self.packages.confirm_access(self.call)?;
         let budget = jobs::child_budget(scope.allocate(&remote)?, remote.timeout_ms);
-        self.metrics.remote_calls += 1;
         let ordinal = attempt.effects.get() + 1;
         attempt.effects.set(ordinal);
         let result = self.durable_effect(&remote, budget, &active, attempt, ordinal);
@@ -715,14 +720,14 @@ impl Invocation<'_> {
                 return Err(PeerError::Cancelled);
             }
         };
-        let result = match state {
+        match state {
             JobState::Completed {
                 revision,
                 value,
                 graph,
             } => {
                 self.metrics.add_descendant(graph);
-                return remote_value(revision, &value, None);
+                remote_value(revision, &value, None)
             }
             JobState::ResourceCompleted {
                 revision,
@@ -731,18 +736,16 @@ impl Invocation<'_> {
                 view,
             } => {
                 self.metrics.add_descendant(graph);
-                return remote_value(revision, &value, Some(&view));
+                remote_value(revision, &value, Some(&view))
             }
             JobState::Failed(error) => Err(error.into()),
             JobState::Expired => Err(PeerError::Timeout),
             JobState::Cancelled => Err(PeerError::Cancelled),
             JobState::Pending | JobState::Running => {
                 attempt.interrupt(PeerError::Busy);
-                return Err(PeerError::Cancelled);
+                Err(PeerError::Cancelled)
             }
-        };
-        self.metrics.remote_failures += 1;
-        result
+        }
     }
 
     fn durable_effect(
@@ -778,6 +781,23 @@ impl Invocation<'_> {
                 .borrow_mut()
                 .job_intent(attempt.key, ordinal, fingerprint, expiry)?;
         if let Some(state) = intent.result {
+            if matches!(state, JobState::ResourceCompleted { .. })
+                && let Some((peer, child)) = &intent.child
+                && *peer == self.server.identity
+            {
+                let key = storage::JobKey {
+                    holder: *peer,
+                    id: child.id,
+                };
+                let executor = self.server.network.as_ref().map(PeerNetwork::id);
+                return match self.packages.job_status(key, executor) {
+                    Ok(state) => Ok(state),
+                    Err(error @ (PeerError::Denied | PeerError::Missing(_))) => {
+                        Ok(JobState::Failed(error.into()))
+                    }
+                    Err(error) => Err(error),
+                };
+            }
             return Ok(state);
         }
         let result = (|| {
@@ -799,6 +819,17 @@ impl Invocation<'_> {
                 child
             };
             active.check()?;
+            if peer == self.server.identity {
+                let parent = self.call.holder;
+                return self.server.accept_job(
+                    &mut self.packages,
+                    self.server.identity,
+                    child,
+                    self.call.reaction,
+                    |store, call| child_code(store, call, parent, false, active),
+                );
+            }
+            self.metrics.remote_calls += 1;
             let mut traffic = Traffic::default();
             let program = child.graph.program;
             let request = if self.call.reaction {
@@ -806,7 +837,7 @@ impl Invocation<'_> {
             } else {
                 Request::Submit(child)
             };
-            let reply = self.peer(peer)?.exchange_program(
+            let reply = self.server.peer(peer)?.exchange_program(
                 program,
                 request,
                 active.clone(),
@@ -816,7 +847,14 @@ impl Invocation<'_> {
             );
             self.metrics.remote_request_bytes += traffic.sent;
             self.metrics.remote_response_bytes += traffic.received;
-            jobs::job_reply(reply?)
+            let result = reply.and_then(jobs::job_reply);
+            if matches!(
+                &result,
+                Err(_) | Ok(JobState::Failed(_) | JobState::Expired | JobState::Cancelled)
+            ) {
+                self.metrics.remote_failures += 1;
+            }
+            result
         })();
         let state = match result {
             Ok(state) => state,
@@ -843,6 +881,25 @@ impl Invocation<'_> {
         }
         Ok(state)
     }
+}
+
+fn child_code(
+    store: &PeerStore,
+    call: Call,
+    parent: Hash,
+    native: bool,
+    active: &Activity,
+) -> Result<Vec<(Hash, Vec<u8>)>> {
+    content::load_code(call.program, false, |hash| {
+        active.check()?;
+        if native {
+            return store.get(hash);
+        }
+        match store.executable(call.holder, hash)? {
+            Some(bytes) => Ok(Some(bytes)),
+            None => store.executable(parent, hash),
+        }
+    })
 }
 
 fn remote_value(revision: u64, bytes: &[u8], view: Option<&ResourceView>) -> Result<Vec<u8>> {
@@ -917,6 +974,7 @@ impl GraphJob {
             }),
             reaction,
             consistency: self.mode.consistency(),
+            resource: self.mode.resource(),
             executor,
         })
     }
@@ -965,12 +1023,149 @@ impl Client {
 }
 
 impl Server {
+    fn peer(&self, id: Hash) -> Result<Client> {
+        self.graph
+            .peers
+            .get(&id)
+            .cloned()
+            .or_else(|| {
+                self.network
+                    .as_ref()
+                    .map(|network| Client::for_peer(network, id, None))
+            })
+            .ok_or(PeerError::Denied)
+    }
+
+    fn place_read(
+        &self,
+        store: &PeerStore,
+        binding: &Binding,
+        job: &mut GraphJob,
+        load: impl FnOnce(Call) -> Result<Vec<(Hash, Vec<u8>)>>,
+    ) -> Result<Hash> {
+        let consistency = job.mode.consistency();
+        if self.network.is_none()
+            || job.delegated_by.is_some()
+            || job.mode.update().is_some()
+            || job.budget.calls != 0
+            || !matches!(&job.bindings, GraphBindings::Local(names) if names.is_empty())
+            || consistency == Consistency::Authoritative
+        {
+            return Ok(binding.peer);
+        }
+        let Some((resource, grant)) = store.replica_read_route(binding)? else {
+            return Ok(binding.peer);
+        };
+        if job
+            .mode
+            .resource()
+            .is_some_and(|expected| resource != expected)
+        {
+            return Err(PeerError::Denied);
+        }
+        job.mode = EvaluationMode::ReadResource {
+            resource,
+            consistency,
+        };
+        let mut call = job.call(self.identity, false, Some(self.identity))?;
+        call.grant = grant;
+        if store.can_read_replica(call)? {
+            match load(call) {
+                Ok(_) => {
+                    job.grant = grant;
+                    return Ok(self.identity);
+                }
+                Err(PeerError::Missing(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(binding.peer)
+    }
+
+    /// Evaluates a leaf under an explicit binding, preferring a local authorized replica for replica reads.
+    pub fn evaluate_bound(
+        &self,
+        binding: &Binding,
+        mode: EvaluationMode,
+        input: &Data,
+    ) -> Result<GraphReport> {
+        if mode.update().is_some() && binding.access != Access::Write {
+            return Err(PeerError::Denied);
+        }
+        let budget = LEAF_BUDGET;
+        let active =
+            Activity::new(Instant::now() + Duration::from_millis(budget.timeout_ms.into()));
+        let store = PeerStore::open_with_timeout(&self.database, active.storage_wait()?)?;
+        let mut request = GraphEvaluation {
+            evaluation: Evaluation {
+                grant: binding.grant,
+                program: binding.program,
+                mode,
+                input,
+                packages: Some(&store),
+            },
+            budget,
+            bindings: &[],
+        };
+        let mut job = request.job(GraphBindings::Local(Vec::new()), None)?;
+        let peer = self.place_read(&store, binding, &mut job, |call| {
+            child_code(&store, call, self.identity, true, &active)
+        })?;
+        if peer == self.identity {
+            self.evaluate_local_job(job, Some(&store))
+        } else {
+            request.evaluation.grant = job.grant;
+            request.evaluation.mode = job.mode;
+            request.budget.timeout_ms = active.remaining()?.as_millis().max(1) as u32;
+            self.peer(peer)?.run_graph(request, None)
+        }
+    }
+
+    /// Runs a locally available program with no capabilities.
+    pub fn evaluate_program(&self, program: Hash, input: &Data) -> Result<GraphReport> {
+        let input = input.to_bytes()?;
+        let budget = LEAF_BUDGET;
+        let expires_at_ms = unix_ms() + u64::from(budget.timeout_ms);
+        let grant = PeerStore::open(&self.database)?.issue_compute_with_limit(
+            self.identity,
+            program,
+            Some(GraphAccess {
+                budget,
+                expires_at_ms,
+                delegated_by: Some(self.identity),
+            }),
+        )?;
+        self.evaluate_local_job(
+            GraphJob {
+                grant,
+                program,
+                mode: EvaluationMode::Read,
+                input,
+                budget,
+                expires_at_ms,
+                delegated_by: Some(self.identity),
+                bindings: GraphBindings::Local(Vec::new()),
+            },
+            None,
+        )
+    }
+
     /// Evaluates as this server's identity with the same grant and budget checks as a peer request.
     pub fn evaluate_local(&self, request: GraphEvaluation<'_>) -> Result<GraphReport> {
-        let started = Instant::now();
         let job = request.job(GraphBindings::Local(request.bindings.to_vec()), None)?;
-        let active =
-            Activity::new(started + Duration::from_millis(u64::from(job.budget.timeout_ms)));
+        self.evaluate_local_job(job, request.evaluation.packages)
+    }
+
+    fn evaluate_local_job(
+        &self,
+        job: GraphJob,
+        packages: Option<&PeerStore>,
+    ) -> Result<GraphReport> {
+        let started = Instant::now();
+        let remaining = job.expires_at_ms.saturating_sub(unix_ms());
+        let active = Activity::new(
+            started + Duration::from_millis(remaining.min(job.budget.timeout_ms.into())),
+        );
         let call = job.call(
             self.identity,
             false,
@@ -986,7 +1181,10 @@ impl Server {
                     active.check()?;
                     match store.get(hash)? {
                         Some(bytes) => Ok(Some(bytes)),
-                        None => request.evaluation.package_block(hash),
+                        None => match packages {
+                            Some(packages) => packages.get(hash),
+                            None => Ok(None),
+                        },
                     }
                 })?;
                 self.execute_graph(

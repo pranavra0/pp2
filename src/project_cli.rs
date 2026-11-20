@@ -5,8 +5,11 @@ use std::{
 };
 
 use pp2::{
-    Hash,
-    peer::{Access, Client, GraphBudget, NativePackage, PeerStore, RequestedBinding},
+    Data, Hash,
+    peer::{
+        Access, Binding, Client, EvaluationMode, GraphBudget, NativePackage, PeerStore,
+        RequestedBinding, data_from_json, data_to_json, package_source,
+    },
 };
 use serde::Deserialize;
 
@@ -22,6 +25,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 struct Project {
     name: String,
     entry: String,
+    #[serde(default)]
     modules: BTreeMap<String, ModuleSpec>,
     budget: GraphBudget,
     bindings: BTreeMap<String, Request>,
@@ -41,13 +45,17 @@ fn build(directory: &Path, store: &mut PeerStore) -> Result<(NativePackage, Hash
     let project: Project = read_document(file)?;
     let mut compiled = BTreeMap::new();
     let mut compile = |name: &str| {
-        package(
-            name,
-            &project.modules,
-            directory,
-            &mut BTreeSet::new(),
-            &mut compiled,
-        )
+        if project.modules.is_empty() {
+            import_source(store, &directory.join(name))
+        } else {
+            package(
+                name,
+                &project.modules,
+                directory,
+                &mut BTreeSet::new(),
+                &mut compiled,
+            )
+        }
     };
     let entry = compile(&project.entry)?;
     let mut bindings = BTreeMap::new();
@@ -83,6 +91,49 @@ fn selected(store: &PeerStore) -> Result<Hash> {
         [] => Err("No apps installed. Run pp2 install PROJECT.".into()),
         _ => Err("Choose an installation from pp2 list and set PP2_APP to its ID.".into()),
     }
+}
+
+fn import_source(store: &mut PeerStore, source: &Path) -> Result<Hash> {
+    let blocks = package_source(source)?;
+    let entry = blocks
+        .last()
+        .ok_or("Expected an executable entry module.")?
+        .0;
+    for (hash, bytes) in blocks {
+        store.import(hash, &bytes)?;
+    }
+    Ok(entry)
+}
+
+fn evaluate(
+    home: &Path,
+    source: &str,
+    input: Option<&str>,
+    target: Option<(Binding, EvaluationMode)>,
+) -> Result<()> {
+    let input = match input {
+        Some(input) => data_from_json(serde_json::from_str(input)?)?,
+        None => Data::Nil,
+    };
+    let mut store = native_cli::open(home)?;
+    let program = match (source, &target, source.parse::<Hash>()) {
+        ("-", Some((binding, _)), _) => binding.program,
+        (_, _, Ok(hash)) => hash,
+        _ => import_source(&mut store, Path::new(source))?,
+    };
+    let result = if let Some((binding, mode)) = target {
+        if binding.program != program {
+            return Err("The grant pins a different program hash.".into());
+        }
+        native_cli::server(home)?.evaluate_bound(&binding, mode, &input)?
+    } else {
+        if source.parse::<Hash>().is_ok() {
+            Client::fetch_discovered_program(&mut store, &network(home)?, program)?;
+        }
+        native_cli::server(home)?.evaluate_program(program, &input)?
+    };
+    println!("{}", data_to_json(&result.value)?);
+    Ok(())
 }
 
 fn starter(dir: &Path) -> Result<()> {
@@ -140,6 +191,41 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<()> {
         .ok_or("Set PP2_HOME to a private workspace directory.")?;
     let home = home.to_str().ok_or("Expected a UTF-8 workspace path")?;
     match args.as_slice() {
+        ["pack", source, flags @ ..] if matches!(flags, [] | ["--publish"]) => {
+            let mut store = native_cli::open(native_cli::workspace(home)?)?;
+            let program = import_source(&mut store, Path::new(source))?;
+            if !flags.is_empty() {
+                store.publish_graph(program)?;
+            }
+            println!("{program}");
+        }
+        [
+            "eval",
+            mode @ ("--at" | "--replica"),
+            grant,
+            source,
+            input @ ..,
+        ] if input.len() <= 1 => {
+            let mode = if *mode == "--replica" {
+                EvaluationMode::ReadReplica
+            } else {
+                EvaluationMode::Read
+            };
+            evaluate(
+                native_cli::workspace(home)?,
+                source,
+                input.first().copied(),
+                Some((read_document(fs::File::open(grant)?)?, mode)),
+            )?;
+        }
+        ["eval", source, input @ ..] if input.len() <= 1 => {
+            evaluate(
+                native_cli::workspace(home)?,
+                source,
+                input.first().copied(),
+                None,
+            )?;
+        }
         [command @ ("install" | "update"), "--from", release] => {
             let (package, source) = release
                 .split_once('@')

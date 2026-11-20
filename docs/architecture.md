@@ -2,7 +2,7 @@
 
 ## Evaluation and authority
 
-Each mutually authenticated TLS 1.3 connection serves one operation. A grant binds a holder and reference to read or write access and can pin one immutable program. Delegation can only narrow access, to depth eight. Revocation deletes descendant grants and their receipts in one transaction.
+Each mutually authenticated TLS 1.3 connection serves one evaluation, control request, or bounded replica transfer. A grant binds a holder and reference to read or write access and can pin one immutable program. Delegation can only narrow access, to depth eight. Revocation deletes descendant grants and their receipts in one transaction.
 
 A graph invocation evaluates a content-addressed module and immutable input under one grant. The same graph engine runs local, authenticated remote, and durable invocations. A compute grant pins a program and carries no storage authority. A resource grant selects a snapshot root, indexed collection, or host resource. Each resource stage runs at its authorized peer and completes before its caller receives a result.
 
@@ -30,13 +30,15 @@ A compute stage can orchestrate named evaluations. Its entry grant selects the p
 
 To pass a handle to a child via `pp2.evaluate`, the executor asks the issuer to narrow it to the child identity, program, access, budget, and expiry. The destination checks holder, presenter, lineage, and limits. Each call consumes one call plus its descendant allowance, even on failure. A branch can shorten its deadline. Synchronous leaf reads can run in parallel. A leaf at the current peer uses the local execution path. Durable batches journal their children in order.
 
-Limits are 16 remote calls, four remote levels, 16 bindings, eight seconds per attempt, 128 effects, and four leaf reads per batch. Guest promises enqueue effects in order. Returning with unsettled effects fails. An update is a leaf and commits at its destination. Later graph failures leave committed effects in place.
+Limits are 16 child calls, four child levels, 16 bindings, eight seconds per attempt, 128 effects, and four leaf reads per batch. Guest promises enqueue effects in order. Returning with unsettled effects fails. An update is a leaf and commits at the issuing peer. Later graph failures leave committed effects in place.
+
+A workspace administrator can pair an owner binding with a separate, program-pinned local read grant for the same signed resource. Queries that accept a replica or request an exact revision prefer the local copy if its grant, lease, revision, and program are available. Otherwise the query goes to the owner with the resource ID pinned. Authoritative reads, writes, and forwarded grants route to their issuer. The local placement remains independently authorized until its grant is revoked, its lease expires, or the replica learns that its placement was revoked.
 
 ## Durable computations
 
 A job is keyed by submitter identity and client-chosen ID at the destination. Acceptance stores the immutable program and input, capabilities, budget, and absolute expiry. An identical submission retrieves status. Changed arguments fail. There are four workers, 32 active jobs per submitter, 64 per peer, and five minutes per job. Restart requeues interrupted attempts.
 
-Before dispatch, the parent records each remote effect and a stable child ID. Pending children and temporary failures yield the worker. On replay the parent reuses terminal outcomes, or queries the child after a lost acknowledgment. Changing or skipping a recorded effect fails recovery. Local reads can see newer snapshots on replay. A local write commits data, revision, receipt, and job completion together.
+Before dispatch, the parent records each evaluation effect, its chosen peer, and a stable child ID. A child at the current peer enters the same durable queue directly. Pending children and temporary failures yield the worker. On replay the parent reuses terminal outcomes, or queries the recorded child after a lost acknowledgment. Changing or skipping a recorded effect fails recovery. Reads of the entry's own resource can see newer snapshots on replay. A local write commits data, revision, receipt, and job completion together.
 
 The submitter can query or cancel. A cancellation that commits first prevents local completion. Children can still finish within their deadlines. An expired job or revoked entry grant prevents further local work. Ordinary terminal results remain available to the submitter after grant revocation. Replicated results require current authority and include the resource view. Terminal records share the database quota.
 
@@ -94,7 +96,7 @@ Replica reads select the lowest accepted head ID and report all heads. Exact rea
 
 The owner signs placement policies for stable identities. A placement permits storage and can also allow local reads or writes and pin a program. Execution also requires a local holder-bound grant. A store-only placement trusts the host operator with plaintext.
 
-Peers pull private blocks in passes of up to 32. They verify hashes, signatures, ancestry, and author authority before admission. Pending transfers survive restart and retain their dependencies. Admission commits history, visible state, and a change event together. Imports can coalesce multiple authored changes into one local event. Private resource blocks stay scoped to replication unless independently published.
+Peers pull private blocks over one authenticated connection per pass, with up to 32 blocks, 36 requests, and a 4 MiB payload threshold. Each request checks current policy, lease, and reachability. Peers verify hashes, signatures, ancestry, and author authority before admission. Pending transfers survive restart and retain their dependencies. Admission commits history, visible state, and a change event together. Imports can coalesce multiple authored changes into one local event. Private resource blocks stay scoped to replication unless independently published.
 
 ### Offline authority and revocation
 
@@ -116,7 +118,7 @@ When a full transfer encounters a pruned payload, a follower can fetch proofs an
 
 A graph program exports `(pp2, input)`. The entry may return a promise. The value boundary accepts null, booleans, safe integers, text, lists, and records with bounded size and depth. The direct snapshot interface also supports `(state, input)` and updates returning `{next, value}`.
 
-TypeScript compiles during packaging with strict ES2022. Runtime imports link to explicit hashes. Use `SPECIFIER=HASH` for TypeScript or declare a JavaScript `pp2:HASH` import and pass its hash to pack. A `PPJ1` module records source and sorted import hashes. Guests get fresh QuickJS contexts without `Date`, `Math.random`, or shared memory. Runtime errors identify emitted module locations by hash.
+TypeScript compiles during packaging with strict ES2022. The source packager resolves relative imports and links the acyclic runtime graph by hash. Low-level `peer pack` also accepts already addressed imports. A `PPJ1` module records source and sorted import hashes. Guests get fresh QuickJS contexts without `Date`, `Math.random`, or shared memory. Runtime errors identify emitted module locations by hash.
 
 Binary `AEB1` programs use the Rust interpreter, with a read-only snapshot grant in slot zero. Both runtimes share the transport, process boundary, and snapshot commit path.
 
@@ -133,17 +135,26 @@ The 40-query loopback run searched 64 documents (121,648 body bytes). Both imple
 | Implementation | Median | Request | Response |
 | --- | --- | --- | --- |
 | pp2 warm | 11.00 ms | 129 B | 393 B |
-| HTTPS with SQLite FTS5 | 6.65 ms | 57 B | 441 B |
-| pp2 cold, one call | 19 ms | 1,916 B | 108 B |
+| HTTPS with SQLite FTS5 | 6.34 ms | 57 B | 441 B |
+| pp2 cold, one call | 32 ms | 1,916 B | 108 B |
 
 [Validation script](../scripts/validate-peers.py)
 
 ## Three-peer graph measurements
 
-The benchmark checks that serial and parallel warehouse stages return the same result through two remote calls. Each warehouse held 20,032 rows and returned a total over 32 matches. Across 40 samples in separate Linux network namespaces, pp2 took a median of 33.48 ms serially and 20.95 ms in parallel, with 565 median application bytes including the entry call. Use `--isolated-networks` to reproduce the topology. Set `PP2_TRACE_GRAPH=1` or pass `--trace-dir` to record peer timing, failures, and memory by invocation and job ID. [Graph benchmark](../scripts/benchmark-graph.py)
+Each warehouse held 20,032 rows and returned a total over 32 matches. Both implementations returned identical results in 40 samples across Linux network namespaces. Bytes cover application frames including the entry call.
+
+| Implementation | Serial median | Parallel median | Parallel bytes |
+| --- | --- | --- | --- |
+| pp2 | 34.26 ms | 21.77 ms | 565 B |
+| Conventional mTLS | 15.36 ms | 11.44 ms | 222 B |
+
+Use `--isolated-networks` to reproduce the topology. Set `PP2_TRACE_GRAPH=1` or pass `--trace-dir` to record peer timing, failures, and memory by invocation and job ID. [Graph benchmark](../scripts/benchmark-graph.py)
 
 ## Operational validation
 
-The seeded three-peer Notes run partitioned writers, killed daemons after acknowledgments, and checked both branches against a model before merging. Seed 761 acknowledged 591 writes and merges across ten rounds. A single-writer run verified 41 signed revisions after compaction and transfer restart. [Notes workflow](../scripts/demo-replicated-notes.py)
+The seeded three-peer Notes run partitioned writers, killed daemons after acknowledgments, and checked both branches against a model before merging. Seed 761 acknowledged 691 writes and merges across ten rounds with 30 operations per writer. A single-writer run verified 41 signed revisions after compaction and transfer restart. [Notes workflow](../scripts/demo-replicated-notes.py)
+
+An initial replica pass transferred 22 private blocks over one TCP connection. The prior wire protocol needed 23 connections for the same blocks. Mixed-version peers can still synchronize through that protocol.
 
 Current evidence comes from controlled runs. Independent physical deployments, sustained WAN load, and critical workloads remain unvalidated. Multi-reference transactions, bounded multi-writer history, interactive guest debugging, remote TypeScript source maps, and portable closure state remain open.

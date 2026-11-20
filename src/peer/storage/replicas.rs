@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, net::SocketAddr};
 
 use super::*;
 use crate::peer::{
-    PeerIdentity,
+    Binding, PeerIdentity,
     replication::{
         Change, Consistency, LEASE, LEASE_MS, Lease, Offer, POLICY, Placement, Policy, RENEW_MS,
         ReplicaAccess, ReplicaStatus, ResourceMode, ResourceRevision, ResourceView, Retirement,
@@ -49,6 +49,12 @@ ALTER TABLE replicas ADD COLUMN retain_snapshots INTEGER;
 ALTER TABLE replica_versions ADD COLUMN retained INTEGER NOT NULL DEFAULT 1;
 CREATE INDEX replica_retained ON replica_versions(resource, id) WHERE retained=1;
 ALTER TABLE replica_pending ADD COLUMN proofs_only INTEGER NOT NULL DEFAULT 0;
+";
+
+pub(super) const LOCAL_READ_SCHEMA: &str = "
+CREATE TABLE replica_reads (
+    binding BLOB PRIMARY KEY, resource BLOB NOT NULL REFERENCES replicas(id), grant_id BLOB NOT NULL
+) WITHOUT ROWID;
 ";
 
 pub(in crate::peer) struct Replica {
@@ -153,6 +159,60 @@ fn by_id(conn: &Connection, id: Hash) -> Result<Replica> {
 }
 
 impl PeerStore {
+    /// Pairs an owner's binding with a separately authorized local grant for replica reads.
+    pub fn prefer_replica_reads(
+        &mut self,
+        local: Hash,
+        primary: &Binding,
+        resource: Hash,
+        grant: Hash,
+    ) -> Result<()> {
+        let tx = self.0.transaction_with_behavior(Immediate)?;
+        let replica = by_id(&tx, resource)?;
+        let scope = authority(&tx, local, grant)?;
+        if replica.owner != primary.peer
+            || replica.local != local
+            || replica.owner == local
+            || scope.reference != replica.reference
+            || scope.program != Some(primary.program)
+            || scope.access != Access::Read
+            || scope.graph.is_some()
+        {
+            return Err(PeerError::Denied);
+        }
+        replica.check_access(local, Some(primary.program), Access::Read)?;
+        tx.execute(
+            "INSERT INTO replica_reads VALUES (?1, ?2, ?3)
+             ON CONFLICT(binding) DO UPDATE SET resource=excluded.resource, grant_id=excluded.grant_id",
+            params![protocol::encode(primary)?, &resource.0[..], &grant.0[..]],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(in crate::peer) fn replica_read_route(
+        &self,
+        primary: &Binding,
+    ) -> Result<Option<(Hash, Hash)>> {
+        Ok(self
+            .0
+            .query_row(
+                "SELECT resource, grant_id FROM replica_reads WHERE binding=?1",
+                [protocol::encode(primary)?],
+                |row| Ok((Hash(row.get(0)?), Hash(row.get(1)?))),
+            )
+            .optional()?)
+    }
+
+    pub(in crate::peer) fn can_read_replica(&self, call: Call) -> Result<bool> {
+        let tx = self.0.unchecked_transaction()?;
+        match super::evaluation_view(&tx, call, true) {
+            Ok(_) => Ok(true),
+            Err(PeerError::Denied | PeerError::Missing(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Starts a signed history at the reference's current contents.
     pub fn share_replica(
         &mut self,
@@ -1406,11 +1466,18 @@ pub(super) fn authorize_executor(
     conn: &Connection,
     reference: &str,
     executor: Option<Hash>,
+    expected_resource: Option<Hash>,
 ) -> Result<()> {
-    if by_reference(conn, reference)?.is_some_and(|replica| Some(replica.local) != executor) {
-        return Err(PeerError::Denied);
+    match by_reference(conn, reference)? {
+        Some(replica)
+            if Some(replica.local) == executor
+                && expected_resource.is_none_or(|id| id == replica.id) =>
+        {
+            Ok(())
+        }
+        None if expected_resource.is_none() => Ok(()),
+        _ => Err(PeerError::Denied),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1497,6 +1564,7 @@ mod tests {
             graph: None,
             reaction: false,
             consistency,
+            resource: None,
             executor: Some(author),
         }
     }
@@ -1720,7 +1788,8 @@ mod tests {
         let legacy = Connection::open(&path).unwrap();
         legacy
             .execute_batch(
-                "DROP INDEX replica_retained;
+                "DROP TABLE replica_reads;
+                 DROP INDEX replica_retained;
                  ALTER TABLE replica_versions DROP COLUMN retained;
                  ALTER TABLE replicas DROP COLUMN retain_snapshots;
                  ALTER TABLE replica_pending DROP COLUMN proofs_only;

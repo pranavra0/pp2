@@ -368,10 +368,7 @@ impl Client {
     fn request(&self, request: Request, active: Activity) -> Result<Reply> {
         let (mut stream, _, _) = self.connect_active(active, None)?;
         protocol::send(&mut stream, &request)?;
-        match protocol::receive::<Reply>(&mut stream)?.0 {
-            Reply::Failed(error) => Err(error.into()),
-            reply => Ok(reply),
-        }
+        receive_reply(&mut stream)
     }
 
     fn connect_active<'a>(
@@ -776,7 +773,13 @@ impl Server {
             database: database.canonicalize()?,
             worker: worker.canonicalize()?,
             tls: Arc::new(config),
-            graph: graph::Configuration::new(creds, network.as_ref(), Vec::new(), Vec::new())?,
+            graph: graph::Configuration::new(
+                creds,
+                network.as_ref(),
+                identity,
+                Vec::new(),
+                Vec::new(),
+            )?,
             providers: {
                 let clock: Arc<dyn HostProvider> = Arc::new(super::Clock);
                 let mut providers = BTreeMap::from([(super::Clock::PROVIDER.into(), clock)]);
@@ -799,7 +802,13 @@ impl Server {
         bindings: Vec<BindingSet>,
         endpoints: Vec<PeerEndpoint>,
     ) -> Result<Self> {
-        self.graph = graph::Configuration::new(creds, self.network.as_ref(), bindings, endpoints)?;
+        self.graph = graph::Configuration::new(
+            creds,
+            self.network.as_ref(),
+            self.identity,
+            bindings,
+            endpoints,
+        )?;
         Ok(self)
     }
 
@@ -917,6 +926,10 @@ impl Server {
             Hash::digest(cert)
         };
         let (mut request, _) = protocol::receive(&mut stream)?;
+        if let Request::SyncReplica(request) = request {
+            return self.serve_replica_sync(&mut stream, holder, request);
+        }
+        let transport_deadline = stream.sock.activity.deadline;
         let outcome = (|| {
             let mut store = if let Request::Run(job) = &mut request {
                 job.budget.validate()?;
@@ -950,12 +963,16 @@ impl Server {
                 Request::Evaluate(job) => self.evaluate(&mut stream, &mut store, holder, job),
                 Request::Run(job) => self.run_graph(&mut stream, &mut store, holder, job),
                 Request::Forward(request) => store.forward(holder, request).map(Reply::Delegated),
-                Request::Submit(submission) => {
-                    self.submit_job(&mut stream, &mut store, holder, submission, false)
-                }
-                Request::SubmitReaction(submission) => {
-                    self.submit_job(&mut stream, &mut store, holder, submission, true)
-                }
+                Request::Submit(submission) => self
+                    .accept_job(&mut store, holder, submission, false, |store, call| {
+                        self.receive_code(&mut stream, store, call)
+                    })
+                    .map(Reply::Job),
+                Request::SubmitReaction(submission) => self
+                    .accept_job(&mut store, holder, submission, true, |store, call| {
+                        self.receive_code(&mut stream, store, call)
+                    })
+                    .map(Reply::Job),
                 Request::JobStatus(id) => store
                     .job_status(
                         storage::JobKey { holder, id },
@@ -980,10 +997,20 @@ impl Server {
                             .map(Reply::Replica),
                     }
                 }
-                Request::LegacyRun | Request::LegacySubprocess => Err(unexpected_reply()),
+                Request::LegacyRun | Request::LegacySubprocess | Request::SyncReplica(_) => {
+                    Err(unexpected_reply())
+                }
             }
         })();
-        let reply = outcome.unwrap_or_else(|err| Reply::Failed(err.into()));
+        let reply = outcome.unwrap_or_else(|error| {
+            if matches!(error, PeerError::Timeout) {
+                // The work deadline may expire before the connection can report it.
+                let reply_deadline =
+                    (Instant::now() + Duration::from_millis(25)).min(transport_deadline);
+                stream.sock.activity.deadline = stream.sock.activity.deadline.max(reply_deadline);
+            }
+            Reply::Failed(error.into())
+        });
         protocol::send(&mut stream, &reply)?;
         stream.conn.send_close_notify();
         let _ = stream.flush();
@@ -1020,6 +1047,7 @@ impl Server {
             graph: None,
             reaction: false,
             consistency: job.mode.consistency(),
+            resource: job.mode.resource(),
             executor: self.network.as_ref().map(PeerNetwork::id),
         };
         let mut snapshot = match store.begin(call)? {
@@ -1128,6 +1156,13 @@ impl Server {
             )?;
         }
         Ok(code)
+    }
+}
+
+fn receive_reply(stream: &mut impl Read) -> Result<Reply> {
+    match protocol::receive::<Reply>(stream)?.0 {
+        Reply::Failed(error) => Err(error.into()),
+        reply => Ok(reply),
     }
 }
 

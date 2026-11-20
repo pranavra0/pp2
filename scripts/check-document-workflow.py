@@ -5,9 +5,10 @@ import argparse
 import json
 import os
 import shutil
-from pathlib import Path
 import subprocess
+import sys
 import tempfile
+from pathlib import Path
 
 from peer_topology import serving, topology
 
@@ -17,13 +18,14 @@ ROOT = Path(__file__).resolve().parents[1]
 class Peer:
     def __init__(self, binary, home, prefix):
         self.command = [*prefix, binary]
+        self.home = home
         self.env = dict(os.environ, PP2_HOME=str(home))
         self.env.pop("PP2_APP", None)
 
     def run(self, *args, approve=False, success=True):
         result = subprocess.run(
             [*self.command, *args], cwd=ROOT, env=self.env, capture_output=True,
-            text=True, input="y\n" if approve else "", timeout=30,
+            text=True, input="y\n" if approve else "", timeout=30, check=False,
         )
         if (result.returncode == 0) != success:
             raise AssertionError(f"{args}: exit {result.returncode}\n{result.stderr}")
@@ -44,6 +46,41 @@ def check(binary, isolated):
             # The fixture has no upstream router. Route link-local multicast onto its Ethernet.
             for _, route in nodes.values():
                 subprocess.run([*route, "ip", "route", "add", "224.0.0.0/4", "dev", "uplink"], check=True)
+        portable = ROOT / "examples/portable/summary.ts"
+        assert json.loads(laptop.run("eval", portable, "[2,4,6]")) == {"count": 3, "total": 12}
+        program = laptop.run("pack", portable)
+        assert json.loads(laptop.run("eval", program, "[3,8]")) == {"count": 2, "total": 11}
+        dependency = root / "number.mjs"
+        dependency.write_text("export const number = 9;\n")
+        dynamic = root / "dynamic.mjs"
+        dynamic.write_text("export default async () => (await import('./number.mjs')).number;\n")
+        assert laptop.run("eval", dynamic) == "9"
+        dependency.write_text("import './dynamic.mjs'; export const number = 9;\n")
+        assert "cyclic runtime import" in laptop.run("pack", dynamic, success=False)
+
+        warehouse = ROOT / "examples/federated-stock"
+        query = warehouse / "warehouse.mjs"
+        query_hash = laptop.run("pack", query)
+        owner_id = owner.run("identity")
+        reader_id = laptop.run("identity")
+        owner.run("peer", "collection-init", owner.home / "peer.db", "inventory", warehouse / "east.ndjson")
+        replica = ("peer", "replica")
+        resource = owner.run(*replica, "share", owner.home, "inventory", "single-writer")
+        owner.run(*replica, "approve", owner.home, resource, reader_id, "read", query_hash)
+        owner_grant = root / "owner.grant"
+        owner_grant.write_text(owner.run(*replica, "grant", owner.home, "inventory", "reader", query_hash, reader_id))
+        laptop.run(*replica, "follow", laptop.home, resource, owner_id, "warehouse")
+        assert owner.run("pack", portable, "--publish") == program
+        with owner.host():
+            fresh = Peer(binary, root / "fresh", nodes["laptop"][1])
+            assert json.loads(fresh.run("eval", program, "[7,9]")) == {"count": 2, "total": 16}
+            assert laptop.run("eval", "--at", owner_grant, query_hash, '{"sku":"lamp"}') == "3"
+            laptop.run(*replica, "sync", laptop.home, resource, owner_id)
+        local_grant = root / "local.grant"
+        local_grant.write_text(laptop.run(*replica, "grant", laptop.home, "warehouse", "reader", query_hash))
+        laptop.run(*replica, "prefer", laptop.home, resource, owner_grant, local_grant)
+        assert laptop.run("eval", "--replica", owner_grant, "-", '{"sku":"lamp"}') == "3"
+
         project = root / "search"
         sample = root / "documents"
         shutil.copytree(ROOT / "examples/native-documents/sample", sample)
@@ -111,6 +148,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--isolated-networks", action="store_true")
+    parser.add_argument("--inside-netns", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.isolated_networks and not args.inside_netns:
+        os.execvp("unshare", ["unshare", "-Urn", sys.executable, __file__, *sys.argv[1:], "--inside-netns"])
     check(args.binary.resolve(), args.isolated_networks)
     print("Document workflow passed")

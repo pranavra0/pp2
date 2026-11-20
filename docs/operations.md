@@ -25,3 +25,5 @@ Use `advertise` for reachable direct endpoints. Direct and relayed sessions auth
 Keep each grant ID and recipient. Run `pp2 revoke "$GRANT_ID"` at the issuer to withdraw future access. Disclosed data can persist in caches. Binding and package changes leave issued grants under the issuer's control.
 
 For **awaiting grant**, check the request name, program, and access. For an ambiguous update, retry with identical arguments and the same operation ID. [Commit and retry rules](architecture.md#evaluation-and-authority)
+
+A preferred replica has its own grant and placement lease. To withdraw both owner and replica access, revoke the owner grant and the reader's placement. A disconnected replica can read until its local grant is revoked or its lease expires. [Offline authority](architecture.md#offline-authority-and-revocation)

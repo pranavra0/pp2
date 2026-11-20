@@ -184,14 +184,17 @@ impl Attempt {
 }
 
 impl Server {
-    pub(super) fn submit_job(
+    pub(super) fn accept_job(
         &self,
-        stream: &mut StreamOwned<ServerConnection, Socket>,
         store: &mut PeerStore,
         holder: Hash,
         submission: Submission,
         reaction: bool,
-    ) -> Result<Reply> {
+        load: impl FnOnce(&mut PeerStore, Call) -> Result<Vec<(Hash, Vec<u8>)>>,
+    ) -> Result<JobState> {
+        if let Some(network) = &self.network {
+            network.check_identity(holder)?;
+        }
         let key = JobKey {
             holder,
             id: submission.id,
@@ -205,7 +208,7 @@ impl Server {
         if let Some(state) =
             store.existing_job(key, request, self.network.as_ref().map(PeerNetwork::id))?
         {
-            return Ok(Reply::Job(state));
+            return Ok(state);
         }
         let remaining = job.expires_at_ms.saturating_sub(unix_ms());
         if remaining == 0 {
@@ -218,15 +221,13 @@ impl Server {
         let kind = store.graph_kind(call)?;
         let bindings = self.graph.resolve(call, job.bindings.clone())?;
         kind.check_bindings(!bindings.is_empty())?;
-        let code = self.receive_code(stream, store, call)?;
+        let code = load(store, call)?;
         if !code[0].1.starts_with(content::MAGIC) {
             return Err(PeerError::Value(
                 "graph evaluation requires JavaScript".into(),
             ));
         }
-        store
-            .submit(key, request, call, job, bindings, &code)
-            .map(Reply::Job)
+        store.submit(key, request, call, job, bindings, &code)
     }
 
     pub(super) fn schedule_applications(&self, stop: &AtomicBool) {

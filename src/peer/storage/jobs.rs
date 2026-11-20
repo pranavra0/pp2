@@ -482,7 +482,7 @@ fn job(conn: &Connection, key: JobKey, executor: Option<Hash>) -> Result<Option<
     .map(|(request, state, expires, result, grant, program)| {
         if let Some(grant) = grant {
             let scope = authority(conn, key.holder, grant)?;
-            replicas::authorize_executor(conn, &scope.reference, executor)?;
+            replicas::authorize_executor(conn, &scope.reference, executor, None)?;
             replicas::authorize_view(conn, &scope.reference, key.holder, Some(program), Access::Read)?;
         }
         let state = match state {

@@ -33,7 +33,7 @@ pub use transport::{
     Cancellation, Client, Credentials, DurableEvaluation, Evaluation, EvaluationMode,
     GraphEvaluation, GraphReport, JobStatus, RemoteReport, Server,
 };
-pub use typescript::compile_typescript;
+pub use typescript::{compile_typescript, package_source};
 
 use std::io;
 

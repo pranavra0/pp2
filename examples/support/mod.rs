@@ -53,7 +53,8 @@ impl Profile {
         let binding = match mode {
             EvaluationMode::Read
             | EvaluationMode::ReadReplica
-            | EvaluationMode::ReadRevision(_) => &self.read,
+            | EvaluationMode::ReadRevision(_)
+            | EvaluationMode::ReadResource { .. } => &self.read,
             EvaluationMode::Update { .. } | EvaluationMode::UpdateReplica { .. } => {
                 self.write.as_ref().ok_or(PeerError::Denied)?
             }

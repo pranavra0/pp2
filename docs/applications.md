@@ -1,6 +1,59 @@
 # Write an application
 
-In the [starter project](getting-started.md), `pp2.json` maps source modules, selects an entry point, sets a graph budget, and requests named grants. Each terminal line starts a bounded invocation. The entry point reads it via `call(resource, 'event')` and returns `{lines}`.
+## Run a source module
+
+Export a default function taking `(pp2, input)`. It can be asynchronous. Use JSON-compatible values with safe integers at the boundary. `pp2 eval SOURCE [JSON]` runs the program locally with no capabilities. The packager follows relative ECMAScript imports and links them to content addresses, including literal dynamic imports. A TypeScript import such as `./total.js` can resolve to `total.ts`. Runtime import cycles and Node built-ins are outside the portable module format.
+
+`pp2 pack SOURCE` writes the graph to the workspace and prints its entry address. `pp2 eval HASH [JSON]` can use the local cache or fetch an explicitly published graph from discovered peers. To publish a source graph, run `pp2 pack SOURCE --publish` and serve the workspace with `pp2 host`. Review the full runtime import graph before publishing.
+
+## Run at the data
+
+Run this inventory query on two peers with pp2 installed and LAN discovery enabled. Set `PP2_HOME` to each peer's own workspace, exchange IDs from `pp2 identity`, and substitute the reader's ID for `READER`.
+
+```sh
+# Owner, from the pp2 checkout
+PROGRAM=$(pp2 pack examples/federated-stock/warehouse.mjs --publish)
+pp2 peer collection-init "$PP2_HOME/peer.db" inventory examples/federated-stock/east.ndjson
+pp2 peer replica grant "$PP2_HOME" inventory reader "$PROGRAM" "$READER" > inventory.grant
+pp2 host
+```
+
+Transfer `inventory.grant` to the reader. The grant limits this peer to the pinned query. The warehouse query reads its collection on the owner and returns a total.
+
+```sh
+# Reader
+pp2 eval --at inventory.grant - '{"sku":"lamp"}'
+```
+
+The result is `3`. The dash selects the program hash pinned in the grant. You can also supply the source path to package and send code to the owner on demand.
+
+### Read a replica offline
+
+Approve a copy of the inventory on the reader. Keep the owner's host running while the reader synchronizes.
+
+```sh
+# Owner
+RESOURCE=$(pp2 peer replica share "$PP2_HOME" inventory single-writer)
+pp2 peer replica approve "$PP2_HOME" "$RESOURCE" "$READER" read "$PROGRAM"
+```
+
+Send `RESOURCE` and `PROGRAM` to the reader. Set `OWNER` to the owner's ID on the reader.
+
+```sh
+# Reader, from the checkout
+pp2 pack examples/federated-stock/warehouse.mjs
+pp2 peer replica follow "$PP2_HOME" "$RESOURCE" "$OWNER" inventory
+pp2 peer replica sync "$PP2_HOME" "$RESOURCE" "$OWNER"
+pp2 peer replica grant "$PP2_HOME" inventory reader "$PROGRAM" > local.grant
+pp2 peer replica prefer "$PP2_HOME" "$RESOURCE" inventory.grant local.grant
+pp2 eval --replica inventory.grant - '{"sku":"lamp"}'
+```
+
+The same call works after the owner stops, while the local lease remains valid. Run `pp2 host` on the reader to keep its replica synchronized in the background when the owner is reachable. In a graph, use `evaluate(capability, input, {consistency: 'replica'})` to opt in. Pass a signed revision ID as the consistency value to require that exact revision.
+
+## Install a terminal app
+
+In the [starter project](getting-started.md), `pp2.json` names the entry source and each requested program, sets a graph budget, and requests named grants. Each terminal line starts a bounded invocation. The entry point reads it via `call(resource, 'event')` and returns `{lines}`.
 
 ```js
 const result = await evaluate(capabilities.documents, {type: 'search', query}, {
@@ -17,7 +70,7 @@ Add `log` to the extension check in `index.ts`, then run `pp2 update search` and
 
 For a remote update, run `pp2 publish` on the owner and `pp2 update --from "$RELEASE"` on the client. Issue and connect a fresh grant for a changed request. Revoke the old grant at the owner to withdraw access.
 
-Use the checkout's npm dependencies or run `npm ci` inside a standalone project. Its `npm run typecheck` checks edits. Packaging uses strict ES2022 and links runtime imports through the module's `imports` map. Workers run the compiled modules without Node built-ins.
+Use the checkout's npm dependencies or run `npm ci` inside a standalone project. Its `npm run typecheck` checks edits. Source paths in the manifest use the same compiler and linker as `pp2 pack`. Existing manifests with a `modules` map can continue to name modules and their explicit import aliases.
 
 `pp2 run` starts an interactive session. Enter `help` for app commands or `.quit` to leave.
 
@@ -27,16 +80,13 @@ A snapshot reference gives a graph program `pp2.blocks`. Use `blocks.root` to fi
 
 The ordered map is a TypeScript AVL tree. A lookup visits one path, a range scan returns a bounded ordered page, and an edit rewrites the affected path and reuses the unaffected subtrees. The map implements storage structure in guest code using the host's block and transaction primitives. [Map library](../examples/ordered-map/map.ts) · [Entry program](../examples/ordered-map/entry.ts)
 
-Run from the pp2 checkout with the [quickstart toolchain](../README.md#try-document-search).
+Run from the pp2 checkout with the [quickstart toolchain](../README.md#run-a-program).
 
 ```sh
 WORK=$(mktemp -d)
 OWNER=$(pp2 peer node-init "$WORK/owner")
 DB="$WORK/owner/peer.db"
-MAP=$(pp2 peer pack examples/ordered-map/map.ts "$WORK/map.ppj")
-ENTRY=$(pp2 peer pack examples/ordered-map/entry.ts "$WORK/entry.ppj" "./map.js=$MAP")
-pp2 peer put "$DB" "$WORK/map.ppj"
-pp2 peer put "$DB" "$WORK/entry.ppj"
+ENTRY=$(PP2_HOME="$WORK/owner" pp2 pack examples/ordered-map/entry.ts)
 
 printf 'null\n' > "$WORK/initial.json"
 pp2 peer ref-init "$DB" inventory "$WORK/initial.json"

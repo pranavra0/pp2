@@ -18,6 +18,12 @@ const USAGE: &str = "pp2 — Write programs, not servers.
   pp2 update PROJECT                  Review changes and keep installation state
   pp2 list                            List installed applications
   pp2 status                          Inspect the selected app and its grants
+  pp2 pack SOURCE [--publish]         Package a JavaScript or TypeScript source graph
+  pp2 eval SOURCE_OR_HASH [JSON]       Evaluate a program with no capabilities
+  pp2 eval --at GRANT SOURCE_OR_HASH [JSON]
+                                      Evaluate at the peer issuing the resource grant
+  pp2 eval --replica GRANT SOURCE_OR_HASH [JSON]
+                                      Prefer an approved local replica
 
 Across machines
   pp2 publish                         Publish selected app code and print PACKAGE@PEER
@@ -35,7 +41,7 @@ Administration and runtime tools
   pp2 app --help       Package and deployment operations
   pp2 peer --help      Storage, networking and authority
   pp2 demo             Run a runtime demonstration
-  pp2 eval FILE        Evaluate a binary program";
+  pp2 eval-binary FILE Evaluate a binary program";
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = env::args_os().skip(1).collect();
@@ -52,7 +58,17 @@ fn run() -> Result<(), Box<dyn Error>> {
             let scenario = scenario.to_str().ok_or(USAGE)?;
             demo::run(Some(scenario))?;
         }
-        [command, path] if command == "eval" => {
+        [command, path]
+            if command == "eval-binary"
+                || (command == "eval"
+                    && path.to_str().is_none_or(|path| {
+                        !matches!(path, "--help" | "-h") && path.parse::<pp2::Hash>().is_err()
+                    })
+                    && !std::path::Path::new(path)
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "ts" | "mts"))) =>
+        {
             let mut bytes = Vec::new();
             File::open(path)?
                 .take(Block::MAX_BYTES as u64 + 1)

@@ -4,7 +4,7 @@ use pp2::peer::{Binding, Client, PeerIdentity, PeerStore, ReplicaAccess, Resourc
 use serde_json::json;
 
 use crate::{
-    app_cli::network,
+    app_cli::{network, read_document},
     peer_cli::{access, peer_target},
 };
 
@@ -20,7 +20,8 @@ const USAGE: &str = "Usage: pp2 peer replica <command>
   status HOME RESOURCE
   history HOME RESOURCE [AFTER_REVISION_ID]
   retain HOME RESOURCE SNAPSHOTS
-  grant HOME LOCAL_REFERENCE reader|writer PROGRAM";
+  grant HOME LOCAL_REFERENCE reader|writer PROGRAM [HOLDER]
+  prefer HOME RESOURCE OWNER_GRANT_FILE LOCAL_GRANT_FILE";
 
 pub(crate) fn run(args: &[&str]) -> Result<()> {
     match args {
@@ -123,11 +124,12 @@ pub(crate) fn run(args: &[&str]) -> Result<()> {
             let pruned = store(home)?.retain_replica_snapshots(resource.parse()?, keep.parse()?)?;
             println!("{}", json!({ "pruned_snapshots": pruned }));
         }
-        ["grant", home, reference, level, program] => {
+        ["grant", home, reference, level, program, holder @ ..] if holder.len() <= 1 => {
             let peer = identity(home)?.id();
             let access = access(level)?;
             let program = program.parse()?;
-            let grant = store(home)?.issue(reference, peer, access, Some(program))?;
+            let holder = holder.first().map_or(Ok(peer), |id| id.parse())?;
+            let grant = store(home)?.issue(reference, holder, access, Some(program))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&Binding {
@@ -137,6 +139,15 @@ pub(crate) fn run(args: &[&str]) -> Result<()> {
                     access
                 })?
             );
+        }
+        ["prefer", home, resource, owner_grant, local_grant] => {
+            let primary: Binding = read_document(std::fs::File::open(owner_grant)?)?;
+            let local: Binding = read_document(std::fs::File::open(local_grant)?)?;
+            let id = identity(home)?.id();
+            if local.peer != id || local.program != primary.program {
+                return Err("Expected a local grant pinned to the same program.".into());
+            }
+            store(home)?.prefer_replica_reads(id, &primary, resource.parse()?, local.grant)?;
         }
         _ => return Err(USAGE.into()),
     }

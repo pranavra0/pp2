@@ -1,6 +1,6 @@
 # Build and test
 
-Use the [quickstart toolchain](README.md#try-document-search) and Python 3. Run from the repository root with the committed lockfiles.
+Use the [quickstart toolchain](README.md#run-a-program) and Python 3. Run from the repository root with the committed lockfiles.
 
 ```sh
 npm ci
@@ -12,6 +12,16 @@ python3 scripts/check-document-workflow.py target/release/pp2
 ```
 
 Exercise runtime invariants through public entry points. Use a fresh workspace for first-run checks.
+
+## Benchmarks
+
+```sh
+cargo build --release --locked --bins --examples
+python3 scripts/validate-peers.py --samples 40
+python3 scripts/benchmark-graph.py --isolated-networks --samples 40
+```
+
+Both benchmarks verify result equivalence against the conventional implementation before reporting timings. [Measurements](docs/architecture.md#snapshot-application-measurements)
 
 ## Release
 
