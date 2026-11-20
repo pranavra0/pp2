@@ -1,8 +1,10 @@
 use super::jobs::{self, Attempt};
 use super::*;
 use crate::peer::{
-    Access, Binding, GraphBudget, GraphMetrics, PeerEndpoint,
+    Access, Binding, GraphBudget, GraphMetrics, HostResource, NativePackage, PeerEndpoint,
+    TerminalResult,
     effects::{self, BoundCapability, Effect, GraphBindings, GraphJob, Remote, Scope},
+    native::{self, STATE, Terminal},
     protocol::{Forward, JobState, Submission},
     storage::{GraphAccess, ScopedStart},
     unix_ms,
@@ -358,11 +360,18 @@ pub(super) struct Traffic {
     pub(super) received: u64,
 }
 
+pub(super) enum Execution<'a> {
+    Synchronous,
+    Durable(&'a Attempt),
+    Terminal(&'a HostResource),
+}
+
 struct Invocation<'a> {
     server: &'a Server,
     routes: BTreeMap<String, BoundCapability>,
     packages: PeerStore,
     call: Call,
+    native: bool,
     metrics: GraphMetrics,
 }
 
@@ -397,6 +406,9 @@ impl Invocation<'_> {
             Some(_) => return Err(PeerError::Denied),
             None => EvaluationMode::Read,
         };
+        if self.native && remote.delegate.iter().any(|name| name == STATE) {
+            return Err(PeerError::Denied);
+        }
         let mut bindings = BTreeMap::new();
         for name in &remote.delegate {
             let capability = self.routes.get(name).ok_or(PeerError::Denied)?;
@@ -469,6 +481,34 @@ impl Invocation<'_> {
         let expiry = remote
             .timeout_ms
             .map_or(expiry, |ms| expiry.min(unix_ms() + u64::from(ms)));
+        let state = self.native && remote.target == STATE;
+        let leaf = remote.delegate.is_empty() && remote.allowance == 0;
+        if state && !leaf {
+            return Err(PeerError::Denied);
+        }
+        let local =
+            self.native && leaf && self.routes[&remote.target].binding.peer == self.server.identity;
+        if local {
+            let (_, job) = self.prepare(&remote, budget, expiry, &active)?;
+            let holder = if state {
+                self.call.holder
+            } else {
+                self.server.identity
+            };
+            let call = job.call(holder, false)?;
+            let code = NativePackage::load_program(job.program, |hash| self.packages.get(hash))?;
+            let (receipt, metrics) = self.server.execute_graph(
+                &mut self.packages,
+                call,
+                code,
+                job.input,
+                BTreeMap::new(),
+                active,
+                Execution::Synchronous,
+            )?;
+            self.metrics.add_descendant(metrics);
+            return remote_value(receipt.revision, &receipt.value);
+        }
         let mut traffic = Traffic::default();
         self.metrics.remote_calls += 1;
         let result = (|| {
@@ -479,7 +519,13 @@ impl Invocation<'_> {
                 active,
                 None,
                 &mut traffic,
-                |hash| self.packages.executable(self.call.holder, hash),
+                |hash| {
+                    if self.native {
+                        self.packages.get(hash)
+                    } else {
+                        self.packages.executable(self.call.holder, hash)
+                    }
+                },
             )? {
                 Reply::Graph {
                     revision,
@@ -736,6 +782,63 @@ impl Client {
 }
 
 impl Server {
+    /// Sends one terminal event to the installed program in a local, isolated worker.
+    /// Remote calls use the same graph protocol as a network-initiated invocation.
+    pub fn run_native(&self, id: Hash, line: &str) -> Result<(TerminalResult, GraphMetrics)> {
+        let event = native::terminal_event(line)?;
+        let mut store = PeerStore::open(&self.database)?;
+        let execution = store.native_execution(id)?;
+        let program = execution.installation.manifest.entry;
+        let budget = execution.installation.manifest.budget;
+        let active =
+            Activity::new(Instant::now() + Duration::from_millis(budget.timeout_ms.into()));
+        let state = Binding {
+            peer: self.identity,
+            grant: execution.writer,
+            program,
+            access: Access::Write,
+        };
+        let bindings = execution
+            .installation
+            .bindings
+            .into_iter()
+            .chain([(STATE.into(), state)])
+            .map(|(name, binding)| {
+                (
+                    name,
+                    BoundCapability {
+                        binding,
+                        delegated_by: None,
+                    },
+                )
+            })
+            .collect();
+        let job = GraphJob {
+            grant: execution.entry,
+            program,
+            mode: EvaluationMode::Read,
+            input: Data::Nil.to_bytes()?,
+            budget,
+            expires_at_ms: unix_ms() + u64::from(budget.timeout_ms),
+            delegated_by: None,
+            bindings: GraphBindings::Local(Vec::new()),
+        };
+        let call = job.call(id, false)?;
+        let (receipt, metrics) = self.execute_graph(
+            &mut store,
+            call,
+            execution.code,
+            job.input,
+            bindings,
+            active,
+            Execution::Terminal(&event),
+        )?;
+        Ok((
+            TerminalResult::from_data(&Data::from_bytes(&receipt.value)?)?,
+            metrics,
+        ))
+    }
+
     pub(super) fn run_graph(
         &self,
         stream: &mut Inbound,
@@ -757,7 +860,7 @@ impl Server {
             job.input,
             bindings,
             stream.sock.active(),
-            None,
+            Execution::Synchronous,
         )?;
         Ok(graph_reply(receipt, metrics))
     }
@@ -771,7 +874,7 @@ impl Server {
         input: Vec<u8>,
         bindings: BTreeMap<String, BoundCapability>,
         active: Activity,
-        durable: Option<&super::jobs::Attempt>,
+        execution: Execution<'_>,
     ) -> Result<(super::super::storage::Receipt, GraphMetrics)> {
         if !code[0].1.starts_with(content::MAGIC) {
             return Err(PeerError::Value(
@@ -779,6 +882,11 @@ impl Server {
             ));
         }
         active.check()?;
+        let (durable, event) = match execution {
+            Execution::Synchronous => (None, None),
+            Execution::Durable(attempt) => (Some(attempt), None),
+            Execution::Terminal(event) => (None, Some(event)),
+        };
         let mut invocation = if bindings.is_empty() {
             None
         } else {
@@ -787,12 +895,46 @@ impl Server {
                 routes: bindings.clone(),
                 packages: PeerStore::open_with_timeout(&self.database, active.storage_wait()?)?,
                 call,
+                native: event.is_some(),
                 metrics: GraphMetrics::default(),
             })
         };
         let storage = match store.scoped(call, active.storage_wait()?)? {
             ScopedStart::Collection(storage) => storage,
             ScopedStart::Replayed(receipt) => return Ok((receipt, GraphMetrics::default())),
+        };
+        let persisted = if event.is_none() {
+            storage.host_resource()?
+        } else {
+            None
+        };
+        let resource = match (event, persisted.as_ref()) {
+            (Some(event), _) => Some((&Terminal as &dyn super::HostProvider, event)),
+            (_, Some(resource)) => {
+                let provider = self
+                    .providers
+                    .get(&resource.provider)
+                    .ok_or(PeerError::Unsupported("host resource provider unavailable"))?;
+                Some((provider.as_ref(), resource))
+            }
+            _ => None,
+        };
+        // Read invocations hold a SQLite snapshot, so verify revocation using a fresh
+        // view. Update invocations already serialize with revocation on the writer lock.
+        let authority = if resource.is_some() && call.update.is_none() {
+            Some(PeerStore::open_with_timeout(
+                &self.database,
+                active.storage_wait()?,
+            )?)
+        } else {
+            None
+        };
+        let confirm_host = || -> Result<()> {
+            active.check()?;
+            if let Some(authority) = &authority {
+                authority.confirm_collection(call)?;
+            }
+            Ok(())
         };
         let mut scope = Scope {
             budget: call.graph.expect("graph invocation").budget,
@@ -809,6 +951,8 @@ impl Server {
                 context: WorkContext::Graph(Guest {
                     bindings: scope.bindings.clone(),
                     write: call.update.is_some(),
+                    resource: resource.is_some(),
+                    revision: storage.revision(),
                 }),
             },
             || active.check(),
@@ -826,6 +970,18 @@ impl Server {
                             )?,
                             None => invocation.invoke(remote, &mut scope, active.clone())?,
                         }
+                    }
+                    Effect::Host(operation, input) => {
+                        let (provider, resource) = resource.ok_or(PeerError::Denied)?;
+                        confirm_host()?;
+                        let value = provider.read(
+                            &resource.configuration,
+                            &operation,
+                            Data::from_bytes(&input)?,
+                            &confirm_host,
+                        );
+                        confirm_host()?;
+                        value?.to_bytes()?
                     }
                     storage_effect => {
                         storage_effects += 1;

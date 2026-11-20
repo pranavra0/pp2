@@ -1062,7 +1062,8 @@ fn version_one_databases_keep_their_snapshot_references() {
     {
         let old = rusqlite::Connection::open(&database).unwrap();
         old.execute_batch(
-            "DROP TABLE job_effects; DROP TABLE job_blocks; DROP TABLE jobs;
+            "DROP TABLE native_bindings; DROP TABLE native_installations; DROP TABLE host_resources;
+             DROP TABLE job_effects; DROP TABLE job_blocks; DROP TABLE jobs;
              DROP VIEW subscription_authority; DROP TABLE subscriptions;
              DROP TABLE applications; DROP TABLE change_events; DROP TABLE reaction_writers;
              DROP TABLE graph_forward_replays; DROP TABLE graph_grants;

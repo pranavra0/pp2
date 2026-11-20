@@ -515,7 +515,7 @@ fn credentials(ca: &str, cert: &str, key: &str) -> Credentials {
     }
 }
 
-fn access(input: &str) -> Result<Access> {
+pub(crate) fn access(input: &str) -> Result<Access> {
     match input {
         "reader" => Ok(Access::Read),
         "writer" => Ok(Access::Write),

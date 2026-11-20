@@ -92,10 +92,20 @@ Use `pp2 app install DB HOLDER SUBSCRIPTIONS_JSON` with a JSON object containing
 
 The handler receives `{id, reference, revision}`. The ID is a stable hex string and the revision is a decimal string. `pp2 app status DB APPLICATION` shows each cursor, pending revision, missed count, and most recent terminal outcome. Use `pp2 app unsubscribe DB APPLICATION SUBSCRIPTION` to revoke one subscription or `pp2 app remove DB APPLICATION` to stop the installation. Status reports `removing` while already dispatched children may still hold live deadlines. [Delivery and lifecycle semantics](docs/architecture.md#persistent-applications)
 
+## Install and run a native application
+
+`pp2 app native` installs immutable application packages by hash. A package lists its entry program, graph budget, and named capability requests. Installation displays those requests along with terminal access and private state. A request becomes usable after the user supplies an issuer's grant for that name and program. Use `pp2 app native update` to approve a new package while keeping the installation ID and state.
+
+`pp2 app native run HOME APPLICATION` opens the terminal shell or reads commands from standard input. Each line becomes a bounded event in a local worker. The program can call its granted peers, and the shell renders its text result. The laptop runs the shell directly. Resource hosts run an ordinary pp2 peer.
+
+The [native document example](examples/native-documents/README.md) builds an index on a separate machine, searches it interactively, and keeps previous results available while disconnected. It includes a two-machine walkthrough and a comparison with a conventional mTLS service.
+
 ## Write a guest with effects
 
 The default export of a collection program receives `(pp2, input)`.
 
+- `pp2.storage.revision` is the revision of the invocation's collection snapshot.
+- `pp2.call(pp2.resource, operation, input)` reads an explicitly scoped host resource. `pp2.resource` is null when the invocation has no host resource. For a directory, use `list`, `read`, or `readText`. [Host resource interface](docs/architecture.md#host-resources)
 - `pp2.storage.get(key)` resolves to `{found: false}` or `{found: true, value}`. Values may be null.
 - `pp2.storage.scan({prefix, after, limit})` resolves to `{entries, next}`. Each entry is a key-value pair. Pass `next` as the exclusive `after` cursor for the next page, until it is null. The host orders keys by their UTF-8 bytes and caps each page by rows and encoded size.
 - `pp2.evaluate(capability, input, {calls, delegate, timeoutMs, update})` resolves to `{revision, value}`. Pass a capability from `pp2.capabilities`. Its grant determines which collection and program the target peer authorizes. Set `calls: 0` for a leaf. An optional `delegate` array supplies the only capabilities available to the child. An optional `timeoutMs` shortens that branch's inherited deadline.

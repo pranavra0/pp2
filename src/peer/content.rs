@@ -68,6 +68,7 @@ pub(super) enum Kind {
     Data,
     Aeb,
     JavaScript,
+    Native,
 }
 
 pub(super) fn inspect(expected: Hash, bytes: &[u8]) -> Result<(Kind, BTreeSet<Hash>)> {
@@ -80,6 +81,12 @@ pub(super) fn inspect(expected: Hash, bytes: &[u8]) -> Result<(Kind, BTreeSet<Ha
     }
     if bytes.starts_with(MAGIC) {
         return Ok((Kind::JavaScript, JavaScript::from_bytes(bytes)?.imports));
+    }
+    if bytes.starts_with(super::native::MAGIC) {
+        return Ok((
+            Kind::Native,
+            super::NativePackage::from_bytes(bytes)?.programs(),
+        ));
     }
     let (kind, links) = wire::inspect_block(bytes)?;
     Ok((

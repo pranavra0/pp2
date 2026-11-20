@@ -23,7 +23,7 @@ use crate::{Block, Data, Hash};
 
 pub use super::protocol::EvaluationMode;
 use super::{
-    Access, PeerError, PeerNetwork, PeerStore, Result,
+    Access, HostProvider, PeerError, PeerNetwork, PeerStore, Result,
     content::{self, MAX_MODULES, load_code},
     discovery::{IDENTITY_ALPN, Route, prove_transport, verify_transport},
     effects::{BindingSet, PeerEndpoint},
@@ -634,6 +634,7 @@ pub struct Server {
     worker: PathBuf,
     tls: Arc<ServerConfig>,
     graph: graph::Configuration,
+    providers: BTreeMap<String, Arc<dyn HostProvider>>,
     identity: Hash,
     network: Option<PeerNetwork>,
 }
@@ -690,6 +691,15 @@ impl Server {
             worker: worker.canonicalize()?,
             tls: Arc::new(config),
             graph: graph::Configuration::new(creds, network.as_ref(), Vec::new(), Vec::new())?,
+            providers: {
+                #[cfg(target_os = "linux")]
+                {
+                    let directory: Arc<dyn HostProvider> = Arc::new(super::Directory);
+                    BTreeMap::from([(super::Directory::PROVIDER.into(), directory)])
+                }
+                #[cfg(not(target_os = "linux"))]
+                BTreeMap::new()
+            },
             identity,
             network,
         })
@@ -703,6 +713,20 @@ impl Server {
         endpoints: Vec<PeerEndpoint>,
     ) -> Result<Self> {
         self.graph = graph::Configuration::new(creds, self.network.as_ref(), bindings, endpoints)?;
+        Ok(self)
+    }
+
+    /// Registers a provider for administrator-created host resources of this kind.
+    pub fn with_host_provider(
+        mut self,
+        name: &str,
+        provider: impl HostProvider + 'static,
+    ) -> Result<Self> {
+        super::effects::validate_binding_name(name)?;
+        if self.providers.contains_key(name) {
+            return Err(PeerError::Value("host provider already registered".into()));
+        }
+        self.providers.insert(name.into(), Arc::new(provider));
         Ok(self)
     }
 

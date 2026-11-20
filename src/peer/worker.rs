@@ -24,6 +24,8 @@ pub(super) enum WorkContext {
 pub(super) struct Guest {
     pub bindings: Vec<String>,
     pub write: bool,
+    pub resource: bool,
+    pub revision: u64,
 }
 
 pub(super) struct Output {

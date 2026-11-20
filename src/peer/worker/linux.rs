@@ -276,7 +276,7 @@ fn evaluate(mut work: Work) -> Result<Output> {
         .ok_or(PeerError::Missing(work.program))?;
     let (_, root) = work.code.swap_remove(at);
     let (value, fuel, memory) = match content::inspect(work.program, &root)?.0 {
-        Kind::Data => return Err(PeerError::Value("expected program".into())),
+        Kind::Data | Kind::Native => return Err(PeerError::Value("expected program".into())),
         Kind::Aeb => {
             let WorkContext::Snapshot { hash, bytes } = work.context else {
                 return Err(PeerError::Value(
@@ -432,7 +432,7 @@ fn evaluate_javascript(
                     })?;
                     let names = serde_json::to_string(&guest.bindings)
                         .expect("binding names are JSON strings");
-                    let api: Array = setup.call((rpc, ctx.json_parse(names)?, guest.write))?;
+                    let api: Array = setup.call((rpc, ctx.json_parse(names)?, guest.write, guest.resource, guest.revision.to_string()))?;
                     replacer = api.get(1)?;
                     Some((api.get::<Value>(0)?, api.get::<Function>(2)?))
                 }
@@ -525,6 +525,7 @@ fn exchange_effect(args: Array<'_>, waiting: &Cell<Duration>) -> rquickjs::Resul
             }),
             "put" => Effect::Put(key, data(&payload)?),
             "delete" => Effect::Delete(key),
+            "host" => Effect::Host(key, data(&payload)?),
             _ => return Err(PeerError::Denied),
         };
         effect.validate()?;

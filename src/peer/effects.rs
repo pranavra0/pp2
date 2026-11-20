@@ -99,6 +99,7 @@ pub(super) enum Effect {
     Scan(Scan),
     Put(String, Vec<u8>),
     Delete(String),
+    Host(String, Vec<u8>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -134,6 +135,13 @@ impl Effect {
     pub(super) fn validate(&self) -> Result<()> {
         match self {
             Self::Evaluate(remote) => remote.validate(),
+            Self::Host(operation, input) => {
+                validate_binding_name(operation)?;
+                if input.len() > MAX_EFFECT_BYTES {
+                    return Err(PeerError::Limit("host input bytes"));
+                }
+                Ok(())
+            }
             Self::Get(key) | Self::Delete(key) => check_key(key, false),
             Self::Put(key, value) => {
                 check_key(key, false)?;
@@ -168,17 +176,24 @@ pub(super) fn check_key(key: &str, empty: bool) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn validate_binding_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    {
+        return Err(PeerError::Value("invalid capability name".into()));
+    }
+    Ok(())
+}
+
 pub fn validate_binding_names(names: &[String]) -> Result<()> {
     let mut seen = BTreeSet::new();
     if names.len() > MAX_BINDINGS
-        || names.iter().any(|name| {
-            name.is_empty()
-                || name.len() > 64
-                || !name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-                || !seen.insert(name)
-        })
+        || names
+            .iter()
+            .any(|name| validate_binding_name(name).is_err() || !seen.insert(name))
     {
         return Err(PeerError::Value(
             "invalid or repeated capability name".into(),

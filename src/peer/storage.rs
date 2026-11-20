@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Block, Data, Hash};
 
 use super::{
-    PeerError, Result,
+    HostResource, PeerError, Result,
     content::{self, Kind},
     effects::{Effect, GraphBudget, GraphMetrics, MAX_EFFECT_BYTES, Scan},
     protocol::{self, Forward, JobState},
@@ -17,6 +17,7 @@ use super::{
 
 mod applications;
 mod jobs;
+mod native;
 pub use applications::{
     ApplicationSpec, ApplicationState, ApplicationStatus, DeliveryOutcome, DeliveryStatus,
     SubscriptionSpec, SubscriptionState, SubscriptionStatus,
@@ -190,7 +191,7 @@ impl PeerStore {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // Bound the main database. Short transactions keep WAL readers from pinning old pages.
         conn.pragma_update(None, "max_page_count", 65_536)?;
-        if version < 4 {
+        if version < 5 {
             let tx = conn.transaction_with_behavior(Immediate)?;
             let version = database_version(&tx)?;
             if version == 0 {
@@ -204,6 +205,9 @@ impl PeerStore {
             }
             if version < 4 {
                 tx.execute_batch(applications::SCHEMA)?;
+            }
+            if version < 5 {
+                tx.execute_batch(native::SCHEMA)?;
             }
             tx.commit()?;
         }
@@ -268,7 +272,7 @@ impl PeerStore {
             if used + size > MAX_CACHE_BYTES_PER_HOLDER {
                 continue;
             }
-            if insert(&tx, *hash, bytes)? == Kind::Data {
+            if !matches!(insert(&tx, *hash, bytes)?, Kind::JavaScript | Kind::Aeb) {
                 return Err(PeerError::Value("expected program".into()));
             }
             let inserted = tx.execute(
@@ -580,31 +584,47 @@ impl PeerStore {
         name: &str,
         entries: impl IntoIterator<Item = Result<(String, Data)>>,
     ) -> Result<Revision> {
-        check_name(name)?;
-        let bytes = Block::Data(Data::Nil).to_bytes()?;
-        let hash = Hash::digest(&bytes);
         let tx = self.0.transaction_with_behavior(Immediate)?;
-        insert(&tx, hash, &bytes)?;
-        if tx.execute(
-            "INSERT INTO refs VALUES (?1, 0, ?2) ON CONFLICT(name) DO NOTHING",
-            params![name, &hash.0[..]],
-        )? == 0
-        {
-            return Err(PeerError::ReferenceExists(name.to_owned()));
-        }
-        tx.execute("INSERT INTO collections VALUES (?1)", [name])?;
-        {
-            let mut insert = tx.prepare("INSERT INTO entries VALUES (?1, ?2, ?3)")?;
-            for entry in entries {
-                let (key, value) = entry?;
-                let bytes = value.to_bytes()?;
-                check_entry(&key, &bytes)?;
-                insert.execute(params![name, key.as_bytes(), bytes])?;
-            }
-        }
-        applications::record_change(&tx, name, 0, false)?;
+        let revision = create_collection(&tx, name, entries)?;
         tx.commit()?;
-        Ok(Revision { number: 0, hash })
+        Ok(revision)
+    }
+
+    /// Creates an indexed reference with a host resource. The association is immutable.
+    pub fn create_host_resource(&mut self, name: &str, resource: HostResource) -> Result<()> {
+        let tx = self.0.transaction_with_behavior(Immediate)?;
+        register_resource(&tx, name, resource, false)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Attaches or reuses an identical resource and grants access to a pinned program.
+    pub fn share_host_resource(
+        &mut self,
+        name: &str,
+        resource: HostResource,
+        holder: Hash,
+        program: Hash,
+        access: Access,
+    ) -> Result<Hash> {
+        let tx = self.0.transaction_with_behavior(Immediate)?;
+        register_resource(&tx, name, resource, true)?;
+        prune_graph_grants(&tx, unix_ms())?;
+        let id = insert_grant(
+            &tx,
+            holder,
+            &Authority {
+                reference: name.into(),
+                access,
+                program: Some(program),
+                depth: 0,
+                graph: None,
+                reaction_writer: false,
+            },
+            None,
+        )?;
+        tx.commit()?;
+        Ok(id)
     }
 
     pub(super) fn probe_collection(&mut self, call: Call) -> Result<Option<Receipt>> {
@@ -664,6 +684,7 @@ impl PeerStore {
             "WITH RECURSIVE live(hash) AS (
             SELECT hash FROM refs UNION SELECT hash FROM blocks WHERE published=1
             UNION SELECT hash FROM job_blocks
+            UNION SELECT package FROM native_installations
             UNION SELECT s.program FROM subscriptions s JOIN subscription_authority a USING(id)
                   WHERE s.expires>?1
             UNION SELECT edges.child FROM edges JOIN live ON edges.parent=live.hash
@@ -688,6 +709,29 @@ pub(super) struct Collection<'a> {
 }
 
 impl Collection<'_> {
+    pub(super) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(super) fn host_resource(&self) -> Result<Option<HostResource>> {
+        let resource = self
+            .tx
+            .query_row(
+                "SELECT provider, configuration FROM host_resources WHERE ref=?1",
+                [&self.reference],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        resource
+            .map(|(provider, bytes)| {
+                Ok(HostResource {
+                    provider,
+                    configuration: Data::from_bytes(&bytes)?,
+                })
+            })
+            .transpose()
+    }
+
     pub(super) fn effect(&self, effect: Effect) -> Result<Vec<u8>> {
         use serde_json::json;
         let result = match effect {
@@ -724,7 +768,7 @@ impl Collection<'_> {
                 )?;
                 json!(deleted != 0)
             }
-            Effect::Evaluate(_) => return Err(PeerError::Denied),
+            Effect::Evaluate(_) | Effect::Host(..) => return Err(PeerError::Denied),
         };
         content::data_from_json(result)?
             .to_bytes()
@@ -824,6 +868,60 @@ fn entry_json(bytes: &[u8]) -> Result<serde_json::Value> {
     content::data_to_json(&Data::from_bytes(bytes)?)
 }
 
+fn register_resource(
+    conn: &Connection,
+    name: &str,
+    resource: HostResource,
+    reuse: bool,
+) -> Result<()> {
+    super::effects::validate_binding_name(&resource.provider)?;
+    let configuration = resource.configuration.to_bytes()?;
+    if configuration.len() > MAX_EFFECT_BYTES {
+        return Err(PeerError::Limit("host resource configuration"));
+    }
+    if reuse && conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM host_resources WHERE ref=?1 AND provider=?2 AND configuration=?3)",
+        params![name, resource.provider, configuration],
+        |row| row.get::<_, bool>(0),
+    )? {
+        return Ok(());
+    }
+    create_collection(conn, name, [])?;
+    conn.execute(
+        "INSERT INTO host_resources VALUES (?1, ?2, ?3)",
+        params![name, resource.provider, configuration],
+    )?;
+    Ok(())
+}
+
+fn create_collection(
+    conn: &Connection,
+    name: &str,
+    entries: impl IntoIterator<Item = Result<(String, Data)>>,
+) -> Result<Revision> {
+    check_name(name)?;
+    let bytes = Block::Data(Data::Nil).to_bytes()?;
+    let hash = Hash::digest(&bytes);
+    insert(conn, hash, &bytes)?;
+    if conn.execute(
+        "INSERT INTO refs VALUES (?1, 0, ?2) ON CONFLICT(name) DO NOTHING",
+        params![name, &hash.0[..]],
+    )? == 0
+    {
+        return Err(PeerError::ReferenceExists(name.to_owned()));
+    }
+    conn.execute("INSERT INTO collections VALUES (?1)", [name])?;
+    let mut insert = conn.prepare("INSERT INTO entries VALUES (?1, ?2, ?3)")?;
+    for entry in entries {
+        let (key, value) = entry?;
+        let bytes = value.to_bytes()?;
+        check_entry(&key, &bytes)?;
+        insert.execute(params![name, key.as_bytes(), bytes])?;
+    }
+    applications::record_change(conn, name, 0, false)?;
+    Ok(Revision { number: 0, hash })
+}
+
 fn require_kind(conn: &Connection, name: &str, scoped: bool) -> Result<()> {
     let collection: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM collections WHERE ref=?1)",
@@ -897,7 +995,7 @@ fn database_version(conn: &Connection) -> Result<i64> {
     )?;
     match (application, version, entries) {
         (0, 0, 0) => Ok(0),
-        (APPLICATION_ID, 1..=4, _) => Ok(version),
+        (APPLICATION_ID, 1..=5, _) => Ok(version),
         (APPLICATION_ID, _, _) => Err(PeerError::Unsupported("peer database version")),
         _ => Err(PeerError::Unsupported(
             "expected a pp2 database or an empty file",

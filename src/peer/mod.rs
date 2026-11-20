@@ -3,6 +3,8 @@
 mod content;
 mod discovery;
 mod effects;
+mod host;
+mod native;
 mod protocol;
 mod storage;
 mod transport;
@@ -14,6 +16,10 @@ pub use discovery::{DiscoveryConfig, PeerIdentity, PeerNetwork, serve_rendezvous
 pub use effects::{
     Binding, BindingSet, GraphBudget, GraphMetrics, PeerEndpoint, validate_binding_names,
 };
+#[cfg(target_os = "linux")]
+pub use host::Directory;
+pub use host::{HostProvider, HostResource};
+pub use native::{NativeInstallation, NativePackage, RequestedBinding, TerminalResult};
 pub use storage::{
     Access, ApplicationSpec, ApplicationState, ApplicationStatus, DeliveryOutcome, DeliveryStatus,
     PeerStore, RECEIPT_WINDOW, Revision, SubscriptionSpec, SubscriptionState, SubscriptionStatus,

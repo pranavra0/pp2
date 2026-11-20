@@ -315,7 +315,7 @@ impl Server {
                 graph.input,
                 bindings,
                 active,
-                Some(&attempt),
+                graph::Execution::Durable(&attempt),
             )?;
             Ok(JobState::Completed {
                 revision: receipt.revision,

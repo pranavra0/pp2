@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const USAGE: &str = "Usage: pp2 app <command>
+  native <command>
   install DB PEER_ID|PEER_CERT SUBSCRIPTIONS_JSON
   status DB APPLICATION
   unsubscribe DB APPLICATION SUBSCRIPTION
@@ -125,6 +126,7 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
         .collect::<std::result::Result<_, _>>()?;
     match args.as_slice() {
         [] | ["--help" | "-h"] => println!("{USAGE}"),
+        ["native", commands @ ..] => crate::native_cli::run(commands)?,
         ["install", db, cert, manifest] => PeerStore::open(db)?
             .install_application(holder_id(cert)?, read_json(Path::new(manifest))?)?,
         ["status", db, application] => {
@@ -776,7 +778,7 @@ fn write_json(path: &Path, data: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-fn read_document<T: DeserializeOwned>(file: File) -> Result<T> {
+pub(crate) fn read_document<T: DeserializeOwned>(file: File) -> Result<T> {
     use std::io::Read;
     let mut bytes = Vec::new();
     file.take(pp2::Block::MAX_BYTES as u64 + 1)

@@ -1,4 +1,4 @@
-(rpc, names, writeStorage) => {
+(rpc, names, writeStorage, hasResource, revision) => {
     'use strict';
 
     const create = Object.create;
@@ -24,6 +24,8 @@
         throw new Type('expected JSON data and safe integers');
     }
 
+    const resource = hasResource ? freeze(create(null)) : null;
+    if (hasResource) slots.set(resource, "");
     const capabilities = create(null);
     for (const name of names) {
         const cap = freeze(create(null));
@@ -34,7 +36,7 @@
 
     function slot(capability) {
         const name = get(capability);
-        if (name === undefined) throw new Type('expected a capability from this invocation');
+        if (!name) throw new Type('expected a capability from this invocation');
         return name;
     }
 
@@ -67,7 +69,12 @@
         }
     }
 
+    const currentRevision = Number(revision);
     const storage = freeze({
+        get revision() {
+            if (!integer(currentRevision)) throw new Type('revision exceeds the JavaScript safe integer range');
+            return currentRevision;
+        },
         async get(key) {
             return request('get', text(key), '', '', 0, 0, '', '');
         },
@@ -88,6 +95,11 @@
     const guest = freeze({
         storage,
         capabilities,
+        resource,
+        async call(capability, operation, input = null) {
+            if (capability !== resource || resource === null) throw new Type('expected a host capability from this invocation');
+            return request('host', text(operation), stringify(input, replacer), '', 0, 0, '', '');
+        },
         async evaluate(capability, input, {calls, delegate = [], timeoutMs = null, update = null}) {
             if (!isArray(delegate) || delegate.length > 16) throw new Type('expected a bounded list of capabilities');
             let names = '';
