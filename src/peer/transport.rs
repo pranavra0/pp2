@@ -778,13 +778,14 @@ impl Server {
             tls: Arc::new(config),
             graph: graph::Configuration::new(creds, network.as_ref(), Vec::new(), Vec::new())?,
             providers: {
+                let clock: Arc<dyn HostProvider> = Arc::new(super::Clock);
+                let mut providers = BTreeMap::from([(super::Clock::PROVIDER.into(), clock)]);
                 #[cfg(target_os = "linux")]
-                {
-                    let directory: Arc<dyn HostProvider> = Arc::new(super::Directory);
-                    BTreeMap::from([(super::Directory::PROVIDER.into(), directory)])
-                }
-                #[cfg(not(target_os = "linux"))]
-                BTreeMap::new()
+                providers.insert(
+                    super::Directory::PROVIDER.into(),
+                    Arc::new(super::Directory),
+                );
+                providers
             },
             identity,
             network,

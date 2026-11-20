@@ -46,7 +46,7 @@ def run(binary, workspace, example):
             listener.bind(("127.0.0.1", 0))
             addresses[role] = f"127.0.0.1:{listener.getsockname()[1]}"
 
-    programs = ("set-stock", "publish-stock", "read-office", "write-office")
+    programs = ("set-stock", "publish-stock", "read-movement", "read-office", "write-office")
     leaf = dict(timeout_ms=2000, calls=0, depth=0)
     collections = {"warehouse": "stock", "office": "inventory"}
     manifest = json_file("bootstrap.json", {
@@ -74,6 +74,9 @@ def run(binary, workspace, example):
 
     stock_writer = issue(warehouse_db, "stock", actor, "writer", "set-stock")
     watch = issue(warehouse_db, "stock", warehouse, "reader", "publish-stock")
+    entry = command("peer", "issue-compute", warehouse_db, warehouse / "peer.pem", hashes["publish-stock"])
+    movement = issue(warehouse_db, "stock", warehouse, "reader", "read-movement")
+    warehouse_identity = hash_bytes(command("peer", "fingerprint", warehouse / "peer.pem"))
     office_observer = issue(office_db, "inventory", office, "reader", "read-office")
     office_reader = issue(office_db, "inventory", actor, "reader", "read-office")
     warehouse_reader = issue(office_db, "inventory", warehouse, "reader", "read-office")
@@ -84,22 +87,25 @@ def run(binary, workspace, example):
     office_identity = hash_bytes(command("peer", "fingerprint", office / "peer.pem"))
     expires = time.time_ns() // 1_000_000 + 300_000
 
-    def install(peer, app, sub, program, grant, budget, capabilities):
+    def install(peer, app, sub, program, grant, budget, capabilities, entry=None):
         spec = json_file(f"{app}.json", {
             "name": app, "subscriptions": {sub: {
                 "program": hash_bytes(hashes[program]), "watch_grant": hash_bytes(grant),
                 "budget": budget, "capabilities": capabilities, "expires_at_ms": expires,
+                "entry_grant": hash_bytes(entry) if entry else None,
             }},
         })
         command("app", "install", peer / "peer.db", peer / "peer.pem", spec)
 
     install(warehouse, "inventory", "project-stock", "publish-stock", watch,
-            dict(timeout_ms=3000, calls=6, depth=1), {
+            dict(timeout_ms=3000, calls=7, depth=1), {
+                "movement": {"peer": warehouse_identity, "grant": hash_bytes(movement),
+                             "program": hash_bytes(hashes["read-movement"]), "access": "Read"},
                 "readOffice": {"peer": office_identity, "grant": hash_bytes(warehouse_reader),
                                "program": hash_bytes(hashes["read-office"]), "access": "Read"},
                 "writeOffice": {"peer": office_identity, "grant": hash_bytes(warehouse_writer),
                                 "program": hash_bytes(hashes["write-office"]), "access": "Write"},
-            })
+            }, entry)
     install(office, "office-observer", "observe", "read-office", office_observer, leaf, {})
     command("peer", "unpublish", warehouse_db, hashes["publish-stock"])
     command("peer", "gc", warehouse_db)

@@ -201,8 +201,8 @@ def measure(work, nodes, binary, rows, samples, trace_dir, load_clients):
             traces = {role: stack.enter_context((trace_dir / f"{role}.jsonl").open("x"))
                       for role in (*ROLES, "client")}
 
-        def run(via_west=False, serial=False):
-            query = json.dumps({"sku": "lamp", "viaWest": via_west, "serial": serial})
+        def run(serial=False):
+            query = json.dumps({"sku": "lamp", "serial": serial})
             return json.loads(command(binary, "app", "invoke", workspace / "client", query,
                                       env=traced_env, trace=traces.get("client")))
 
@@ -217,10 +217,9 @@ def measure(work, nodes, binary, rows, samples, trace_dir, load_clients):
                 crash=True,
             ))
         first = run()
-        nested = run(via_west=True)
-        assert first["value"] == nested["value"] == expected
-        assert first["graph"]["remote_calls"] == nested["graph"]["remote_calls"] == 2
-        assert first["graph"]["storage_effects"] == nested["graph"]["storage_effects"] == 5
+        assert first["value"] == expected
+        assert first["graph"]["remote_calls"] == 2
+        assert first["graph"]["storage_effects"] == 5
         context = tls(baseline_workspace / "client", server=False)
 
         native_times = []
@@ -302,7 +301,6 @@ def measure(work, nodes, binary, rows, samples, trace_dir, load_clients):
         "result": expected, "storage_database_bytes": sizes, "samples": samples,
         "sqlite_in_process": timing(native_times),
         "first_pp2_application_bytes": traffic(first), "first_pp2_elapsed_us": first["elapsed_us"],
-        "delegated_pp2_elapsed_us": nested["elapsed_us"],
     }
     for parallel, name in ((False, "serial"), (True, "parallel")):
         summary[f"conventional_mtls_{name}"] = {

@@ -160,6 +160,7 @@ impl PeerStore {
         reference: &str,
         mode: ResourceMode,
     ) -> Result<Hash> {
+        check_name(reference)?;
         let tx = self.0.transaction_with_behavior(Immediate)?;
         let current =
             revision(&tx, reference)?.ok_or_else(|| PeerError::NoReference(reference.into()))?;
@@ -1099,7 +1100,7 @@ fn recompute_validity(conn: &Connection, policy: &Policy) -> Result<()> {
     Ok(())
 }
 
-fn root_at(conn: &Connection, resource: Hash, id: Hash) -> Result<Hash> {
+pub(super) fn root_at(conn: &Connection, resource: Hash, id: Hash) -> Result<Hash> {
     conn.query_row(
         "SELECT root FROM replica_versions WHERE resource=?1 AND id=?2 AND valid=1 AND retained=1",
         params![&resource.0[..], &id.0[..]],
@@ -2079,6 +2080,112 @@ mod tests {
     }
 
     #[test]
+    fn explicit_block_merge_can_read_each_head_and_commits_the_chosen_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = key(dir.path(), "owner");
+        let writer = key(dir.path(), "writer");
+        let mut origin = PeerStore::open(":memory:").unwrap();
+        origin.create_ref("source", &Data::Int(0)).unwrap();
+        let id = origin
+            .share_replica(&owner, "source", ResourceMode::MultiWriter)
+            .unwrap();
+        let program = Hash::digest(b"merge");
+        origin
+            .approve_replica(&owner, id, writer.id(), ReplicaAccess::Write, Some(program))
+            .unwrap();
+        let mut copy = PeerStore::open(":memory:").unwrap();
+        copy.follow_replica(writer.id(), owner.id(), id, "copy")
+            .unwrap();
+        pull(&origin, &owner, &mut copy, writer.id(), id);
+        let grant = origin
+            .issue("source", owner.id(), Access::Write, Some(program))
+            .unwrap();
+        let owner_call = call(owner.id(), grant, program, Consistency::Replica);
+        let copy_grant = copy
+            .issue("copy", writer.id(), Access::Write, Some(program))
+            .unwrap();
+        let copy_call = call(writer.id(), copy_grant, program, Consistency::Replica);
+        write(&mut origin, &owner, owner_call, 2);
+        write(&mut copy, &writer, copy_call, 3);
+        pull(&copy, &writer, &mut origin, owner.id(), id);
+        let heads = origin.replica_status(id).unwrap().heads;
+        assert_eq!(heads.len(), 2);
+
+        let hidden = root_at(&origin.0, id, heads[1]).unwrap();
+        let EvaluationStart::Ready(mut ordinary) =
+            origin.scoped(owner_call, Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected ordinary read");
+        };
+        assert!(ordinary.merge_heads().is_empty());
+        assert!(matches!(
+            ordinary.effect(Effect::ReadBlock(hidden)),
+            Err(PeerError::Denied)
+        ));
+        drop(ordinary);
+
+        let no_choice = update(&origin, owner_call, true);
+        let EvaluationStart::Ready(merge) =
+            origin.scoped(no_choice, Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected merge");
+        };
+        assert!(matches!(
+            merge.finish(Data::Nil.to_bytes().unwrap(), || Ok(()), None, Some(&owner)),
+            Err(PeerError::Value(_))
+        ));
+        assert_eq!(origin.replica_status(id).unwrap().heads, heads);
+
+        let merge_call = update(&origin, owner_call, true);
+        let EvaluationStart::Ready(mut merge) =
+            origin.scoped(merge_call, Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected merge");
+        };
+        let mut input = Vec::new();
+        for (peer_revision, root) in merge.merge_heads().to_vec() {
+            assert!(heads.contains(&peer_revision));
+            let Data::Record(block) =
+                Data::from_bytes(&merge.effect(Effect::ReadBlock(root)).unwrap()).unwrap()
+            else {
+                panic!("expected a root block");
+            };
+            let Data::Int(value) = block["value"] else {
+                panic!("expected a value");
+            };
+            input.push(value);
+        }
+        let sum = Data::Int(input.iter().sum());
+        assert_eq!(sum, Data::Int(5));
+        let address = merge
+            .effect(Effect::WriteBlock(sum.to_bytes().unwrap(), Vec::new()))
+            .unwrap();
+        let Data::Text(address) = Data::from_bytes(&address).unwrap() else {
+            panic!("expected a block address");
+        };
+        merge
+            .effect(Effect::SetRoot(address.parse().unwrap()))
+            .unwrap();
+        let receipt = merge
+            .finish(sum.to_bytes().unwrap(), || Ok(()), None, Some(&owner))
+            .unwrap();
+        let head = receipt.view.unwrap().revision.unwrap();
+        let history = origin.replica_history(id, None, 16).unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .find(|record| record.id == head)
+                .unwrap()
+                .parents,
+            heads
+        );
+        assert_eq!(
+            Block::from_bytes(&snapshot(&mut origin, owner_call).bytes).unwrap(),
+            Block::Data(sum)
+        );
+    }
+
+    #[test]
     fn synchronized_changes_schedule_replica_subscriptions_and_revocation_cancels_them() {
         let dir = tempfile::tempdir().unwrap();
         let owner = key(dir.path(), "owner");
@@ -2136,7 +2243,8 @@ mod tests {
             call(owner.id(), writer, program, Consistency::Authoritative),
             false,
         );
-        let EvaluationStart::Ready(state) = source.scoped(call, Duration::from_secs(1)).unwrap()
+        let EvaluationStart::Ready(mut state) =
+            source.scoped(call, Duration::from_secs(1)).unwrap()
         else {
             panic!("expected writable collection");
         };

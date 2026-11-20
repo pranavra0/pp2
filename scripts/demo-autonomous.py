@@ -31,17 +31,16 @@ def run(binary, workspace, example):
     }
     budget = dict(timeout_ms=3000, calls=1, depth=1)
     manifest = {
-        "root": {"peer": "b", "collection": "local", "module": "local", "capabilities": {}},
+        "root": {"peer": "b", "module": "local", "capabilities": {}},
         "budget": budget,
         "modules": {
             name: {"source": str(example / f"{name}.mjs")} for name in ("local", "remote")
         },
         "peers": {role: {"address": addresses[role]} for role in roles},
     }
-    for role, collection, value in (("b", "local", 6), ("c", "remote", 7)):
-        seed = workspace / f"{role}.ndjson"
-        seed.write_text(json.dumps(["stock", value]) + "\n")
-        manifest["peers"][role]["collections"] = {collection: str(seed)}
+    seed = workspace / "c.ndjson"
+    seed.write_text(json.dumps(["stock", 7]) + "\n")
+    manifest["peers"]["c"]["collections"] = {"remote": str(seed)}
     manifest_file = workspace / "app.json"
     manifest_file.write_text(json.dumps(manifest))
     deployment = workspace / "deployment"
@@ -54,7 +53,7 @@ def run(binary, workspace, example):
     local = command("pack", example / "local.mjs", workspace / "local.ppj")
     remote = command("pack", example / "remote.mjs", workspace / "remote.ppj")
     command("put", c / "peer.db", workspace / "remote.ppj", "--publish")
-    grant_b = command("issue", b / "peer.db", "local", cert_a, "reader", local)
+    grant_b = command("issue-compute", b / "peer.db", cert_a, local)
     grant_c = command("issue", c / "peer.db", "remote", cert_a, "reader", remote)
 
     def connection(role):
@@ -75,7 +74,7 @@ def run(binary, workspace, example):
         }
     }))
     input_file = workspace / "input.json"
-    input_file.write_text(json.dumps("stock"))
+    input_file.write_text(json.dumps({"key": "stock", "local": 6}))
     job = secrets.token_hex(32)
     with serve(binary, b):
         with serve(binary, a):

@@ -23,12 +23,15 @@ mod applications;
 mod jobs;
 mod native;
 mod replicas;
+mod roots;
 pub use applications::{
     ApplicationSpec, ApplicationState, ApplicationStatus, DeliveryOutcome, DeliveryStatus,
     SubscriptionSpec, SubscriptionState, SubscriptionStatus,
 };
 pub(super) use jobs::{JobKey, JobOutcome, QueuedJob};
 
+// The empty name reserves a grant target without creating a user-visible resource.
+const COMPUTE_REF: &str = "";
 const MAX_DELEGATION_DEPTH: u8 = 8;
 const MAX_GRANTS_PER_REF: u32 = 1024;
 const MAX_CACHE_BYTES_PER_HOLDER: i64 = 16 * 1024 * 1024;
@@ -238,6 +241,15 @@ impl PeerStore {
         Ok(())
     }
 
+    pub(super) fn import_graph(&mut self, blocks: &[(Hash, Vec<u8>)]) -> Result<()> {
+        let tx = self.0.transaction_with_behavior(Immediate)?;
+        for (hash, bytes) in blocks {
+            insert(&tx, *hash, bytes)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn get(&self, hash: Hash) -> Result<Option<Vec<u8>>> {
         self.read_block(hash, false)
     }
@@ -307,16 +319,27 @@ impl PeerStore {
         let tx = self.0.transaction_with_behavior(Immediate)?;
         for &hash in hashes {
             require_graph(&tx, hash)?;
-            if content::inspect(
-                hash,
-                &get(&tx, hash, false)?.ok_or(PeerError::Missing(hash))?,
-            )?
-            .0 == Kind::Revision
-            {
-                return Err(PeerError::Denied);
-            }
-            replicas::prevent_private_publication(&tx, hash)?;
-            tx.execute("UPDATE blocks SET published=1 WHERE hash=?1", [&hash.0[..]])?;
+            publish_block(&tx, hash)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Makes a complete immutable graph available after checking every block's policy.
+    pub fn publish_graph(&mut self, root: Hash) -> Result<()> {
+        let tx = self.0.transaction_with_behavior(Immediate)?;
+        let hashes = {
+            let mut query = tx.prepare(
+                "WITH RECURSIVE graph(hash) AS (
+                    VALUES (?1) UNION SELECT edges.child FROM edges JOIN graph ON edges.parent=graph.hash
+                 ) SELECT hash FROM graph",
+            )?;
+            query
+                .query_map([&root.0[..]], |row| Ok(Hash(row.get(0)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for hash in hashes {
+            publish_block(&tx, hash)?;
         }
         tx.commit()?;
         Ok(())
@@ -351,6 +374,9 @@ impl PeerStore {
     }
 
     pub fn reference(&self, name: &str) -> Result<Option<Revision>> {
+        if name == COMPUTE_REF {
+            return Ok(None);
+        }
         revision(&self.0, name)
     }
 
@@ -399,6 +425,34 @@ impl PeerStore {
         self.issue_grant(reference, holder, access, program, false)
     }
 
+    /// Permits one program to run without a private resource.
+    pub fn issue_compute(&mut self, holder: Hash, program: Hash) -> Result<Hash> {
+        let tx = self.0.transaction_with_behavior(Immediate)?;
+        let bytes = Block::Data(Data::Nil).to_bytes()?;
+        let hash = Hash::digest(&bytes);
+        insert(&tx, hash, &bytes)?;
+        tx.execute(
+            "INSERT INTO refs VALUES (?1, 0, ?2) ON CONFLICT(name) DO NOTHING",
+            params![COMPUTE_REF, &hash.0[..]],
+        )?;
+        prune_graph_grants(&tx, unix_ms())?;
+        let grant = insert_grant(
+            &tx,
+            holder,
+            &Authority {
+                reference: COMPUTE_REF.into(),
+                access: Access::Read,
+                program: Some(program),
+                depth: 0,
+                graph: None,
+                reaction_writer: false,
+            },
+            None,
+        )?;
+        tx.commit()?;
+        Ok(grant)
+    }
+
     /// Grants a pinned program the ability to make updates from durable reactions.
     pub fn issue_reaction_writer(
         &mut self,
@@ -417,6 +471,7 @@ impl PeerStore {
         program: Option<Hash>,
         reaction_writer: bool,
     ) -> Result<Hash> {
+        check_name(reference)?;
         let tx = self.0.transaction_with_behavior(Immediate)?;
         if reaction_writer {
             require_kind(&tx, reference, true)?;
@@ -490,7 +545,6 @@ impl PeerStore {
         let tx = self.0.transaction_with_behavior(Immediate)?;
         let mut scope = authority(&tx, caller, forwarded.grant)?;
         replicas::can_delegate(&tx, &scope.reference)?;
-        require_kind(&tx, &scope.reference, true)?;
         if forwarded.access > scope.access
             || scope
                 .program
@@ -545,7 +599,7 @@ impl PeerStore {
 
     pub(super) fn begin(&mut self, call: Call) -> Result<EvaluationStart<Snapshot>> {
         let tx = self.0.transaction()?;
-        let (reference, view, root) = evaluation_view(&tx, call, false)?;
+        let (reference, view, root, _) = evaluation_view(&tx, call, false)?;
         let revision = match evaluation_revision(&tx, call, &reference, &view)? {
             EvaluationStart::Ready(revision) => revision,
             EvaluationStart::Replayed(receipt) => return Ok(EvaluationStart::Replayed(receipt)),
@@ -675,9 +729,14 @@ impl PeerStore {
         Ok(id)
     }
 
-    pub(super) fn probe_collection(&mut self, call: Call) -> Result<Option<Receipt>> {
+    pub(super) fn probe_graph(
+        &mut self,
+        call: Call,
+        has_bindings: bool,
+    ) -> Result<Option<Receipt>> {
         let tx = self.0.transaction()?;
-        let (reference, view, _) = evaluation_view(&tx, call, true)?;
+        let (reference, view, _, kind) = evaluation_view(&tx, call, true)?;
+        kind.check_bindings(has_bindings)?;
         if call.update.is_some()
             && let EvaluationStart::Replayed(receipt) =
                 evaluation_revision(&tx, call, &reference, &view)?
@@ -691,28 +750,45 @@ impl PeerStore {
         &mut self,
         call: Call,
         busy: Duration,
-    ) -> Result<EvaluationStart<Collection<'_>>> {
+    ) -> Result<EvaluationStart<Stage<'_>>> {
         self.0.busy_timeout(busy)?;
         let tx = if call.update.is_some() {
             self.0.transaction_with_behavior(Immediate)?
         } else {
             self.0.transaction()?
         };
-        let (reference, view, root) = evaluation_view(&tx, call, true)?;
+        let (reference, view, root, kind) = evaluation_view(&tx, call, true)?;
         let revision = match evaluation_revision(&tx, call, &reference, &view)? {
             EvaluationStart::Ready(revision) => revision,
             EvaluationStart::Replayed(receipt) => return Ok(EvaluationStart::Replayed(receipt)),
         };
-        let historical = if matches!(view.consistency, Consistency::Revision(_)) {
-            Some(replicas::read_manifest(
-                &tx,
-                root.ok_or(PeerError::Denied)?,
-            )?)
+        let historical =
+            if kind == StageKind::Indexed && matches!(view.consistency, Consistency::Revision(_)) {
+                Some(replicas::read_manifest(
+                    &tx,
+                    root.ok_or(PeerError::Denied)?,
+                )?)
+            } else {
+                None
+            };
+        let roots = if kind == StageKind::Blocks {
+            let heads = if call.update.is_some_and(|update| update.merge) {
+                let resource = view.resource.ok_or(PeerError::Denied)?;
+                view.heads
+                    .iter()
+                    .map(|&id| Ok((id, replicas::root_at(&tx, resource, id)?)))
+                    .collect::<Result<_>>()?
+            } else {
+                Vec::new()
+            };
+            Some(roots::Roots::new(root.unwrap_or(revision.hash), heads))
         } else {
             None
         };
-        Ok(EvaluationStart::Ready(Collection {
+        Ok(EvaluationStart::Ready(Stage {
             tx,
+            kind,
+            roots,
             reference,
             revision: revision.number,
             call: Box::new(call),
@@ -721,9 +797,8 @@ impl PeerStore {
         }))
     }
 
-    pub(super) fn confirm_collection(&self, call: Call) -> Result<()> {
-        let scope = authorize(&self.0, call)?;
-        require_kind(&self.0, &scope.reference, true)
+    pub(super) fn graph_kind(&self, call: Call) -> Result<StageKind> {
+        graph_kind(&self.0, call)
     }
 
     /// Drops blocks unreachable from references and publications in one transaction.
@@ -746,8 +821,10 @@ impl PeerStore {
     }
 }
 
-pub(super) struct Collection<'a> {
+pub(super) struct Stage<'a> {
     tx: Transaction<'a>,
+    kind: StageKind,
+    roots: Option<roots::Roots>,
     reference: String,
     revision: u64,
     call: Box<Call>,
@@ -755,7 +832,21 @@ pub(super) struct Collection<'a> {
     historical: Option<BTreeMap<String, Hash>>,
 }
 
-impl Collection<'_> {
+impl Stage<'_> {
+    pub(super) fn kind(&self) -> StageKind {
+        self.kind
+    }
+
+    pub(super) fn root(&self) -> Option<Hash> {
+        self.roots
+            .as_ref()
+            .map(|roots| roots.next.unwrap_or(roots.current))
+    }
+
+    pub(super) fn merge_heads(&self) -> &[(Hash, Hash)] {
+        self.roots.as_ref().map_or(&[], |roots| &roots.heads)
+    }
+
     pub(super) fn revision(&self) -> u64 {
         self.revision
     }
@@ -783,7 +874,13 @@ impl Collection<'_> {
             .transpose()
     }
 
-    pub(super) fn effect(&self, effect: Effect) -> Result<Vec<u8>> {
+    pub(super) fn effect(&mut self, effect: Effect) -> Result<Vec<u8>> {
+        if let Some(roots) = &mut self.roots {
+            return roots.effect(&self.tx, self.call.update.is_some(), effect);
+        }
+        if self.kind != StageKind::Indexed {
+            return Err(PeerError::Denied);
+        }
         use serde_json::json;
         let result = match effect {
             Effect::Get(key) => {
@@ -825,9 +922,7 @@ impl Collection<'_> {
                 )?;
                 json!(deleted != 0)
             }
-            Effect::Evaluate(_) | Effect::EvaluateBatch(_) | Effect::Host(..) => {
-                return Err(PeerError::Denied);
-            }
+            _ => return Err(PeerError::Denied),
         };
         content::data_from_json(result)?
             .to_bytes()
@@ -897,22 +992,35 @@ impl Collection<'_> {
         durable: Option<(JobKey, GraphMetrics)>,
         signer: Option<&PeerIdentity>,
     ) -> Result<Receipt> {
+        let root = self.root();
         let mut receipt = Receipt {
             revision: self.revision,
             value,
             view: self.view.resource.is_some().then_some(self.view),
         };
         if let Some(update) = self.call.update {
+            if update.merge
+                && self
+                    .roots
+                    .as_ref()
+                    .is_some_and(|roots| roots.next.is_none())
+            {
+                return Err(PeerError::Value("a block merge must select a root".into()));
+            }
             receipt.revision += 1;
             let number = receipt.revision;
             let revision =
                 i64::try_from(number).map_err(|_| PeerError::Limit("reference revisions"))?;
-            if replicas::commit(&self.tx, &self.reference, signer, *self.call, None)? {
+            if replicas::commit(&self.tx, &self.reference, signer, *self.call, root)? {
                 receipt.view = Some(replicas::view(&self.tx, &self.reference, *self.call)?.0);
             } else {
                 self.tx.execute(
-                    "UPDATE refs SET revision=?1 WHERE name=?2",
-                    params![revision, self.reference],
+                    "UPDATE refs SET revision=?1, hash=coalesce(?2, hash) WHERE name=?3",
+                    params![
+                        revision,
+                        root.as_ref().map(|hash| &hash.0[..]),
+                        self.reference
+                    ],
                 )?;
                 applications::record_change(&self.tx, &self.reference, number, self.call.reaction)?;
             }
@@ -997,15 +1105,52 @@ fn create_collection(
     Ok(Revision { number: 0, hash })
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum StageKind {
+    Compute,
+    Indexed,
+    Blocks,
+}
+
+impl StageKind {
+    pub(super) fn check_bindings(self, has_bindings: bool) -> Result<()> {
+        if self != Self::Compute && has_bindings {
+            return Err(PeerError::Denied);
+        }
+        Ok(())
+    }
+}
+
+fn graph_kind(conn: &Connection, call: Call) -> Result<StageKind> {
+    let scope = authorize(conn, call)?;
+    stage_kind(conn, &scope.reference, call)
+}
+
+fn stage_kind(conn: &Connection, reference: &str, call: Call) -> Result<StageKind> {
+    if reference == COMPUTE_REF {
+        if call.update.is_some() || call.consistency != Consistency::Authoritative {
+            return Err(PeerError::Denied);
+        }
+        Ok(StageKind::Compute)
+    } else if is_collection(conn, reference)? {
+        Ok(StageKind::Indexed)
+    } else {
+        Ok(StageKind::Blocks)
+    }
+}
+
 fn evaluation_view(
     conn: &Connection,
     call: Call,
     scoped: bool,
-) -> Result<(String, ResourceView, Option<Hash>)> {
+) -> Result<(String, ResourceView, Option<Hash>, StageKind)> {
     let reference = authorize(conn, call)?.reference;
-    require_kind(conn, &reference, scoped)?;
+    let kind = stage_kind(conn, &reference, call)?;
+    if !scoped && kind != StageKind::Blocks {
+        return Err(PeerError::Value("expected a snapshot reference".into()));
+    }
     let (view, root) = replicas::view(conn, &reference, call)?;
-    Ok((reference, view, root))
+    Ok((reference, view, root, kind))
 }
 
 fn evaluation_revision(
@@ -1029,13 +1174,16 @@ fn evaluation_revision(
     Ok(EvaluationStart::Ready(revision))
 }
 
-fn require_kind(conn: &Connection, name: &str, scoped: bool) -> Result<()> {
-    let collection: bool = conn.query_row(
+fn is_collection(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM collections WHERE ref=?1)",
         [name],
         |row| row.get(0),
-    )?;
-    if collection != scoped {
+    )?)
+}
+
+fn require_kind(conn: &Connection, name: &str, scoped: bool) -> Result<()> {
+    if name == COMPUTE_REF || is_collection(conn, name)? != scoped {
         return Err(PeerError::Value(if scoped {
             "expected an indexed collection reference".into()
         } else {
@@ -1151,6 +1299,16 @@ fn insert_block(conn: &Connection, hash: Hash, bytes: &[u8], links: BTreeSet<Has
     Ok(())
 }
 
+fn publish_block(conn: &Connection, hash: Hash) -> Result<()> {
+    let bytes = get(conn, hash, false)?.ok_or(PeerError::Missing(hash))?;
+    if content::inspect(hash, &bytes)?.0 == Kind::Revision {
+        return Err(PeerError::Denied);
+    }
+    replicas::prevent_private_publication(conn, hash)?;
+    conn.execute("UPDATE blocks SET published=1 WHERE hash=?1", [&hash.0[..]])?;
+    Ok(())
+}
+
 fn require_graph(conn: &Connection, hash: Hash) -> Result<()> {
     let missing = conn
         .query_row(
@@ -1188,7 +1346,6 @@ fn insert_grant(
     scope: &Authority,
     parent: Option<Hash>,
 ) -> Result<Hash> {
-    check_name(&scope.reference)?;
     let count: u32 = conn.query_row(
         "SELECT count(*) FROM grants WHERE ref=?1",
         [&scope.reference],

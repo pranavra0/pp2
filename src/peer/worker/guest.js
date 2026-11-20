@@ -1,5 +1,7 @@
-(rpc, names, writeStorage, hasResource, revision, view) => {
+(rpc, options) => {
     'use strict';
+
+    const {names, writeStorage, hasResource, revision, view, indexed, root, mergeHeads} = options;
 
     const create = Object.create;
     const freeze = Object.freeze;
@@ -71,12 +73,16 @@
 
     const currentRevision = Number(revision);
     freeze(view.heads);
-    const storage = freeze({
+    const snapshot = freeze({
         view: freeze(view),
         get revision() {
             if (!integer(currentRevision)) throw new Type('revision exceeds the JavaScript safe integer range');
             return currentRevision;
         },
+    });
+    const storage = indexed ? freeze({
+        get revision() { return snapshot.revision; },
+        view: snapshot.view,
         async get(key) {
             return request('get', text(key), '', '', 0, 0, '', '');
         },
@@ -92,17 +98,44 @@
             if (!writeStorage) throw new Type('expected an update invocation');
             return request('delete', text(key), '', '', 0, 0, '', '');
         },
+    }) : null;
+
+    let currentRoot = root;
+    for (const head of mergeHeads) freeze(head);
+    const blocks = root === null ? null : freeze({
+        heads: freeze(mergeHeads),
+        get root() { return currentRoot; },
+        async read(hash) {
+            return request('readBlock', text(hash), '', '', 0, 0, '', '');
+        },
+        async write(value, children = []) {
+            if (!writeStorage) throw new Type('expected an update invocation');
+            if (!isArray(children) || children.length > 128) throw new Type('expected a bounded list of block addresses');
+            let addresses = '';
+            for (let i = 0; i < children.length; i++) {
+                const address = text(children[i]);
+                if (address.length !== 64) throw new Type('expected a block address');
+                addresses += (i ? ',' : '') + address;
+            }
+            return request('writeBlock', '', stringify(value, replacer), addresses, 0, 0, '', '');
+        },
+        async setRoot(hash) {
+            if (!writeStorage) throw new Type('expected an update invocation');
+            currentRoot = await request('setRoot', text(hash), '', '', 0, 0, '', '');
+        },
     });
 
     const guest = freeze({
+        snapshot,
         storage,
+        blocks,
         capabilities,
         resource,
         async call(capability, operation, input = null) {
             if (capability !== resource || resource === null) throw new Type('expected a host capability from this invocation');
             return request('host', text(operation), stringify(input, replacer), '', 0, 0, '', '');
         },
-        async evaluate(capability, input, {calls, delegate = [], timeoutMs = null, update = null, consistency = 'authoritative'}) {
+        async evaluate(capability, input, {calls = 0, delegate = [], timeoutMs = null, update = null, consistency = 'authoritative'} = {}) {
             if (!isArray(delegate) || delegate.length > 16) throw new Type('expected a bounded list of capabilities');
             let names = '';
             for (let i = 0; i < delegate.length; i++) {

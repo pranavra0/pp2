@@ -131,11 +131,13 @@ def prepare(binary, work, rendezvous):
     office_db = node["office"] / "peer.db"
     writer = pp2("peer", "issue", office_db, "settings", ids["client"], "writer", set_program)
     watch = pp2("peer", "issue", office_db, "settings", ids["office"], "reader", watch_program)
+    entry = pp2("peer", "issue-compute", office_db, ids["office"], watch_program)
     profile = json.loads((node["office"] / "profile.json").read_text())
     route = profile["routes"]["west"]
     install = json_file(work / "subscription.json", {
         "name": "watch-stock", "subscriptions": {"west": {
             "program": hash_array(watch_program), "watch_grant": hash_array(watch),
+            "entry_grant": hash_array(entry),
             "budget": {"timeout_ms": 3000, "calls": 1, "depth": 1},
             "expires_at_ms": time.time_ns() // 1_000_000 + 180_000,
             "capabilities": {"west": {**route, "peer": hash_array(ids["west"])}},
@@ -205,7 +207,7 @@ def exercise(binary, work, lab, run, launch, rendezvous, forged, wrong_address):
                for role in ROLES}
 
     def invoke():
-        return json.loads(run("office", "app", "invoke", node["client"], '{"sku":"lamp","viaWest":true}'))
+        return json.loads(run("office", "app", "invoke", node["client"], '{"sku":"lamp"}'))
 
     def delivery():
         status = run("office", "app", "status", node["office"] / "peer.db", "watch-stock")
@@ -225,7 +227,7 @@ def exercise(binary, work, lab, run, launch, rendezvous, forged, wrong_address):
     assert invoke()["value"]["total"] == 10
     change_minimum(0, 11)
     wait_for(delivery, lambda state: completed(state, 1))
-    print("Three independent networks completed a delegated query and an installed application delivery.", flush=True)
+    print("Three independent networks completed a federated query and an installed application delivery.", flush=True)
 
     forged(rendezvous, ids["east"])
     with (node["office"] / "profile.json").open() as file:
@@ -246,7 +248,7 @@ def exercise(binary, work, lab, run, launch, rendezvous, forged, wrong_address):
     change_minimum(1, 12)
     wait_for(delivery, lambda state: state["pending_revision"] == 2)
     lab.fail("office", "no authenticated route",
-             "app", "invoke", node["client"], '{"sku":"lamp","viaWest":true}')
+             "app", "invoke", node["client"], '{"sku":"lamp"}')
     lab.move_west()
     wait_for(delivery, lambda state: completed(state, 2))
     assert invoke()["value"]["total"] == 10

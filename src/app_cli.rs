@@ -59,7 +59,7 @@ pub(crate) struct ModuleSpec {
 #[serde(deny_unknown_fields)]
 struct Root {
     peer: String,
-    collection: String,
+    collection: Option<String>,
     module: String,
     capabilities: BTreeMap<String, Target>,
 }
@@ -68,7 +68,7 @@ struct Root {
 #[serde(deny_unknown_fields)]
 struct Target {
     peer: String,
-    collection: String,
+    collection: Option<String>,
     module: String,
     #[serde(default)]
     write: bool,
@@ -216,6 +216,16 @@ fn init(path: &Path, directory: &Path, stable: bool) -> Result<()> {
         budget,
     } = manifest;
     budget.validate()?;
+    if root.collection.is_some() && !root.capabilities.is_empty() {
+        return Err("an entry with capabilities must use a compute grant".into());
+    }
+    if root
+        .capabilities
+        .values()
+        .any(|target| target.collection.is_none() && target.write)
+    {
+        return Err("a compute grant cannot write".into());
+    }
     let mut packaged = BTreeMap::new();
     let mut pending = BTreeSet::new();
     for module in modules.keys() {
@@ -228,13 +238,15 @@ fn init(path: &Path, directory: &Path, stable: bool) -> Result<()> {
                 .map(|target| (&target.peer, &target.collection, &target.module)),
         )
     {
-        if peers
-            .get(peer)
-            .is_none_or(|spec| !spec.collections.contains_key(collection))
-            || !packaged.contains_key(module)
+        if peers.get(peer).is_none_or(|spec| {
+            collection
+                .as_ref()
+                .is_some_and(|name| !spec.collections.contains_key(name))
+        }) || !packaged.contains_key(module)
         {
             return Err(format!(
-                "unknown peer, collection or module for {peer}/{collection}/{module}"
+                "unknown peer, collection or module for {peer}/{}/{module}",
+                collection.as_deref().unwrap_or("(compute)")
             )
             .into());
         }
@@ -312,7 +324,10 @@ fn init(path: &Path, directory: &Path, stable: bool) -> Result<()> {
         }
         let mut store = PeerStore::open(directory.join(&root.peer).join("peer.db"))?;
         let program = packaged[&root.module].0;
-        let grant = store.issue(&root.collection, holder, Access::Read, Some(program))?;
+        let grant = match root.collection {
+            Some(collection) => store.issue(&collection, holder, Access::Read, Some(program))?,
+            None => store.issue_compute(holder, program)?,
+        };
         let mut routes = BTreeMap::new();
         for (name, target) in root.capabilities {
             let program = packaged[&target.module].0;
@@ -321,12 +336,11 @@ fn init(path: &Path, directory: &Path, stable: bool) -> Result<()> {
             } else {
                 Access::Read
             };
-            let grant = PeerStore::open(directory.join(&target.peer).join("peer.db"))?.issue(
-                &target.collection,
-                executor,
-                access,
-                Some(program),
-            )?;
+            let mut store = PeerStore::open(directory.join(&target.peer).join("peer.db"))?;
+            let grant = match target.collection {
+                Some(collection) => store.issue(&collection, executor, access, Some(program))?,
+                None => store.issue_compute(executor, program)?,
+            };
             routes.insert(
                 name,
                 Route {

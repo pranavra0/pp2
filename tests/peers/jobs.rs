@@ -150,22 +150,20 @@ fn autonomous_job_recovers_between_independently_administered_peers() {
     let mut b_store = PeerStore::open(path.join("b.db")).unwrap();
     let c_db = path.join("c.db");
     let mut c_store = PeerStore::open(&c_db).unwrap();
-    b_store
-        .create_collection("base", [Ok(("value".into(), Data::Int(6)))])
-        .unwrap();
     c_store
         .create_collection("counter", [Ok(("value".into(), Data::Int(10)))])
         .unwrap();
     let program_b = pack(
         &mut a_store,
         r#"
-        export default async ({storage, capabilities, evaluate}, input) => {
-            const local = await storage.get('value');
+        const local = 6;
+        export default async ({capabilities, evaluate, blocks, storage, resource}, input) => {
+            if (blocks || storage || resource) throw Error("unexpected resource");
             const remote = await evaluate(capabilities.remote, input, {
                 calls: input.calls ?? 0,
                 update: input.operation ? {revision: 0, operation: input.operation} : null,
             });
-            return {local: local.value, remote: remote.value};
+            return {local, remote: remote.value};
         }
     "#,
         BTreeSet::new(),
@@ -187,12 +185,8 @@ fn autonomous_job_recovers_between_independently_administered_peers() {
         BTreeSet::new(),
     );
     c_store.publish(program_c).unwrap();
-    let grant_b = b_store
-        .issue("base", a, Access::Read, Some(program_b))
-        .unwrap();
-    let other_grant = b_store
-        .issue("base", other, Access::Read, Some(program_b))
-        .unwrap();
+    let grant_b = b_store.issue_compute(a, program_b).unwrap();
+    let other_grant = b_store.issue_compute(other, program_b).unwrap();
     let grant_c = c_store
         .issue("counter", a, Access::Write, Some(program_c))
         .unwrap();
@@ -265,6 +259,23 @@ fn autonomous_job_recovers_between_independently_administered_peers() {
             BTreeMap::from([("remote".into(), binding)]),
         )
     };
+
+    b_store.create_collection("private", []).unwrap();
+    let private = b_store
+        .issue("private", a, Access::Read, Some(program_b))
+        .unwrap();
+    assert!(matches!(
+        submit(
+            &connect_b("a"),
+            private,
+            id,
+            &input,
+            binding.clone(),
+            budget,
+            expires
+        ),
+        Err(PeerError::Denied)
+    ));
 
     // C is unreachable at submission. A exits before B can execute the remote effect.
     drop(daemon_c);

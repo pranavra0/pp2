@@ -19,7 +19,7 @@ pub use effects::{
 };
 #[cfg(target_os = "linux")]
 pub use host::Directory;
-pub use host::{HostProvider, HostResource};
+pub use host::{Clock, HostProvider, HostResource};
 pub use native::{NativeInstallation, NativePackage, RequestedBinding, TerminalResult};
 pub use replication::{
     Consistency, ReplicaAccess, ReplicaStatus, ResourceMode, ResourceRevision, ResourceView,

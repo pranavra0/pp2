@@ -89,8 +89,7 @@ impl PeerStore {
         if graph.expires_at_ms - now > MAX_JOB_LIFETIME_MS {
             return Err(PeerError::Limit("job lifetime"));
         }
-        let authority = authorize(&tx, call)?;
-        require_kind(&tx, &authority.reference, true)?;
+        graph_kind(&tx, call)?.check_bindings(!bindings.is_empty())?;
         if !has_capacity(&tx, key.holder, now)? {
             return Err(if call.reaction {
                 PeerError::Busy

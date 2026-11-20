@@ -2,7 +2,7 @@
 
 **Write programs, not servers.**
 
-pp2 runs a function on the peer that owns a resource. The owner grants a particular peer access to the resource and can pin that access to specific code. The runtime authenticates peers, fetches verified code, and returns the result.
+Evaluate a program at a peer with explicit capabilities. The same runtime launches a local app, runs a query at the owner of private data, and combines results from several peers. Program and data blocks have content addresses. An immutable-root write commits the replacement and a retry receipt together.
 
 ## Try document search
 
@@ -20,6 +20,7 @@ pp2 run 'search budget'
 Review the install request before approving. Search returns `meeting.md` at index revision 1. The grant lets the indexer read the directory and write its index in pp2 storage.
 
 - [Search across two machines](docs/getting-started.md)
+- [Evaluate an ordered map locally and remotely](docs/applications.md#evaluate-over-an-immutable-root)
 - [Write and update an app](docs/applications.md)
 - [Operate a peer](docs/operations.md)
 - [Runtime design and limits](docs/architecture.md)

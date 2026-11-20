@@ -11,8 +11,9 @@ fn three_peers_enforce_delegation_budgets_and_cancel_a_descendant() {
     fs::write(
         &manifest,
         j!({
-            "root": {"peer":"root", "collection":"stock", "module":"stock", "capabilities":{
+            "root": {"peer":"root", "module":"stock", "capabilities":{
                 "west":{"peer":"west","collection":"stock","module":"stock"},
+                "relay":{"peer":"west","module":"stock"},
                 "east":{"peer":"east","collection":"stock","module":"stock","write":true}
             }},
             "budget":{"timeout_ms":4000,"calls":2,"depth":2},
@@ -32,15 +33,14 @@ fn three_peers_enforce_delegation_budgets_and_cancel_a_descendant() {
         temp.path().join("stock.mjs"),
         r#"
         export default async ({capabilities, storage, evaluate, evaluateAll}, input) => {
-            const {east, west} = capabilities;
+            const {east, west, relay} = capabilities;
             switch (input.task) {
             case 'get':
                 return (await storage.get('stock')).value;
             case 'nested':
-                return (await storage.get('stock')).value +
-                    (await evaluate(east, {task:'get'}, {calls: 0})).value;
+                return (await evaluate(east, {task:'get'}, {calls: 0})).value;
             case 'delegate':
-                return (await evaluate(west, {task:'nested'}, {
+                return (await evaluate(relay, {task:'nested'}, {
                     calls: 1, delegate: input.share ? [east] : [],
                 })).value;
             case 'forgery':
@@ -129,7 +129,7 @@ fn three_peers_enforce_delegation_budgets_and_cancel_a_descendant() {
     let program: Hash = serde_json::from_value(profile["program"].clone()).unwrap();
     let grant: Hash = serde_json::from_value(profile["grant"].clone()).unwrap();
     let client = Client::new(root.1, "pp2-root", &creds).unwrap();
-    let bindings: Vec<String> = vec!["west".into(), "east".into()];
+    let bindings: Vec<String> = vec!["west".into(), "east".into(), "relay".into()];
     let request = |grant, input, calls, depth, cancellation: Option<Cancellation>| {
         client.run_graph(
             GraphEvaluation {
@@ -165,9 +165,9 @@ fn three_peers_enforce_delegation_budgets_and_cancel_a_descendant() {
     assert_eq!(forged.value, json(j!({"error":"invalid"})));
     assert_eq!(forged.graph.remote_calls, 0);
     let delegated = request(grant, j!({"task":"delegate","share":true}), 2, 2, None).unwrap();
-    assert_eq!(delegated.value, direct.value);
+    assert_eq!(delegated.value, Data::Int(7));
     assert_eq!(delegated.graph.remote_calls, 2);
-    assert_eq!(delegated.graph.storage_effects, 2);
+    assert_eq!(delegated.graph.storage_effects, 1);
     assert!(delegated.graph.remote_request_bytes > 0);
     let id = Hash([42; 32]);
     let expires_at_ms = std::time::SystemTime::now()
@@ -205,7 +205,7 @@ fn three_peers_enforce_delegation_budgets_and_cancel_a_descendant() {
                 thread::sleep(Duration::from_millis(20));
             }
             JobStatus::Completed { value, graph, .. } => {
-                assert_eq!(value, direct.value);
+                assert_eq!(value, delegated.value);
                 assert_eq!(graph.remote_calls, 2);
                 break;
             }

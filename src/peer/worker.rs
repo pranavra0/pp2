@@ -28,6 +28,9 @@ pub(super) enum WorkContext {
 pub(super) struct Guest {
     pub bindings: Vec<String>,
     pub write: bool,
+    pub indexed: bool,
+    pub root: Option<Hash>,
+    pub merge_heads: Vec<(Hash, Hash)>,
     pub resource: bool,
     pub revision: u64,
     pub view: ResourceView,

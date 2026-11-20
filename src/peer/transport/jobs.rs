@@ -215,8 +215,9 @@ impl Server {
             return Err(PeerError::Limit("job lifetime"));
         }
         let call = job.call(holder, reaction, self.network.as_ref().map(PeerNetwork::id))?;
-        store.confirm_collection(call)?;
+        let kind = store.graph_kind(call)?;
         let bindings = self.graph.resolve(call, job.bindings.clone())?;
+        kind.check_bindings(!bindings.is_empty())?;
         let code = self.receive_code(stream, store, call)?;
         if !code[0].1.starts_with(content::MAGIC) {
             return Err(PeerError::Value(
@@ -295,7 +296,7 @@ impl Server {
                 self.network.as_ref().map(PeerNetwork::id),
             )?;
             call = Some(invocation);
-            store.confirm_collection(invocation)?;
+            store.graph_kind(invocation)?;
             let attempt = Rc::new(Attempt::new(
                 key,
                 PeerStore::open_with_timeout(&self.database, POLL)?,

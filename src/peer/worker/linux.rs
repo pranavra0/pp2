@@ -450,9 +450,20 @@ fn evaluate_javascript(
                     let rpc = Function::new(ctx.clone(), move |args: Array| {
                         exchange_effect(args, &idle)
                     })?;
-                    let names = serde_json::to_string(&guest.bindings)
-                        .expect("binding names are JSON strings");
-                    let api: Array = setup.call((rpc, ctx.json_parse(names)?, guest.write, guest.resource, guest.revision.to_string(), ctx.json_parse(guest.view.to_json().to_string())?))?;
+                    let heads: Vec<_> = guest.merge_heads.iter().map(|(id, root)| {
+                        serde_json::json!({"revision": id.to_string(), "root": root.to_string()})
+                    }).collect();
+                    let options = serde_json::json!({
+                        "names": guest.bindings,
+                        "writeStorage": guest.write,
+                        "hasResource": guest.resource,
+                        "revision": guest.revision.to_string(),
+                        "view": guest.view.to_json(),
+                        "indexed": guest.indexed,
+                        "root": guest.root.map(|hash| hash.to_string()),
+                        "mergeHeads": heads,
+                    });
+                    let api: Array = setup.call((rpc, ctx.json_parse(options.to_string())?))?;
                     replacer = api.get(1)?;
                     Some((api.get::<Value>(0)?, api.get::<Function>(2)?))
                 }
@@ -599,6 +610,21 @@ fn exchange_effect(args: Array<'_>, waiting: &Cell<Duration>) -> rquickjs::Resul
                         .collect::<Result<_>>()?,
                 )
             }
+            "readBlock" => Effect::ReadBlock(key.parse()?),
+            "writeBlock" => {
+                if aux.len() > 128 * 65 {
+                    return Err(PeerError::Limit("block children"));
+                }
+                let children = if aux.is_empty() {
+                    Vec::new()
+                } else {
+                    aux.split(',')
+                        .map(str::parse)
+                        .collect::<crate::Result<_>>()?
+                };
+                Effect::WriteBlock(data(&payload)?, children)
+            }
+            "setRoot" => Effect::SetRoot(key.parse()?),
             "get" => Effect::Get(key),
             "scan" => Effect::Scan(Scan {
                 prefix: key,

@@ -6,7 +6,7 @@ use crate::peer::{
     effects::{self, BoundCapability, Effect, GraphBindings, GraphJob, Remote, Scope},
     native::{self, STATE, Terminal},
     protocol::{Forward, JobState, Submission},
-    storage::GraphAccess,
+    storage::{GraphAccess, StageKind},
     unix_ms,
     worker::Guest,
 };
@@ -186,7 +186,7 @@ impl Configuration {
 }
 
 impl Client {
-    /// Runs JavaScript against one indexed reference with explicitly supplied capabilities.
+    /// Evaluates JavaScript with a program grant and explicitly supplied capabilities.
     pub fn run_graph(
         &self,
         request: GraphEvaluation<'_>,
@@ -520,7 +520,7 @@ impl Invocation<'_> {
         scope: &mut Scope,
         mut active: Activity,
     ) -> Result<Vec<u8>> {
-        self.packages.confirm_collection(self.call)?;
+        self.packages.confirm_access(self.call)?;
         let mut budget = scope.allocate(&remote)?;
         if let Some(timeout) = remote.timeout_ms {
             active.deadline = active
@@ -538,8 +538,7 @@ impl Invocation<'_> {
         if state && !leaf {
             return Err(PeerError::Denied);
         }
-        let local =
-            self.native && leaf && self.routes[&remote.target].binding.peer == self.server.identity;
+        let local = leaf && self.routes[&remote.target].binding.peer == self.server.identity;
         if local {
             let (_, job) = self.prepare(&remote, budget, expiry, &active)?;
             let holder = if state {
@@ -552,7 +551,13 @@ impl Invocation<'_> {
                 false,
                 self.server.network.as_ref().map(PeerNetwork::id),
             )?;
-            let code = NativePackage::load_program(job.program, |hash| self.packages.get(hash))?;
+            let code = NativePackage::load_program(job.program, |hash| {
+                if self.native {
+                    self.packages.get(hash)
+                } else {
+                    self.packages.executable(holder, hash)
+                }
+            })?;
             let (receipt, metrics) = self.server.execute_graph(
                 &mut self.packages,
                 call,
@@ -612,16 +617,13 @@ impl Invocation<'_> {
         for read in &reads {
             remaining.allocate(read)?;
         }
-        let results = if durable.is_some() || self.native || self.call.update.is_some() {
+        let results = if let Some(attempt) = durable {
             reads
                 .into_iter()
-                .map(|read| match durable {
-                    Some(attempt) => self.invoke_durable(read, scope, active.clone(), attempt),
-                    None => self.invoke(read, scope, active.clone()),
-                })
+                .map(|read| self.invoke_durable(read, scope, active.clone(), attempt))
                 .collect::<Result<Vec<_>>>()?
         } else {
-            self.packages.confirm_collection(self.call)?;
+            self.packages.confirm_access(self.call)?;
             active.check()?;
             let budget = scope.budget;
             *scope = remaining;
@@ -629,6 +631,7 @@ impl Invocation<'_> {
             let call = self.call;
             let deadline = active.deadline;
             let invocation = active.invocation;
+            let native = self.native;
             let results = thread::scope(|threads| {
                 let workers = reads
                     .into_iter()
@@ -657,7 +660,7 @@ impl Invocation<'_> {
                                     active.storage_wait()?,
                                 )?,
                                 call,
-                                native: false,
+                                native,
                                 metrics: GraphMetrics::default(),
                             };
                             let value = invocation.invoke(read, &mut scope, active);
@@ -698,7 +701,7 @@ impl Invocation<'_> {
         active: Activity,
         attempt: &Attempt,
     ) -> Result<Vec<u8>> {
-        self.packages.confirm_collection(self.call)?;
+        self.packages.confirm_access(self.call)?;
         let budget = jobs::child_budget(scope.allocate(&remote)?, remote.timeout_ms);
         self.metrics.remote_calls += 1;
         let ordinal = attempt.effects.get() + 1;
@@ -962,6 +965,51 @@ impl Client {
 }
 
 impl Server {
+    /// Evaluates as this server's identity with the same grant and budget checks as a peer request.
+    pub fn evaluate_local(&self, request: GraphEvaluation<'_>) -> Result<GraphReport> {
+        let started = Instant::now();
+        let job = request.job(GraphBindings::Local(request.bindings.to_vec()), None)?;
+        let active =
+            Activity::new(started + Duration::from_millis(u64::from(job.budget.timeout_ms)));
+        let call = job.call(
+            self.identity,
+            false,
+            self.network.as_ref().map(PeerNetwork::id),
+        )?;
+        let mut store = PeerStore::open_with_timeout(&self.database, active.storage_wait()?)?;
+        let bindings = self.graph.resolve(call, job.bindings)?;
+        let (receipt, graph) =
+            if let Some(receipt) = store.probe_graph(call, !bindings.is_empty())? {
+                (receipt, GraphMetrics::default())
+            } else {
+                let code = content::load_code(job.program, false, |hash| {
+                    active.check()?;
+                    match store.get(hash)? {
+                        Some(bytes) => Ok(Some(bytes)),
+                        None => request.evaluation.package_block(hash),
+                    }
+                })?;
+                self.execute_graph(
+                    &mut store,
+                    call,
+                    code,
+                    job.input,
+                    bindings,
+                    active,
+                    Execution::Synchronous,
+                )?
+            };
+        Ok(GraphReport {
+            revision: receipt.revision,
+            view: receipt.view,
+            value: Data::from_bytes(&receipt.value)?,
+            elapsed_us: protocol::elapsed_us(started),
+            request_bytes: 0,
+            response_bytes: 0,
+            graph,
+        })
+    }
+
     /// Sends one terminal event to the installed program in a local, isolated worker.
     /// Remote calls use the same graph protocol as a network-initiated invocation.
     pub fn run_native(&self, id: Hash, line: &str) -> Result<(TerminalResult, GraphMetrics)> {
@@ -1029,7 +1077,7 @@ impl Server {
         stream.sock.check_active()?;
         let call = job.call(holder, false, self.network.as_ref().map(PeerNetwork::id))?;
         let bindings = self.graph.resolve(call, job.bindings)?;
-        if let Some(receipt) = store.probe_collection(call)? {
+        if let Some(receipt) = store.probe_graph(call, !bindings.is_empty())? {
             return Ok(graph_reply(receipt, GraphMetrics::default()));
         }
         let code = self.receive_code(stream, store, call)?;
@@ -1120,6 +1168,15 @@ impl Server {
             Execution::Durable(attempt) => (Some(attempt), None),
             Execution::Terminal(event) => (None, Some(event)),
         };
+        trace.stage = "storage_open";
+        let started = Instant::now();
+        let mut storage = match store.scoped(call, active.storage_wait()?)? {
+            EvaluationStart::Ready(storage) => storage,
+            EvaluationStart::Replayed(receipt) => return Ok((receipt, GraphMetrics::default())),
+        };
+        if event.is_none() {
+            storage.kind().check_bindings(!bindings.is_empty())?;
+        }
         let mut invocation = if bindings.is_empty() {
             None
         } else {
@@ -1131,12 +1188,6 @@ impl Server {
                 native: event.is_some(),
                 metrics: GraphMetrics::default(),
             })
-        };
-        trace.stage = "storage_open";
-        let started = Instant::now();
-        let storage = match store.scoped(call, active.storage_wait()?)? {
-            EvaluationStart::Ready(storage) => storage,
-            EvaluationStart::Replayed(receipt) => return Ok((receipt, GraphMetrics::default())),
         };
         trace.storage_open_us = protocol::elapsed_us(started);
         let persisted = if event.is_none() {
@@ -1168,7 +1219,7 @@ impl Server {
         let confirm_host = || -> Result<()> {
             active.check()?;
             if let Some(authority) = &authority {
-                authority.confirm_collection(call)?;
+                authority.confirm_access(call)?;
             }
             Ok(())
         };
@@ -1188,6 +1239,9 @@ impl Server {
                 context: WorkContext::Graph(Guest {
                     bindings: scope.bindings.clone(),
                     write: call.update.is_some(),
+                    indexed: storage.kind() == StageKind::Indexed && event.is_none(),
+                    root: storage.root(),
+                    merge_heads: storage.merge_heads().to_vec(),
                     resource: resource.is_some(),
                     revision: storage.revision(),
                     view: storage.view().clone(),
@@ -1226,13 +1280,14 @@ impl Server {
                             confirm_host()?;
                             value?.to_bytes()?
                         }
-                        storage_effect => {
+                        storage_effect if event.is_none() => {
                             storage_effects += 1;
                             let started = Instant::now();
                             let result = storage.effect(storage_effect);
                             storage_us += started.elapsed().as_micros() as u64;
                             result?
                         }
+                        _ => return Err(PeerError::Denied),
                     };
                 effects::check_response(&bytes)?;
                 Ok(bytes)
@@ -1268,7 +1323,7 @@ impl Server {
             if let Some(view) = &receipt.view {
                 store.confirm(call, view)?;
             } else {
-                store.confirm_collection(call)?;
+                store.confirm_access(call)?;
             }
             active.check()?;
         }

@@ -1,5 +1,5 @@
 export default async function warehouse(pp2, {sku}) {
-    const {storage, capabilities, evaluate} = pp2;
+    const {storage} = pp2;
     if (typeof sku !== 'string' || !/^[a-z0-9-]{1,64}$/.test(sku)) {
         throw new Error('expected a product SKU');
     }
@@ -13,10 +13,5 @@ export default async function warehouse(pp2, {sku}) {
         after = page.next;
     } while (after !== null);
 
-    if (capabilities.east) {
-        const east = await evaluate(capabilities.east, {sku}, {calls: 0});
-        return [total, ...east.value];
-    }
-
-    return [total];
+    return total;
 }

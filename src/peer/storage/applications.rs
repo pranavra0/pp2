@@ -176,7 +176,12 @@ impl PeerStore {
             let watch = subscription_grant(&tx, holder, spec.watch_grant, spec.program)?;
             let entry_grant = spec.entry_grant.unwrap_or(spec.watch_grant);
             let entry = subscription_grant(&tx, holder, entry_grant, spec.program)?;
-            require_kind(&tx, &entry.reference, true)?;
+            if entry.reference != COMPUTE_REF && !spec.capabilities.is_empty() {
+                return Err(PeerError::Denied);
+            }
+            if watch.reference == COMPUTE_REF {
+                return Err(PeerError::Denied);
+            }
             let code = load_code(spec.program, false, |hash| get(&tx, hash, false))?;
             if !code[0].1.starts_with(content::MAGIC) {
                 return Err(PeerError::Value("subscriptions require JavaScript".into()));

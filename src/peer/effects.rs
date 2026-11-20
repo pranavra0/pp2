@@ -102,6 +102,9 @@ pub(super) enum Effect {
     Delete(String),
     Host(String, Vec<u8>),
     EvaluateBatch(Vec<Remote>),
+    ReadBlock(Hash),
+    WriteBlock(Vec<u8>, Vec<Hash>),
+    SetRoot(Hash),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -160,6 +163,13 @@ impl Effect {
                     if read.update.is_some() || read.allowance != 0 || !read.delegate.is_empty() {
                         return Err(PeerError::Denied);
                     }
+                }
+                Ok(())
+            }
+            Self::ReadBlock(_) | Self::SetRoot(_) => Ok(()),
+            Self::WriteBlock(value, children) => {
+                if value.len() > MAX_EFFECT_BYTES || children.len() > 128 {
+                    return Err(PeerError::Limit("block payload or children"));
                 }
                 Ok(())
             }

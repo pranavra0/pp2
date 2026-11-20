@@ -1,5 +1,4 @@
-export default async function sum({storage, capabilities, evaluate}, key) {
-    const local = await storage.get(key);
+export default async function sum({capabilities, evaluate}, {key, local}) {
     const remote = await evaluate(capabilities.remote, key, {calls: 0});
-    return local.value + remote.value;
+    return local + remote.value;
 }

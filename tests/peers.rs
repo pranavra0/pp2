@@ -129,3 +129,5 @@ mod execution;
 mod identity;
 #[path = "peers/jobs.rs"]
 mod jobs;
+#[path = "peers/roots.rs"]
+mod roots;

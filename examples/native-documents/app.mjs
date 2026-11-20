@@ -10,6 +10,7 @@ function results(paths, revision, cache = false) {
 
 export default async function app({call, capabilities, evaluate, resource, storage}, input) {
     if (resource === null) {
+        if (input.type === 'cache-read') return storage.get(input.key);
         await storage.put(input.key, input.result);
         return true;
     }
@@ -43,14 +44,15 @@ export default async function app({call, capabilities, evaluate, resource, stora
         });
     } catch (error) {
         if (!offline.has(error.code)) return response('Search failed · ' + error.message);
-        const cached = await storage.get(key);
+        const {value: cached} = await evaluate(capabilities.state, {type: 'cache-read', key}, options);
         if (!cached.found) return response('Documents are offline. This query has no cached result.');
         return results(cached.value.value, cached.value.revision, true);
     }
     try {
-        await evaluate(capabilities.state, {key, result}, {
+        const current = await evaluate(capabilities.state, {type: 'cache-read', key}, options);
+        await evaluate(capabilities.state, {type: 'cache-write', key, result}, {
             calls: 0,
-            update: {revision: storage.revision, operation: event.id},
+            update: {revision: current.revision, operation: event.id},
         });
     } catch (error) {
         return response(...results(result.value, result.revision).lines, 'Cache write failed · ' + error.message);

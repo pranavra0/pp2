@@ -1,16 +1,17 @@
 {
   "root": {
     "peer": "office",
-    "collection": "settings",
     "module": "stock",
     "capabilities": {
+      "minimum": {"peer": "office", "collection": "settings", "module": "minimum"},
       "west": {"peer": "west", "collection": "stock", "module": "warehouse"},
       "east": {"peer": "east", "collection": "stock", "module": "warehouse"}
     }
   },
-  "budget": {"timeout_ms": 4000, "calls": 2, "depth": 2},
+  "budget": {"timeout_ms": 4000, "calls": 3, "depth": 1},
   "modules": {
     "stock": {"source": "stock.mjs"},
+    "minimum": {"source": "minimum.mjs"},
     "warehouse": {"source": "warehouse.mjs"}
   },
   "peers": {

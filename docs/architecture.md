@@ -4,7 +4,9 @@
 
 Each mutually authenticated TLS 1.3 connection serves one operation. A grant binds a holder and reference to read or write access and can pin one immutable program. Delegation can only narrow access, to depth eight. Revocation deletes descendant grants and their receipts in one transaction.
 
-A snapshot read sees one immutable state block. An indexed read holds one SQLite snapshot. The peer rechecks authorization before releasing either result. Writes guard the expected revision. Snapshot writers return `{next, value}`. Indexed writers change rows inside the transaction. State, revision, and retry receipt commit together.
+A graph invocation evaluates a content-addressed module and immutable input under one grant. The same graph engine runs local, authenticated remote, and durable invocations. A compute grant pins a program and carries no storage authority. A resource grant selects a snapshot root, indexed collection, or host resource. Each resource stage runs at its authorized peer and completes before its caller receives a result.
+
+An immutable block read starts at the selected root. A successful read exposes its child addresses to that invocation. A write can add immutable blocks pointing to already visible blocks and select a replacement root. Indexed stages hold one SQLite snapshot and can change rows in an update. The owner rechecks read authority before release. The expected revision guards writes. The root or row changes, revision, event, and retry receipt commit together.
 
 Retry an ambiguous update with the same grant, program, input, expected revision, and operation ID. A matching receipt returns the original result. Changed arguments under an existing ID fail. Receipts survive 1,024 revisions while the grant is live. Older outcomes require reconciliation through application state. The `peer delegate` command issues a new grant on each success. Graph attenuation replays the same live grant for identical requests.
 
@@ -24,9 +26,9 @@ The directory holds 64 identities and a lease carries up to four direct addresse
 
 ## Guest effects and placement
 
-A graph runs one program against an indexed reference at a selected peer. Bindings resolve against the caller, entry grant, and program. Peers can also attach recipient-bound grants. The guest gets opaque invocation-local handles.
+A compute stage can orchestrate named evaluations. Its entry grant selects the program. Bindings resolve against the caller, entry grant, and program. A resource stage cannot accept outbound bindings. It can return values for an orchestrator to supply as input to the next stage. The terminal stage receives a UI capability and invokes its private state using a separate local stage. Peers can also attach recipient-bound grants. The guest gets opaque invocation-local handles.
 
-To pass a handle to a child via `pp2.evaluate`, the executor asks the issuer to narrow it to the child identity, program, access, budget, and expiry. The destination checks holder, presenter, lineage, and limits. Each call consumes one call plus its descendant allowance, even on failure. A branch can shorten its deadline.
+To pass a handle to a child via `pp2.evaluate`, the executor asks the issuer to narrow it to the child identity, program, access, budget, and expiry. The destination checks holder, presenter, lineage, and limits. Each call consumes one call plus its descendant allowance, even on failure. A branch can shorten its deadline. Synchronous leaf reads can run in parallel. A leaf at the current peer uses the local execution path. Durable batches journal their children in order.
 
 Limits are 16 remote calls, four remote levels, 16 bindings, eight seconds per attempt, 128 effects, and four leaf reads per batch. Guest promises enqueue effects in order. Returning with unsettled effects fails. An update is a leaf and commits at its destination. Later graph failures leave committed effects in place.
 
@@ -40,7 +42,7 @@ The submitter can query or cancel. A cancellation that commits first prevents lo
 
 ## Persistent applications
 
-The daemon installs subscriptions for its own identity. Each has program-pinned read-only watch and entry grants, named remote grants, a budget, expiry, and a delivery cursor. The entry defaults to the watch grant and selects an indexed collection. Installation pins the verified handler graph.
+The daemon installs subscriptions for its own identity. Each has program-pinned read-only watch and entry grants, named remote grants, a budget, expiry, and a delivery cursor. The entry defaults to the watch grant. A handler with outbound capabilities uses a separate compute entry grant. To read watched data, that handler invokes a resource stage with a pinned read grant. Installation pins the verified handler graph.
 
 Reference creation and revision advances log an event in the same transaction. Receipt replay produces no new event. Events carry a stable ID, reference, and revision. A subscription starts at the current revision and reads the collection snapshot for each attempt. To recover values from a specific revision, store them under an immutable revision key during the original update.
 
@@ -54,6 +56,8 @@ Revoking a watch or entry grant disables affected subscriptions and cancels loca
 
 An indexed reference can carry a provider name and private config. Register it with `Server::with_host_provider` and create it through `PeerStore::create_host_resource` or `share_host_resource`. The latter also issues a pinned grant. Guests call read-only provider operations with `pp2.call(pp2.resource, operation, input)`. Reads can repeat on retry.
 
+The clock provider returns epoch milliseconds through `call(resource, 'unixMillis')`. Create a clock reference with `pp2 peer clock-init` and issue a read grant pinned to its consumer.
+
 Authority is rechecked before and after provider reads, at checkpoints, and before result release. Write transactions serialize with grant revocation. The Linux directory provider pins root device, inode, and creation time. Scoped `openat2` lookups stay beneath a verified descriptor without symlinks or mount crossings. File reads require a pinned regular file with one link. Successive calls can see different filesystem versions.
 
 - `list({path, after, limit})` returns up to 64 sorted UTF-8 entries as name/type pairs and a cursor. It examines at most 4,096 entries. An empty path selects the root.
@@ -66,7 +70,7 @@ A `PPA1` package names an entry point, graph budget, and requests. Its hash cove
 
 Installation creates a stable ID, private collection, and local program-pinned read and write grants. Bindings connect explicit issuer grants to approved requests. An atomic update preserves state and keeps bindings for identical requests. Updates and binding changes renew local grants. Removal revokes local grants and deletes private state and bindings. Issuers control their own grants.
 
-The terminal provides `{type: "line", id, text}` via its `event` operation, up to 4 KiB. The event ID can key an update. The app returns up to 64 lines and 16 KiB. The launcher escapes controls. The reserved `state` binding invokes the entry as a local leaf without a terminal resource. A native leaf bound to the local peer also runs directly under its grant.
+The terminal provides `{type: "line", id, text}` via its `event` operation, up to 4 KiB. The event ID can key an update. The app returns up to 64 lines and 16 KiB. The launcher escapes controls. The reserved `state` binding invokes the entry as a local storage leaf. It can return a value and revision for a subsequent update. A native leaf bound to the local peer also runs directly under its grant.
 
 ## Storage and distribution
 
@@ -74,7 +78,7 @@ SQLite uses WAL, synchronous FULL, and a 65,536-page main-file cap. Writers seri
 
 Blocks use SHA-256 addresses. References and publication require complete Merkle graphs. Garbage collection traces references, publications, active job inputs and programs, subscription programs, and verified or pending replica history. Unreachable blocks and cache entries are removed together.
 
-Public fetch serves published hashes. Publish dependencies as well as root modules. An authorized caller can supply code restricted to the declared import graph, and the peer caches it by holder. The receiver verifies hash and format. On a cache miss it can consult discovered sources, LAN first, with up to 64 attempts inside the deadline.
+Public fetch serves explicitly published hashes. `pp2 peer publish DB HASH --graph` checks every descendant before publishing the graph in one transaction. `peer fetch-graph` and `peer find-graph` verify and cache a complete graph of up to 256 blocks and 16 MiB. Discovery allows up to 64 fetch attempts per graph. A fetched graph is cache data until publication or a reference retains it. An authorized caller can supply code restricted to the declared import graph, and the peer caches it by holder. The receiver verifies hash and format. On a cache miss it can consult discovered sources, LAN first, with up to 64 attempts inside the deadline.
 
 ## Replicated resources
 
@@ -86,7 +90,7 @@ A shared reference has a stable resource ID and signed revisions containing stat
 | Single writer | Authoritative, replica, exact revision | Owner only |
 | Multi-writer | Replica, exact revision | Owner and approved writers, including offline |
 
-Replica reads select the lowest accepted head ID and report all heads. Exact reads select a retained accepted revision. With multiple heads, a writer must explicitly merge at the current local revision. The merge records every current head as a parent. Later arrivals can create new branches. Timestamps never select a winner. Resource views expose the mode, consistency, selected revision, and heads in guest and caller results.
+Replica reads select the lowest accepted head ID and report all heads. Exact reads select a retained accepted revision. With multiple heads, a writer must explicitly merge at the current local revision. Immutable-block merge stages can read every current head through `blocks.heads` and must call `blocks.setRoot` to select the result. The merge records every current head as a parent. Later arrivals can create new branches. Timestamps never select a winner. Resource views expose the mode, consistency, selected revision, and heads in guest and caller results.
 
 The owner signs placement policies for stable identities. A placement permits storage and can also allow local reads or writes and pin a program. Execution also requires a local holder-bound grant. A store-only placement trusts the host operator with plaintext.
 
@@ -110,7 +114,7 @@ When a full transfer encounters a pruned payload, a follower can fetch proofs an
 
 ## TypeScript, JavaScript, and binary programs
 
-JavaScript defaults to `(state, input)` for snapshots or `(pp2, input)` for collections. The function may return a promise. The boundary accepts null, booleans, safe integers, text, lists, and records with bounded size and depth. Snapshot updates return `{next, value}`.
+A graph program exports `(pp2, input)`. The entry may return a promise. The value boundary accepts null, booleans, safe integers, text, lists, and records with bounded size and depth. The direct snapshot interface also supports `(state, input)` and updates returning `{next, value}`.
 
 TypeScript compiles during packaging with strict ES2022. Runtime imports link to explicit hashes. Use `SPECIFIER=HASH` for TypeScript or declare a JavaScript `pp2:HASH` import and pass its hash to pack. A `PPJ1` module records source and sorted import hashes. Guests get fresh QuickJS contexts without `Date`, `Math.random`, or shared memory. Runtime errors identify emitted module locations by hash.
 
@@ -136,17 +140,7 @@ The 40-query loopback run searched 64 documents (121,648 body bytes). Both imple
 
 ## Three-peer graph measurements
 
-The benchmark uses Linux network namespaces, 20,032 entries per warehouse, and 32 matches per query. The 40-sample run included fresh TLS per edge and used a warm page cache.
-
-| Implementation | Median | p95 | Application bytes |
-| --- | --- | --- | --- |
-| SQLite in process | 1.88 ms | 2.20 ms | — |
-| Conventional mTLS, serial | 14.46 ms | 16.61 ms | 206 B |
-| pp2, serial | 26.13 ms | 29.19 ms | 579 B |
-| Conventional mTLS, parallel | 11.07 ms | 12.24 ms | 222 B |
-| pp2, parallel | 19.87 ms | 21.63 ms | 579 B |
-
-Set `PP2_TRACE_GRAPH=1` or pass `--trace-dir` to the benchmark. Stderr JSON links client and peer timing by TLS invocation ID, and durable work by job ID. It includes timing, failures, and memory metadata. [Graph benchmark](../scripts/benchmark-graph.py)
+The benchmark checks that serial and parallel warehouse stages return the same result through two remote calls. Each warehouse held 20,032 rows and returned a total over 32 matches. Across 40 samples in separate Linux network namespaces, pp2 took a median of 33.48 ms serially and 20.95 ms in parallel, with 565 median application bytes including the entry call. Use `--isolated-networks` to reproduce the topology. Set `PP2_TRACE_GRAPH=1` or pass `--trace-dir` to record peer timing, failures, and memory by invocation and job ID. [Graph benchmark](../scripts/benchmark-graph.py)
 
 ## Operational validation
 

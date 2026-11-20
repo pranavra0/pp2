@@ -1,6 +1,6 @@
 use crate::Data;
 
-use super::Result;
+use super::{PeerError, Result, unix_ms};
 
 #[cfg(target_os = "linux")]
 mod directory;
@@ -24,4 +24,36 @@ pub trait HostProvider: Send + Sync {
         input: Data,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Data>;
+}
+
+/// Reads the owning peer's wall clock through an explicit host resource.
+pub struct Clock;
+
+impl Clock {
+    pub const PROVIDER: &str = "clock";
+
+    pub fn resource() -> HostResource {
+        HostResource {
+            provider: Self::PROVIDER.into(),
+            configuration: Data::Nil,
+        }
+    }
+}
+
+impl HostProvider for Clock {
+    fn read(
+        &self,
+        configuration: &Data,
+        operation: &str,
+        input: Data,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Data> {
+        if *configuration != Data::Nil || operation != "unixMillis" || input != Data::Nil {
+            return Err(PeerError::Denied);
+        }
+        check()?;
+        i64::try_from(unix_ms())
+            .map(Data::Int)
+            .map_err(|_| PeerError::Limit("clock timestamp"))
+    }
 }

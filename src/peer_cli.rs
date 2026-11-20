@@ -29,17 +29,21 @@ const USAGE: &str = "Usage: pp2 peer <command>
   identity IDENTITY_KEY
   connect NODE_DIRECTORY PEER_ID[@ADDRESS] OPERATION [OPERATION_ARGS ...]
   find NODE_DIRECTORY DB HASH [--publish]
+  find-graph NODE_DIRECTORY DB HASH [--publish]
   find-program NODE_DIRECTORY DB HASH [--publish]
   fingerprint CERT
   pack SOURCE OUTPUT [HASH | SPECIFIER=HASH ...]
   put DB BLOCK [--publish]
-  publish DB HASH
+  publish DB HASH [--graph]
   unpublish DB HASH
   fetch DB ADDRESS NAME CA CERT KEY HASH
+  fetch-graph DB ADDRESS NAME CA CERT KEY HASH [--publish]
   fetch-program DB ADDRESS NAME CA CERT KEY HASH [--publish]
   ref-init DB REFERENCE JSON_FILE
   collection-init DB REFERENCE [ENTRIES_NDJSON]
+  clock-init DB REFERENCE
   issue DB REFERENCE PEER_ID|HOLDER_CERT reader|writer [PROGRAM]
+  issue-compute DB PEER_ID|HOLDER_CERT PROGRAM
   issue-reaction-writer DB REFERENCE PEER_ID|HOLDER_CERT PROGRAM
   delegate ADDRESS NAME CA CERT KEY GRANT PEER_ID|HOLDER_CERT reader|writer [PROGRAM]
   attenuate ADDRESS NAME CA CERT KEY GRANT PEER_ID|HOLDER_CERT reader|writer PROGRAM BUDGET_JSON EXPIRES_AT_MS
@@ -48,6 +52,7 @@ const USAGE: &str = "Usage: pp2 peer <command>
   read DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE
   update DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE REVISION OPERATION
   replica-read|revision-read|replica-update DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE [REVISION_ID | REVISION OPERATION [--merge]]
+  graph-local NODE_DIRECTORY DB GRANT PROGRAM JSON_FILE BUDGET_JSON [--update REVISION OPERATION]
   graph-read DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON [CAPABILITY ...]
   graph-update DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON REVISION OPERATION
   graph-replica-read|graph-revision-read|graph-replica-update DB|- ADDRESS NAME CA CERT KEY GRANT PROGRAM JSON_FILE BUDGET_JSON [REVISION_ID | REVISION OPERATION [--merge]]
@@ -71,6 +76,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
         let mut args = vec![*command];
         let operands = match *command {
             "fetch"
+            | "fetch-graph"
             | "fetch-program"
             | "read"
             | "update"
@@ -137,7 +143,7 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
         ["identity-new", key] => println!("{}", PeerIdentity::generate(key)?),
         ["identity", key] => println!("{}", PeerIdentity::load(key)?.id()),
         [
-            command @ ("find" | "find-program"),
+            command @ ("find" | "find-program" | "find-graph"),
             directory,
             db,
             hash,
@@ -146,19 +152,23 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
             let mut cache = PeerStore::open(db)?;
             let network = network(Path::new(directory))?;
             let hash = hash.parse()?;
-            if *command == "find-program" {
-                for hash in Client::fetch_discovered_program(&mut cache, &network, hash)? {
-                    if !flags.is_empty() {
-                        cache.publish(hash)?;
-                    }
-                    println!("{hash}");
+            let hashes = match *command {
+                "find-graph" => Client::fetch_discovered_graph(&mut cache, &network, hash)?,
+                "find-program" => Client::fetch_discovered_program(&mut cache, &network, hash)?,
+                _ => {
+                    Client::fetch_discovered(&mut cache, &network, hash)?;
+                    vec![hash]
                 }
-            } else {
-                let bytes = Client::fetch_discovered(&mut cache, &network, hash)?;
-                if !flags.is_empty() {
+            };
+            if !flags.is_empty() {
+                if *command == "find" {
                     cache.publish(hash)?;
+                } else {
+                    cache.publish_graph(hash)?;
                 }
-                println!("{} bytes", bytes.len());
+            }
+            for hash in hashes {
+                println!("{hash}");
             }
         }
         ["fingerprint", cert] => println!("{}", Credentials::fingerprint(cert)?),
@@ -209,6 +219,7 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
             println!("{hash}");
         }
         ["publish", db, hash] => PeerStore::open(db)?.publish(hash.parse()?)?,
+        ["publish", db, hash, "--graph"] => PeerStore::open(db)?.publish_graph(hash.parse()?)?,
         ["unpublish", db, hash] => println!("{}", PeerStore::open(db)?.unpublish(hash.parse()?)?),
         ["fetch", db, address, name, ca, cert, key, hash] => {
             let client = client(address, name, ca, cert, key)?;
@@ -216,7 +227,7 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
             println!("{} bytes", bytes.len());
         }
         [
-            "fetch-program",
+            command @ ("fetch-graph" | "fetch-program"),
             db,
             address,
             name,
@@ -226,13 +237,18 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
             hash,
             flags @ ..,
         ] if matches!(flags, [] | ["--publish"]) => {
-            let mut store = PeerStore::open(db)?;
-            let client = client(address, name, ca, cert, key)?;
-            let hashes = Client::fetch_program(&mut store, &[client], hash.parse()?)?;
+            let mut cache = PeerStore::open(db)?;
+            let sources = [client(address, name, ca, cert, key)?];
+            let root = hash.parse()?;
+            let hashes = if *command == "fetch-graph" {
+                Client::fetch_graph(&mut cache, &sources, root)?
+            } else {
+                Client::fetch_program(&mut cache, &sources, root)?
+            };
+            if !flags.is_empty() {
+                cache.publish_graph(root)?;
+            }
             for hash in hashes {
-                if !flags.is_empty() {
-                    store.publish(hash)?;
-                }
                 println!("{hash}");
             }
         }
@@ -244,6 +260,9 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
             let file = entries.first().map(File::open).transpose()?;
             crate::app_cli::seed(&mut PeerStore::open(db)?, reference, file)?;
         }
+        ["clock-init", db, reference] => {
+            PeerStore::open(db)?.create_host_resource(reference, pp2::peer::Clock::resource())?;
+        }
         ["issue", db, reference, holder, level, program @ ..] if program.len() <= 1 => {
             let token = PeerStore::open(db)?.issue(
                 reference,
@@ -252,6 +271,12 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
                 optional_hash(program)?,
             )?;
             println!("{token}");
+        }
+        ["issue-compute", db, holder, program] => {
+            println!(
+                "{}",
+                PeerStore::open(db)?.issue_compute(holder_id(holder)?, program.parse()?)?
+            );
         }
         ["issue-reaction-writer", db, reference, holder, program] => {
             let token = PeerStore::open(db)?.issue_reaction_writer(
@@ -338,6 +363,40 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
                 result["view"] = view.to_json();
             }
             println!("{result}");
+        }
+        [
+            "graph-local",
+            directory,
+            db,
+            grant,
+            program,
+            file,
+            budget,
+            rest @ ..,
+        ] => {
+            let mode = match rest {
+                [] => EvaluationMode::Read,
+                ["--update", args @ ..] => evaluation_mode("update", args)?,
+                _ => return Err(USAGE.into()),
+            };
+            let directory = Path::new(directory);
+            let server = Server::new_discovered(
+                db,
+                std::env::current_exe()?,
+                &crate::app_cli::credentials(directory),
+                network(directory)?,
+            )?;
+            print_graph(server.evaluate_local(GraphEvaluation {
+                evaluation: Evaluation {
+                    grant: grant.parse()?,
+                    program: program.parse()?,
+                    mode,
+                    input: &read_json(file)?,
+                    packages: None,
+                },
+                budget: serde_json::from_str(budget)?,
+                bindings: &[],
+            })?)?;
         }
         [
             command @ ("graph-read"
