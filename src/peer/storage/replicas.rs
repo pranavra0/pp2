@@ -725,6 +725,7 @@ impl PeerStore {
         hash: Hash,
         bytes: &[u8],
     ) -> Result<()> {
+        let (kind, links) = content::inspect(hash, bytes)?;
         let tx = self.0.transaction_with_behavior(Immediate)?;
         if !pending(&tx, resource, peer, tip)? {
             if known(&tx, resource, tip)? {
@@ -740,13 +741,14 @@ impl PeerStore {
         if peer != replica.owner && replica.policy()?.placement(peer).is_none() {
             return Err(PeerError::Denied);
         }
-        match insert(&tx, hash, bytes)? {
+        match kind {
             Kind::Revision => {
                 Change::decode(bytes)?.verify(replica.policy()?, hash)?;
             }
             _ if hash == tip => return Err(PeerError::Denied),
             _ => {}
         }
+        insert_block(&tx, hash, bytes, links)?;
         tx.execute(
             "INSERT OR IGNORE INTO replica_private VALUES (?1)",
             [&hash.0[..]],

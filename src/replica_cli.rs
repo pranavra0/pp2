@@ -1,12 +1,12 @@
-use std::{net::SocketAddr, path::Path};
+use std::path::Path;
 
-use pp2::{
-    Hash,
-    peer::{Binding, Client, PeerIdentity, PeerStore, ReplicaAccess, ResourceMode},
-};
+use pp2::peer::{Binding, Client, PeerIdentity, PeerStore, ReplicaAccess, ResourceMode};
 use serde_json::json;
 
-use crate::{app_cli::network, peer_cli::access};
+use crate::{
+    app_cli::network,
+    peer_cli::{access, peer_target},
+};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -60,7 +60,7 @@ pub(crate) fn run(args: &[&str]) -> Result<()> {
             store(home)?.revoke_replica(&identity(home)?, resource.parse()?, peer.parse()?)?;
         }
         ["follow", home, resource, owner, reference] => {
-            let (owner, endpoint) = target(owner)?;
+            let (owner, endpoint) = peer_target(owner)?;
             let resource = resource.parse()?;
             let mut store = store(home)?;
             store.follow_replica(identity(home)?.id(), owner, resource, reference)?;
@@ -74,7 +74,7 @@ pub(crate) fn run(args: &[&str]) -> Result<()> {
         ["sync", home, resource, peer] | ["sync", home, resource, peer, "--once"] => {
             let once = args.last() == Some(&"--once");
             let resource = resource.parse()?;
-            let (id, address) = target(peer)?;
+            let (id, address) = peer_target(peer)?;
             let client = Client::for_peer(&network(Path::new(home))?, id, address);
             let mut store = store(home)?;
             let (mut blocks, mut revisions, mut bytes) = (0, 0, 0);
@@ -149,11 +149,4 @@ fn identity(home: &str) -> Result<PeerIdentity> {
 
 fn store(home: &str) -> Result<PeerStore> {
     Ok(PeerStore::open(Path::new(home).join("peer.db"))?)
-}
-
-fn target(input: &str) -> Result<(Hash, Option<SocketAddr>)> {
-    Ok(match input.split_once('@') {
-        Some((peer, address)) => (peer.parse()?, Some(address.parse()?)),
-        None => (input.parse()?, None),
-    })
 }

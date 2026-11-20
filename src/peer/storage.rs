@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    time::Duration,
+};
 
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior::Immediate, params,
@@ -235,15 +239,15 @@ impl PeerStore {
     }
 
     pub fn get(&self, hash: Hash) -> Result<Option<Vec<u8>>> {
-        let bytes = get(&self.0, hash, false)?;
-        if let Some(bytes) = &bytes {
-            content::inspect(hash, bytes)?;
-        }
-        Ok(bytes)
+        self.read_block(hash, false)
     }
 
     pub(super) fn public(&self, hash: Hash) -> Result<Option<Vec<u8>>> {
-        let bytes = get(&self.0, hash, true)?;
+        self.read_block(hash, true)
+    }
+
+    fn read_block(&self, hash: Hash, published: bool) -> Result<Option<Vec<u8>>> {
+        let bytes = get(&self.0, hash, published)?;
         if let Some(bytes) = &bytes {
             content::inspect(hash, bytes)?;
         }
@@ -1129,6 +1133,11 @@ fn get(conn: &Connection, hash: Hash, published: bool) -> Result<Option<Vec<u8>>
 
 fn insert(conn: &Connection, hash: Hash, bytes: &[u8]) -> Result<Kind> {
     let (kind, links) = content::inspect(hash, bytes)?;
+    insert_block(conn, hash, bytes, links)?;
+    Ok(kind)
+}
+
+fn insert_block(conn: &Connection, hash: Hash, bytes: &[u8], links: BTreeSet<Hash>) -> Result<()> {
     let added = conn.execute(
         "INSERT INTO blocks (hash, bytes) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
         params![&hash.0[..], bytes],
@@ -1139,7 +1148,7 @@ fn insert(conn: &Connection, hash: Hash, bytes: &[u8]) -> Result<Kind> {
             stmt.execute(params![&hash.0[..], &link.0[..]])?;
         }
     }
-    Ok(kind)
+    Ok(())
 }
 
 fn require_graph(conn: &Connection, hash: Hash) -> Result<()> {

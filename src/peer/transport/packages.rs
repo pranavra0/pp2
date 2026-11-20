@@ -18,21 +18,17 @@ impl Client {
 
     /// Checks the local cache, then tries sources in the caller's order of preference.
     pub fn fetch_into(cache: &mut PeerStore, sources: &[Self], hash: Hash) -> Result<Vec<u8>> {
-        if let Some(bytes) = cache.get(hash)? {
-            return Ok(bytes);
-        }
-        let mut failure = PeerError::Missing(hash);
-        for source in sources {
-            match source.fetch(hash) {
-                Ok(bytes) => {
-                    cache.import(hash, &bytes)?;
-                    return Ok(bytes);
+        fetch_into(cache, hash, || {
+            let mut failure = PeerError::Missing(hash);
+            for source in sources {
+                match source.fetch(hash) {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(PeerError::Missing(_)) => {}
+                    Err(error) => failure = error,
                 }
-                Err(PeerError::Missing(_)) => {}
-                Err(error) => failure = error,
             }
-        }
-        Err(failure)
+            Err(failure)
+        })
     }
 
     /// Resolves a program and its imports from a cache and ordered authenticated sources.
@@ -51,7 +47,7 @@ impl Client {
         hash: Hash,
     ) -> Result<Vec<u8>> {
         let mut sources = ContentSources::new(network, Activity::new(Instant::now() + DEADLINE));
-        sources.fetch_into(cache, hash)
+        fetch_into(cache, hash, || sources.fetch(hash))
     }
 
     /// Resolves and verifies an immutable program and its declared imports by hash.
@@ -62,7 +58,7 @@ impl Client {
     ) -> Result<Vec<Hash>> {
         let mut sources = ContentSources::new(network, Activity::new(Instant::now() + DEADLINE));
         let graph = load_code(root, false, |hash| {
-            sources.fetch_into(cache, hash).map(Some)
+            fetch_into(cache, hash, || sources.fetch(hash)).map(Some)
         })?;
         Ok(graph.into_iter().map(|(hash, _)| hash).collect())
     }
@@ -85,15 +81,6 @@ impl<'a> ContentSources<'a> {
             remote: None,
             attempts: 0,
         }
-    }
-
-    fn fetch_into(&mut self, cache: &mut PeerStore, hash: Hash) -> Result<Vec<u8>> {
-        if let Some(bytes) = cache.get(hash)? {
-            return Ok(bytes);
-        }
-        let bytes = self.fetch(hash)?;
-        cache.import(hash, &bytes)?;
-        Ok(bytes)
     }
 
     pub(super) fn fetch(&mut self, hash: Hash) -> Result<Vec<u8>> {
@@ -132,4 +119,17 @@ impl<'a> ContentSources<'a> {
         self.active.check()?;
         Err(failure)
     }
+}
+
+fn fetch_into(
+    cache: &mut PeerStore,
+    hash: Hash,
+    fetch: impl FnOnce() -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    if let Some(bytes) = cache.get(hash)? {
+        return Ok(bytes);
+    }
+    let bytes = fetch()?;
+    cache.import(hash, &bytes)?;
+    Ok(bytes)
 }

@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     app_cli::{credentials, network, node_init, read_document},
-    peer_cli::access,
+    peer_cli::{access, peer_target},
 };
 use pp2::{
     Hash,
@@ -162,11 +162,8 @@ fn fetch(
     let clients = sources
         .iter()
         .map(|source| -> Result<Client> {
-            let (id, address) = match source.split_once('@') {
-                Some((id, address)) => (id, Some(address.parse()?)),
-                None => (*source, None),
-            };
-            Ok(Client::for_peer(&network, id.parse()?, address))
+            let (id, address) = peer_target(source)?;
+            Ok(Client::for_peer(&network, id, address))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok((NativePackage::fetch(store, &clients, package)?, yes))

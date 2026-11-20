@@ -3,7 +3,7 @@
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack
 import hashlib
 import json
 import math
@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 
-from peer_topology import topology
+from peer_topology import serving, topology
 
 ROOT = Path(__file__).resolve().parents[1]
 ROLES = ("office", "west", "east")
@@ -33,19 +33,6 @@ def command(*args, env=None, trace=None):
     if result.returncode:
         raise RuntimeError(f"{args[0]} exited with status {result.returncode}\n{result.stderr.strip()}")
     return result.stdout.strip()
-
-
-@contextmanager
-def process(*args, env=None, stderr=None):
-    with subprocess.Popen(args, text=True, stdout=subprocess.PIPE, env=env, stderr=stderr) as child:
-        try:
-            ready = child.stdout.readline().strip()
-            if not ready:
-                raise RuntimeError(f"{args[0]} failed to start ({child.poll()})")
-            yield child, ready
-        finally:
-            child.kill()
-            child.wait()
 
 
 def endpoints(nodes, port):
@@ -220,11 +207,15 @@ def measure(work, nodes, binary, rows, samples, trace_dir, load_clients):
                                       env=traced_env, trace=traces.get("client")))
 
         for role, (_, prefix) in nodes.items():
-            stack.enter_context(process(*prefix, binary, "app", "serve", workspace / role,
-                                        env=traced_env, stderr=traces.get(role)))
-            stack.enter_context(process(*prefix, sys.executable, __file__,
-                                        "--baseline-peer", role, work, baseline_workspace,
-                                        json.dumps(baseline_addresses)))
+            stack.enter_context(serving(
+                [*prefix, binary, "app", "serve", workspace / role],
+                env=traced_env, stderr=traces.get(role), crash=True,
+            ))
+            stack.enter_context(serving(
+                [*prefix, sys.executable, __file__, "--baseline-peer", role, work,
+                 baseline_workspace, json.dumps(baseline_addresses)],
+                crash=True,
+            ))
         first = run()
         nested = run(via_west=True)
         assert first["value"] == nested["value"] == expected

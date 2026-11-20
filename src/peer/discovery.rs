@@ -24,6 +24,7 @@ mod rendezvous;
 use directory::{Directory, Location, MAX_ENDPOINTS, Record, valid_endpoint};
 pub use identity::PeerIdentity;
 pub(super) use identity::{IDENTITY_ALPN, Proof, prove_transport, verify_transport};
+pub(super) use rendezvous::connect as connect_relay;
 pub use rendezvous::serve_rendezvous;
 
 const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 73, 42);
@@ -334,14 +335,5 @@ impl PeerNetwork {
             }
             thread::sleep(Duration::from_millis(20));
         }
-    }
-
-    pub(super) fn relay(
-        &self,
-        address: SocketAddr,
-        id: Hash,
-        deadline: Instant,
-    ) -> Result<std::net::TcpStream> {
-        rendezvous::connect(address, id, deadline)
     }
 }

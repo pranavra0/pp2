@@ -133,7 +133,11 @@ pub(super) fn lookup(
     }
 }
 
-pub(super) fn connect(address: SocketAddr, id: Hash, deadline: Instant) -> Result<TcpStream> {
+pub(in crate::peer) fn connect(
+    address: SocketAddr,
+    id: Hash,
+    deadline: Instant,
+) -> Result<TcpStream> {
     let mut wire = Wire::open(address, deadline)?;
     wire.send(&Request::Connect(id))?;
     match wire.receive::<Reply>()? {

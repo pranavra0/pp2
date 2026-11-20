@@ -20,6 +20,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+from peer_topology import serving
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -36,19 +38,12 @@ def output(binary, *args):
 
 @contextmanager
 def peer(pp2, db, certificates, address="127.0.0.1:0", prefix=()):
-    with subprocess.Popen(
+    with serving(
         [*prefix, pp2, "peer", "serve", db, address, certificates / "ca.pem",
          certificates / "server.pem", certificates / "server.key"],
-        text=True, stdout=subprocess.PIPE,
-    ) as child:
-        try:
-            line = child.stdout.readline().strip()
-            if not line.startswith("listening on "):
-                raise RuntimeError(f"peer failed to start: {line}")
-            yield line.removeprefix("listening on ")
-        finally:
-            child.kill()
-            child.wait()
+        crash=True, ready_prefix="listening on ",
+    ) as ready:
+        yield ready.removeprefix("listening on ")
 
 
 def profile(pp2, certificates, database, reference, modules, cache, address):

@@ -1,5 +1,5 @@
 use super::*;
-use crate::peer::{SyncReport, replication::checked_block};
+use crate::peer::SyncReport;
 
 const SYNC_PASS: Duration = Duration::from_secs(2);
 const BLOCKS_PER_PASS: usize = 32;
@@ -49,7 +49,6 @@ impl Client {
                 let Reply::Block(bytes) = reply? else {
                     return Err(unexpected_reply());
                 };
-                checked_block(hash, &bytes)?;
                 store.stage_replica_block(resource, peer, tip, hash, &bytes)?;
                 report.blocks += 1;
                 report.bytes += bytes.len();

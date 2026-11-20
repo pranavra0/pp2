@@ -25,7 +25,7 @@ pub use super::protocol::EvaluationMode;
 use super::{
     Access, HostProvider, PeerError, PeerNetwork, PeerStore, ResourceView, Result,
     content::{self, MAX_MODULES, load_code},
-    discovery::{IDENTITY_ALPN, Route, prove_transport, verify_transport},
+    discovery::{IDENTITY_ALPN, Route, connect_relay, prove_transport, verify_transport},
     effects::{BindingSet, PeerEndpoint},
     protocol::{self, Job, Reply, Request},
     storage::{self, Call, EvaluationStart, Update},
@@ -470,10 +470,10 @@ impl Client {
         let tcp = match route {
             Route::Direct(address) => graph::dial(address, &activity, cancellation)?,
             Route::Relay(address) => {
-                let Destination::Identity { network, id, .. } = &self.destination else {
+                let Destination::Identity { id, .. } = &self.destination else {
                     return Err(PeerError::Denied);
                 };
-                network.relay(address, *id, activity.deadline)?
+                connect_relay(address, *id, activity.deadline)?
             }
         };
         let registration = cancellation

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Block, Hash};
+use crate::Hash;
 
 use super::{PeerError, PeerIdentity, Result, discovery::Proof, protocol};
 
@@ -286,14 +286,6 @@ pub(super) struct Offer {
     pub policy: SignedPolicy,
     pub lease: Option<SignedLease>,
     pub heads: Vec<Hash>,
-}
-
-pub(super) fn checked_block(hash: Hash, bytes: &[u8]) -> Result<()> {
-    if bytes.len() > Block::MAX_BYTES {
-        return Err(PeerError::Limit("resource block bytes"));
-    }
-    super::content::inspect(hash, bytes)?;
-    Ok(())
 }
 
 impl ResourceView {

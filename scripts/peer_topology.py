@@ -5,13 +5,15 @@ import subprocess
 
 
 @contextmanager
-def serving(command, *, env=None, crash=False, ready_prefix=""):
-    with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, text=True) as process:
+def serving(command, *, env=None, stderr=None, crash=False, ready_prefix=""):
+    with subprocess.Popen(
+        command, env=env, stderr=stderr, stdout=subprocess.PIPE, text=True,
+    ) as process:
         try:
-            ready = process.stdout.readline()
+            ready = process.stdout.readline().strip()
             if not ready or not ready.startswith(ready_prefix):
                 raise RuntimeError(f"{command} failed to start")
-            yield
+            yield ready
         finally:
             if crash:
                 process.kill()

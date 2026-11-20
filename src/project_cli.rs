@@ -35,7 +35,7 @@ struct Request {
     access: Access,
 }
 
-fn build(directory: &Path, store: &mut PeerStore) -> Result<NativePackage> {
+fn build(directory: &Path, store: &mut PeerStore) -> Result<(NativePackage, Hash)> {
     let path = directory.join("pp2.json");
     let file = fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let project: Project = read_document(file)?;
@@ -67,11 +67,11 @@ fn build(directory: &Path, store: &mut PeerStore) -> Result<NativePackage> {
         budget: project.budget,
         bindings,
     };
-    manifest.to_bytes()?;
+    let hash = Hash::digest(&manifest.to_bytes()?);
     for (_, (hash, bytes)) in compiled {
         store.import(hash, &bytes)?;
     }
-    Ok(manifest)
+    Ok((manifest, hash))
 }
 
 fn selected(store: &PeerStore) -> Result<Hash> {
@@ -164,9 +164,7 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<()> {
             let mut store = native_cli::open(home)?;
             let app = store.native_installation(selected(&store)?)?;
             let mut blocks = BTreeSet::new();
-            for program in std::iter::once(app.manifest.entry)
-                .chain(app.manifest.bindings.values().map(|req| req.program))
-            {
+            for program in app.manifest.programs() {
                 blocks.extend(Client::fetch_program(&mut store, &[], program)?);
             }
             let publisher = network(home)?.id();
@@ -181,8 +179,7 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<()> {
             } else {
                 None
             };
-            let manifest = build(Path::new(directory), &mut store)?;
-            let hash = Hash::digest(&manifest.to_bytes()?);
+            let (manifest, hash) = build(Path::new(directory), &mut store)?;
             native_cli::apply_package(
                 &mut store,
                 &manifest,

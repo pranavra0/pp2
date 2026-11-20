@@ -6,7 +6,7 @@ use crate::{Block, Data, Hash};
 
 use super::{
     Access, Binding, Client, GraphBudget, HostProvider, HostResource, PeerError, PeerStore, Result,
-    content::{self, Kind, load_code},
+    content::{self, load_code},
     data_to_json, protocol, validate_binding_names,
 };
 
@@ -65,7 +65,8 @@ impl NativePackage {
         Ok(package)
     }
 
-    pub(super) fn programs(&self) -> BTreeSet<Hash> {
+    /// Returns the distinct entry and binding programs referenced by this package.
+    pub fn programs(&self) -> BTreeSet<Hash> {
         std::iter::once(self.entry)
             .chain(self.bindings.values().map(|binding| binding.program))
             .collect()
@@ -107,7 +108,7 @@ impl NativePackage {
         get: impl FnMut(Hash) -> Result<Option<Vec<u8>>>,
     ) -> Result<Vec<(Hash, Vec<u8>)>> {
         let code = load_code(program, false, get)?;
-        if content::inspect(program, &code[0].1)?.0 != Kind::JavaScript {
+        if !code[0].1.starts_with(content::MAGIC) {
             return Err(PeerError::Value(
                 "native packages require JavaScript programs".into(),
             ));

@@ -67,11 +67,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
         return crate::replica_cli::run(rest);
     }
     if let ["connect", directory, target, command, operands @ ..] = args.as_slice() {
-        let (id, fallback) = if let Some((id, address)) = target.split_once('@') {
-            (id.parse()?, Some(address.parse::<SocketAddr>()?))
-        } else {
-            (target.parse()?, None)
-        };
+        let (id, fallback) = peer_target(target)?;
         let mut args = vec![*command];
         let operands = match *command {
             "fetch"
@@ -100,6 +96,13 @@ pub fn run(args: &[OsString]) -> Result<()> {
         return run_command(&args, Some(client));
     }
     run_command(&args, None)
+}
+
+pub(crate) fn peer_target(input: &str) -> Result<(Hash, Option<SocketAddr>)> {
+    Ok(match input.split_once('@') {
+        Some((peer, address)) => (peer.parse()?, Some(address.parse()?)),
+        None => (input.parse()?, None),
+    })
 }
 
 fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {

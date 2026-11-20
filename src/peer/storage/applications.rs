@@ -146,7 +146,6 @@ impl PeerStore {
         if app.subscriptions.is_empty() || app.subscriptions.len() > MAX_PER_APPLICATION {
             return Err(PeerError::Limit("subscriptions per application"));
         }
-        // Code is already in this peer's store. Pin it only after the entire installation validates.
         let tx = self.0.transaction_with_behavior(Immediate)?;
         let now = unix_ms();
         let active: u32 = tx.query_row(
