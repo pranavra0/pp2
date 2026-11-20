@@ -117,32 +117,18 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
         [] | ["--help" | "-h"] => println!("{USAGE}"),
         ["serve", db, bind, ca, cert, key, config @ ..] if config.len() <= 1 => {
             let creds = credentials(ca, cert, key);
-            let mut server = Server::new(db, std::env::current_exe()?, &creds)?;
-            if let Some(path) = config.first() {
-                let graph: GraphConfig = serde_json::from_slice(&read(Path::new(path))?)?;
-                server = server.with_graph(&creds, graph.bindings, graph.peers)?;
-            }
-            let listener = TcpListener::bind(bind)?;
-            println!("listening on {}", listener.local_addr()?);
-            server.serve(listener)?;
+            let server = Server::new(db, std::env::current_exe()?, &creds)?;
+            serve(server, &creds, bind, config.first().copied())?;
         }
         ["serve-network", db, bind, directory, config @ ..] if config.len() <= 1 => {
             let directory = Path::new(directory);
             let creds = crate::app_cli::credentials(directory);
-            let mut server =
+            let server =
                 Server::new_discovered(db, std::env::current_exe()?, &creds, network(directory)?)?;
-            if let Some(path) = config.first() {
-                let graph: GraphConfig = serde_json::from_slice(&read(path)?)?;
-                server = server.with_graph(&creds, graph.bindings, graph.peers)?;
-            }
-            let listener = TcpListener::bind(bind)?;
-            println!("listening on {}", listener.local_addr()?);
-            server.serve(listener)?;
+            serve(server, &creds, bind, config.first().copied())?;
         }
         ["rendezvous", bind, flags @ ..] if matches!(flags, [] | ["--relay"]) => {
-            let listener = TcpListener::bind(bind)?;
-            println!("listening on {}", listener.local_addr()?);
-            serve_rendezvous(listener, !flags.is_empty())?;
+            serve_rendezvous(listening(bind)?, !flags.is_empty())?;
         }
         ["node-init", directory] => println!("{}", node_init(Path::new(directory))?),
         ["identity-new", key] => println!("{}", PeerIdentity::generate(key)?),
@@ -483,6 +469,23 @@ fn run_command(args: &[&str], stable: Option<Client>) -> Result<()> {
         _ => return Err(USAGE.into()),
     }
     Ok(())
+}
+
+fn serve(server: Server, creds: &Credentials, bind: &str, config: Option<&str>) -> Result<()> {
+    let server = if let Some(path) = config {
+        let graph: GraphConfig = serde_json::from_slice(&read(path)?)?;
+        server.with_graph(creds, graph.bindings, graph.peers)?
+    } else {
+        server
+    };
+    let listener = listening(bind)?;
+    Ok(server.serve(listener)?)
+}
+
+fn listening(bind: &str) -> Result<TcpListener> {
+    let listener = TcpListener::bind(bind)?;
+    println!("listening on {}", listener.local_addr()?);
+    Ok(listener)
 }
 
 fn print_job(status: JobStatus) -> Result<()> {

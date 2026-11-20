@@ -7,14 +7,11 @@ impl Client {
     }
 
     fn fetch_active(&self, hash: Hash, active: Activity) -> Result<Vec<u8>> {
-        let (mut stream, _, _) = self.connect_active(active, None)?;
-        protocol::send(&mut stream, &Request::Fetch(hash))?;
-        match protocol::receive::<Reply>(&mut stream)?.0 {
+        match self.request(Request::Fetch(hash), active)? {
             Reply::Block(bytes) => {
                 content::inspect(hash, &bytes)?;
                 Ok(bytes)
             }
-            Reply::Failed(error) => Err(error.into()),
             _ => Err(unexpected_reply()),
         }
     }

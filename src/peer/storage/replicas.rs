@@ -42,7 +42,6 @@ CREATE TABLE replica_routes (
 ) WITHOUT ROWID;
 ALTER TABLE receipts ADD COLUMN view BLOB;
 ALTER TABLE jobs ADD COLUMN replica_grant BLOB;
-PRAGMA user_version = 6;
 ";
 
 pub(super) const RETENTION_SCHEMA: &str = "
@@ -50,7 +49,6 @@ ALTER TABLE replicas ADD COLUMN retain_snapshots INTEGER;
 ALTER TABLE replica_versions ADD COLUMN retained INTEGER NOT NULL DEFAULT 1;
 CREATE INDEX replica_retained ON replica_versions(resource, id) WHERE retained=1;
 ALTER TABLE replica_pending ADD COLUMN proofs_only INTEGER NOT NULL DEFAULT 0;
-PRAGMA user_version = 7;
 ";
 
 pub(in crate::peer) struct Replica {
@@ -152,12 +150,6 @@ fn by_reference(conn: &Connection, reference: &str) -> Result<Option<Replica>> {
 
 fn by_id(conn: &Connection, id: Hash) -> Result<Replica> {
     read_replica(conn, "id", &id.0[..])?.ok_or(PeerError::Denied)
-}
-
-pub(super) fn random_id() -> Result<Hash> {
-    let mut bytes = [0; 32];
-    getrandom::fill(&mut bytes).map_err(|err| std::io::Error::other(err.to_string()))?;
-    Ok(Hash(bytes))
 }
 
 impl PeerStore {
@@ -628,9 +620,12 @@ impl PeerStore {
         }
         let current = by_id(&tx, resource)?;
         let policy = current.policy()?;
-        if let Some(old) = &replica.policy
-            && old.body.placement(local).is_some()
-            && old.body.placement(local) != policy.placement(local)
+        let revoked = local != policy.owner && policy.placement(local).is_none();
+        if revoked
+            || replica.policy.as_ref().is_some_and(|old| {
+                old.body.placement(local).is_some()
+                    && old.body.placement(local) != policy.placement(local)
+            })
         {
             tx.execute(
                 "UPDATE replicas SET lease=NULL WHERE id=?1",
@@ -647,7 +642,6 @@ impl PeerStore {
             if peer != replica.owner {
                 return Err(PeerError::Denied);
             }
-            // A newer concurrent renewal or revocation takes precedence over this reply.
             if check_lease(policy, local, &lease, unix_ms()).is_ok()
                 && current.lease.as_ref().is_none_or(|old| {
                     old.body.placement != lease.body.placement
@@ -660,17 +654,7 @@ impl PeerStore {
                 )?;
             }
         }
-        if local != policy.owner && policy.placement(local).is_none() {
-            tx.execute(
-                "UPDATE replicas SET lease=NULL WHERE id=?1",
-                [&resource.0[..]],
-            )?;
-            tx.execute(
-                "DELETE FROM replica_pending WHERE resource=?1",
-                [&resource.0[..]],
-            )?;
-            tx.execute("DELETE FROM grants WHERE ref=?1", [&current.reference])?;
-            applications::revoke_unauthorized(&tx)?;
+        if revoked {
             tx.commit()?;
             return Ok(Vec::new());
         }
@@ -1527,7 +1511,7 @@ mod tests {
     }
 
     fn snapshot(store: &mut PeerStore, call: Call) -> Snapshot {
-        let EvaluationStart::Snapshot(snapshot) = store.begin(call).unwrap() else {
+        let EvaluationStart::Ready(snapshot) = store.begin(call).unwrap() else {
             panic!("expected snapshot")
         };
         snapshot
@@ -1907,7 +1891,7 @@ mod tests {
         assert!(store.get(Hash::digest(&payload)).unwrap().is_none());
         assert!(matches!(
             store.begin(pending),
-            Ok(EvaluationStart::Snapshot(_))
+            Ok(EvaluationStart::Ready(_))
         ));
         assert_eq!(
             store
@@ -2150,7 +2134,7 @@ mod tests {
             call(owner.id(), writer, program, Consistency::Authoritative),
             false,
         );
-        let ScopedStart::Collection(state) = source.scoped(call, Duration::from_secs(1)).unwrap()
+        let EvaluationStart::Ready(state) = source.scoped(call, Duration::from_secs(1)).unwrap()
         else {
             panic!("expected writable collection");
         };

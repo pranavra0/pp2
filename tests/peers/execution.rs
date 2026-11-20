@@ -2,8 +2,8 @@ use super::*;
 
 #[test]
 fn real_peers_exchange_code_enforce_authority_and_recover_state() {
-    let dir = Temp::new();
-    let path = &dir.0;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
     certificates(path);
     let database = path.join("storage.db");
     let mut store = PeerStore::open(&database).unwrap();

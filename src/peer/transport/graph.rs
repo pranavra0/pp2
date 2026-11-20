@@ -6,7 +6,7 @@ use crate::peer::{
     effects::{self, BoundCapability, Effect, GraphBindings, GraphJob, Remote, Scope},
     native::{self, STATE, Terminal},
     protocol::{Forward, JobState, Submission},
-    storage::{GraphAccess, ScopedStart},
+    storage::GraphAccess,
     unix_ms,
     worker::Guest,
 };
@@ -43,6 +43,28 @@ pub struct GraphEvaluation<'a> {
     pub budget: GraphBudget,
     /// Explicitly requested names from the host configuration for this caller and program.
     pub bindings: &'a [String],
+}
+
+impl GraphEvaluation<'_> {
+    pub(super) fn job(
+        &self,
+        bindings: GraphBindings,
+        expires_at_ms: Option<u64>,
+    ) -> Result<GraphJob> {
+        self.budget.validate()?;
+        effects::validate_binding_names(self.bindings)?;
+        Ok(GraphJob {
+            grant: self.evaluation.grant,
+            program: self.evaluation.program,
+            mode: self.evaluation.mode,
+            input: self.evaluation.input.to_bytes()?,
+            budget: self.budget,
+            expires_at_ms: expires_at_ms
+                .unwrap_or_else(|| unix_ms() + u64::from(self.budget.timeout_ms)),
+            delegated_by: None,
+            bindings,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -171,21 +193,9 @@ impl Client {
         cancellation: Option<&Cancellation>,
     ) -> Result<GraphReport> {
         let started = Instant::now();
-        request.budget.validate()?;
-        effects::validate_binding_names(request.bindings)?;
-        let job = GraphJob {
-            grant: request.evaluation.grant,
-            program: request.evaluation.program,
-            mode: request.evaluation.mode,
-            input: request.evaluation.input.to_bytes()?,
-            budget: request.budget,
-            expires_at_ms: unix_ms() + u64::from(request.budget.timeout_ms),
-            delegated_by: None,
-            bindings: GraphBindings::Local(request.bindings.to_vec()),
-        };
+        let job = request.job(GraphBindings::Local(request.bindings.to_vec()), None)?;
         let active =
             Activity::new(started + Duration::from_millis(u64::from(job.budget.timeout_ms)));
-        let packages = request.evaluation.packages;
         let mut traffic = Traffic::default();
         let result = self.exchange_program(
             job.program,
@@ -193,12 +203,7 @@ impl Client {
             active,
             cancellation,
             &mut traffic,
-            |hash| {
-                packages
-                    .map(|store| store.get(hash))
-                    .transpose()
-                    .map(Option::flatten)
-            },
+            |hash| request.evaluation.package_block(hash),
         );
         if result.is_err() && cancellation.is_some_and(Cancellation::requested) {
             return Err(PeerError::Cancelled);
@@ -224,7 +229,7 @@ impl Client {
         active: Activity,
         cancellation: Option<&Cancellation>,
         traffic: &mut Traffic,
-        mut get: impl FnMut(Hash) -> Result<Option<Vec<u8>>>,
+        get: impl FnMut(Hash) -> Result<Option<Vec<u8>>>,
     ) -> Result<Reply> {
         if cancellation.is_some_and(Cancellation::requested) {
             return Err(PeerError::Cancelled);
@@ -242,7 +247,6 @@ impl Client {
         let mut invocation = None;
         let mut connection = None;
         let mut connect_us = None;
-        let mut modules = BTreeSet::new();
         let result = (|| {
             let (mut stream, _registration, timing) = self.connect_active(active, cancellation)?;
             connect_us = Some(protocol::elapsed_us(started));
@@ -254,31 +258,12 @@ impl Client {
                     .ok()
                     .map(Hash);
             }
-            traffic.send(&mut stream, &request)?;
-            let mut code = None;
-            loop {
-                match traffic.receive(&mut stream)? {
-                    Reply::NeedProgram(hash) => {
-                        if modules.len() >= MAX_MODULES || !modules.insert(hash) {
-                            return Err(PeerError::Protocol("invalid program negotiation".into()));
-                        }
-                        let code = match &mut code {
-                            Some(code) => code,
-                            None => code.insert(
-                                load_code(program, true, &mut get)?
-                                    .into_iter()
-                                    .collect::<BTreeMap<_, _>>(),
-                            ),
-                        };
-                        traffic.send(&mut stream, &code.remove(&hash))?;
-                    }
-                    reply @ (Reply::Graph { .. } | Reply::ResourceGraph { .. } | Reply::Job(_)) => {
-                        stream.sock.activity.check()?;
-                        return Ok(reply);
-                    }
-                    Reply::Failed(error) => return Err(error.into()),
-                    _ => return Err(unexpected_reply()),
+            match traffic.exchange(&mut stream, &request, program, get)? {
+                reply @ (Reply::Graph { .. } | Reply::ResourceGraph { .. } | Reply::Job(_)) => {
+                    stream.sock.activity.check()?;
+                    Ok(reply)
                 }
+                _ => Err(unexpected_reply()),
             }
         })();
         if traced {
@@ -297,7 +282,7 @@ impl Client {
                     "elapsed_us": protocol::elapsed_us(started), "connect_us": connect_us,
                     "connection": connection, "postcard_us": traffic.codec_us,
                     "request_bytes": traffic.sent, "response_bytes": traffic.received,
-                    "requested_modules": modules.len(), "failure": failure_class(&result),
+                    "requested_modules": traffic.requested_modules, "failure": failure_class(&result),
                 })
             );
         }
@@ -414,32 +399,6 @@ pub(super) fn dial(
     _: Option<&Cancellation>,
 ) -> Result<TcpStream> {
     Ok(TcpStream::connect_timeout(&endpoint, active.remaining()?)?)
-}
-
-#[derive(Default)]
-pub(super) struct Traffic {
-    pub(super) sent: u64,
-    pub(super) received: u64,
-    codec_us: u64,
-}
-
-impl Traffic {
-    fn send(&mut self, stream: &mut Outbound, value: &impl serde::Serialize) -> Result<()> {
-        let started = Instant::now();
-        let bytes = protocol::encode(value)?;
-        self.codec_us += protocol::elapsed_us(started);
-        self.sent += protocol::write_payload(stream, &bytes)?;
-        Ok(())
-    }
-
-    fn receive(&mut self, stream: &mut Outbound) -> Result<Reply> {
-        let bytes = protocol::read_payload(stream)?;
-        self.received += (8 + bytes.len()) as u64;
-        let started = Instant::now();
-        let decoded = protocol::decode(&bytes)?;
-        self.codec_us += protocol::elapsed_us(started);
-        Ok(decoded)
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -748,8 +707,7 @@ impl Invocation<'_> {
         let state = match result {
             Ok(state) => state,
             Err(error) => {
-                // Journal and transport failures must interrupt the attempt, even if the
-                // program catches an effect error or tries to submit another effect.
+                // A guest catch must not swallow journal or transport failures.
                 attempt.interrupt(error);
                 return Err(PeerError::Cancelled);
             }
@@ -1177,8 +1135,8 @@ impl Server {
         trace.stage = "storage_open";
         let started = Instant::now();
         let storage = match store.scoped(call, active.storage_wait()?)? {
-            ScopedStart::Collection(storage) => storage,
-            ScopedStart::Replayed(receipt) => return Ok((receipt, GraphMetrics::default())),
+            EvaluationStart::Ready(storage) => storage,
+            EvaluationStart::Replayed(receipt) => return Ok((receipt, GraphMetrics::default())),
         };
         trace.storage_open_us = protocol::elapsed_us(started);
         let persisted = if event.is_none() {

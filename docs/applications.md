@@ -1,8 +1,6 @@
 # Write an application
 
-Start with the project generated in [Getting started](getting-started.md). Its `pp2.json` maps module names to source files, selects a terminal entry point, sets the invocation budget, and declares named resource requests. Each request names the program the owner will authorize and the access it needs. A request by itself confers no authority.
-
-The entry point receives a terminal event through `call(resource, 'event')`. It returns an object with a `lines` array. Each line of terminal input starts a new bounded invocation. In the document app the body of a search uses this call:
+In the [starter project](getting-started.md), `pp2.json` maps source modules, selects an entry point, sets a graph budget, and requests named grants. Each terminal line starts a bounded invocation. The entry point reads it via `call(resource, 'event')` and returns `{lines}`.
 
 ```js
 const result = await evaluate(capabilities.documents, {type: 'search', query}, {
@@ -11,27 +9,20 @@ const result = await evaluate(capabilities.documents, {type: 'search', query}, {
 });
 ```
 
-The indexer receives the query as an ordinary argument. It scans its local index and returns matching paths. The caller gets the returned value and the collection revision. A refresh uses an expected revision and the terminal event's operation ID to commit a replacement index atomically. The terminal saves successful queries in its installation's private collection via the built-in state capability. [Terminal source](../examples/native-documents/app.mjs) · [Indexer source](../examples/native-documents/index.ts)
+The indexer returns matching paths and the collection revision. A refresh uses the expected revision and event ID to commit atomically. The terminal stores successful searches in private installation state. [Terminal](../examples/native-documents/app.mjs) · [Indexer](../examples/native-documents/index.ts)
 
 ## Edit and update
 
-For example, add `log` to the extension check in `index.ts` to include UTF-8 log files. From the checkout, rebuild the generated project and inspect the resulting requests:
+Add `log` to the extension check in `index.ts`, then run `pp2 update search` and `pp2 status`. Review the new package before approving. An update keeps the installation ID, state, and bindings for identical requests. A changed request needs a new grant. Review the pinned program because the values it returns determine what the recipient can learn.
 
-```sh
-pp2 update search
-pp2 status
-```
+For a remote update, run `pp2 publish` on the owner and `pp2 update --from "$RELEASE"` on the client. Issue and connect a fresh grant for a changed request. Revoke the old grant at the owner to withdraw access.
 
-Review the new package before approving. An installation ID names a private collection and survives updates. A package address identifies one immutable version. Updating keeps bindings whose name, program, access and description are unchanged. Editing the indexer changes the program hash, so the documents request awaits a new grant. Repeat the local grant and index steps. To distribute an update, publish the new version and use the laptop command below with its new address. For a changed request, issue and connect a fresh grant, and revoke the old grant at the owner when its holders should lose access.
+Use the checkout's npm dependencies or run `npm ci` inside a standalone project. Its `npm run typecheck` checks edits. Packaging uses strict ES2022 and links runtime imports through the module's `imports` map. Workers run the compiled modules without Node built-ins.
 
-```sh
-pp2 update --from "$RELEASE"
-```
+`pp2 run` starts an interactive session. Enter `help` for app commands or `.quit` to leave.
 
-The editor uses the generated `tsconfig.json` and `directory.d.ts` for the indexer. Packaging checks TypeScript with strict ES2022 settings. The compiler resolves TypeScript from the project's or current directory's Node module tree. Inside a standalone generated project, run `npm ci` to install its locked compiler and `npm run typecheck` to check edits. When developing from the pp2 checkout, you can use its existing npm dependencies. Runtime imports in a TypeScript module can be mapped in its manifest entry with an `imports` object from source specifier to module name. Type-only imports are erased. Workers run the compiled modules without Node built-ins.
+## Examples
 
-Run the app interactively with `pp2 run`. Enter `help` for its commands and `.quit` to leave. A directory grant authorizes the exact indexer code to read the selected directory. Review the program before granting access: its return values determine what the remote caller can learn. Each installation has separate local state. Changing a binding preserves that state, including paths already returned to the app.
-
-## Other application patterns
-
-The [warehouse query](../examples/federated-stock/app.json) shows a fixed graph that reads collections on several peers and combines the results. The [inventory handlers](../examples/persistent-inventory) update a projection after a source change. The [Notes application](../examples/replicated-notes) uses a replicated collection so peers can edit offline and reconcile concurrent versions. Its [three-peer workflow](../scripts/demo-replicated-notes.py) exercises installation, synchronization and explicit conflict resolution. See the architecture reference for [offline authority and revocation](architecture.md#offline-authority-and-revocation).
+- [Federated stock](../examples/federated-stock/app.json) combines reads from several peers.
+- [Persistent inventory](../examples/persistent-inventory) updates a projection after source changes.
+- [Replicated Notes](../examples/replicated-notes) keeps concurrent offline edits until explicit resolution. [Three-peer workflow](../scripts/demo-replicated-notes.py)

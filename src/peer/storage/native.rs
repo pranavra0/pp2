@@ -20,7 +20,6 @@ CREATE TABLE native_bindings (
     installation BLOB REFERENCES native_installations(id) ON DELETE CASCADE,
     name TEXT, binding BLOB NOT NULL, PRIMARY KEY(installation, name)
 ) WITHOUT ROWID;
-PRAGMA user_version = 5;
 ";
 
 pub(in crate::peer) struct NativeExecution {
@@ -35,9 +34,7 @@ impl PeerStore {
     pub fn install_native(&mut self, approved: &NativePackage) -> Result<Hash> {
         let tx = self.0.transaction_with_behavior(Immediate)?;
         let package = validate_package(&tx, approved)?;
-        let mut id = [0; 32];
-        getrandom::fill(&mut id).map_err(|error| std::io::Error::other(error.to_string()))?;
-        let id = Hash(id);
+        let id = random_id()?;
         let reference = format!("native.{id}");
         create_collection(&tx, &reference, [])?;
         let (entry, writer) = issue(&tx, id, &reference, approved.entry)?;

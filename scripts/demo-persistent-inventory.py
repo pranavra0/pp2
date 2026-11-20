@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-from contextlib import contextmanager
 import json
 from pathlib import Path
 import secrets
@@ -12,19 +11,11 @@ import tempfile
 import time
 
 
-@contextmanager
-def serve(binary, directory):
-    with subprocess.Popen(
-        [binary, "app", "serve", directory], stdout=subprocess.PIPE, text=True
-    ) as process:
-        try:
-            if not process.stdout.readline():
-                raise RuntimeError(f"{directory.name} failed to start")
-            yield
-        finally:
-            # Kill the daemon to exercise durable recovery rather than a graceful drain.
-            process.kill()
+from peer_topology import serving
 
+
+def serve(binary, directory):
+    return serving([binary, "app", "serve", directory], crash=True)
 
 def until(read, ready):
     deadline = time.monotonic() + 10

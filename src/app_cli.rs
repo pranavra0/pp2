@@ -246,24 +246,7 @@ fn init(path: &Path, directory: &Path, stable: bool) -> Result<()> {
         let admin = directory.join("admin");
         if !stable {
             private_dir(&admin)?;
-            openssl(Command::new("openssl").current_dir(&admin).args([
-                "req",
-                "-new",
-                "-x509",
-                "-newkey",
-                "ec",
-                "-pkeyopt",
-                "ec_paramgen_curve:P-256",
-                "-nodes",
-                "-days",
-                "30",
-                "-subj",
-                "/CN=pp2-development",
-                "-keyout",
-                "ca.key",
-                "-out",
-                "ca.pem",
-            ]))?;
+            self_signed_certificate(&admin, "/CN=pp2-development", "ca.key", "ca.pem")?;
         }
         let client_dir = directory.join("client");
         private_dir(&client_dir)?;
@@ -519,6 +502,27 @@ fn certificate(admin: &Path, directory: &Path, name: &str, is_peer: bool) -> Res
     Ok(())
 }
 
+fn self_signed_certificate(dir: &Path, subject: &str, key: &str, cert: &str) -> Result<()> {
+    openssl(Command::new("openssl").current_dir(dir).args([
+        "req",
+        "-new",
+        "-x509",
+        "-newkey",
+        "ec",
+        "-pkeyopt",
+        "ec_paramgen_curve:P-256",
+        "-nodes",
+        "-days",
+        "30",
+        "-subj",
+        subject,
+        "-keyout",
+        key,
+        "-out",
+        cert,
+    ]))
+}
+
 fn openssl(command: &mut Command) -> Result<()> {
     let output = command.output()?;
     if !output.status.success() {
@@ -535,24 +539,7 @@ pub(crate) fn node_init(dir: &Path) -> Result<Hash> {
     private_dir(dir)?;
     let result = (|| -> Result<Hash> {
         let id = PeerIdentity::generate(dir.join("identity.key"))?;
-        openssl(Command::new("openssl").current_dir(dir).args([
-            "req",
-            "-new",
-            "-x509",
-            "-newkey",
-            "ec",
-            "-pkeyopt",
-            "ec_paramgen_curve:P-256",
-            "-nodes",
-            "-days",
-            "30",
-            "-subj",
-            "/CN=pp2-transport",
-            "-keyout",
-            "peer.key",
-            "-out",
-            "peer.pem",
-        ]))?;
+        self_signed_certificate(dir, "/CN=pp2-transport", "peer.key", "peer.pem")?;
         Ok(id)
     })();
     if result.is_err() {

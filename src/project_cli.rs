@@ -183,19 +183,13 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<()> {
             };
             let manifest = build(Path::new(directory), &mut store)?;
             let hash = Hash::digest(&manifest.to_bytes()?);
-            native_cli::approve(
+            native_cli::apply_package(
+                &mut store,
                 &manifest,
                 &hash.to_string(),
-                previous.as_ref().map(|i| &i.manifest),
+                previous.as_ref(),
                 false,
             )?;
-            let id = if let Some(previous) = previous {
-                store.update_native(previous.id, previous.package, &manifest)?;
-                previous.id
-            } else {
-                store.install_native(&manifest)?
-            };
-            println!("{id}");
         }
         [command @ ("list" | "identity")] => native_cli::run(&[command, home])?,
         ["host", bind @ ..] if bind.len() <= 1 => {

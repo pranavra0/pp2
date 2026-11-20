@@ -66,15 +66,7 @@ impl PeerStore {
         executor: Option<Hash>,
     ) -> Result<Option<JobState>> {
         let tx = self.0.unchecked_transaction()?;
-        let Some((actual, state)) = job(&tx, key, executor)? else {
-            return Ok(None);
-        };
-        if actual != request {
-            return Err(PeerError::Value(
-                "job ID already used for a different submission".into(),
-            ));
-        }
-        Ok(Some(state))
+        existing_job(&tx, key, request, executor)
     }
 
     pub(in crate::peer) fn submit(
@@ -87,14 +79,8 @@ impl PeerStore {
         code: &[(Hash, Vec<u8>)],
     ) -> Result<JobState> {
         let tx = self.0.transaction_with_behavior(Immediate)?;
-        if let Some((actual, state)) = job(&tx, key, call.executor)? {
-            return if actual == request {
-                Ok(state)
-            } else {
-                Err(PeerError::Value(
-                    "job ID already used for a different submission".into(),
-                ))
-            };
+        if let Some(state) = existing_job(&tx, key, request, call.executor)? {
+            return Ok(state);
         }
         let now = unix_ms();
         if graph.expires_at_ms <= now {
@@ -462,6 +448,20 @@ pub(super) fn enqueue(
         )?;
     }
     Ok(())
+}
+
+fn existing_job(
+    conn: &Connection,
+    key: JobKey,
+    request: Hash,
+    executor: Option<Hash>,
+) -> Result<Option<JobState>> {
+    match job(conn, key, executor)? {
+        Some((actual, _)) if actual != request => Err(PeerError::Value(
+            "job ID already used for a different submission".into(),
+        )),
+        entry => Ok(entry.map(|(_, state)| state)),
+    }
 }
 
 fn job(conn: &Connection, key: JobKey, executor: Option<Hash>) -> Result<Option<(Hash, JobState)>> {

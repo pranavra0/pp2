@@ -141,13 +141,12 @@ pub(super) fn terminal_event(line: &str) -> Result<HostResource> {
     if line.len() > MAX_EVENT || line.contains(['\r', '\n']) {
         return Err(PeerError::Limit("terminal event"));
     }
-    let mut id = [0; 32];
-    getrandom::fill(&mut id).map_err(|error| std::io::Error::other(error.to_string()))?;
+    let id = super::random_id()?;
     Ok(HostResource {
         provider: TERMINAL.into(),
         configuration: Data::Record(BTreeMap::from([
             ("type".into(), Data::Text("line".into())),
-            ("id".into(), Data::Text(Hash(id).to_string())),
+            ("id".into(), Data::Text(id.to_string())),
             ("text".into(), Data::Text(line.into())),
         ])),
     })

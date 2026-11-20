@@ -5,9 +5,9 @@ fn three_peers_enforce_delegation_budgets_and_cancel_a_descendant() {
     use pp2::peer::{DurableEvaluation, GraphBudget, GraphEvaluation, JobStatus};
     use serde_json::json as j;
 
-    let temp = Temp::new();
-    let workspace = temp.0.join("deployment");
-    let manifest = temp.0.join("app.json");
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("deployment");
+    let manifest = temp.path().join("app.json");
     fs::write(
         &manifest,
         j!({
@@ -26,10 +26,10 @@ fn three_peers_enforce_delegation_budgets_and_cancel_a_descendant() {
         .to_string(),
     )
     .unwrap();
-    fs::write(temp.0.join("east.ndjson"), "[\"stock\",7]\n").unwrap();
-    fs::write(temp.0.join("west.ndjson"), "[\"stock\",5]\n").unwrap();
+    fs::write(temp.path().join("east.ndjson"), "[\"stock\",7]\n").unwrap();
+    fs::write(temp.path().join("west.ndjson"), "[\"stock\",5]\n").unwrap();
     fs::write(
-        temp.0.join("stock.mjs"),
+        temp.path().join("stock.mjs"),
         r#"
         export default async ({capabilities, storage, evaluate, evaluateAll}, input) => {
             const {east, west} = capabilities;

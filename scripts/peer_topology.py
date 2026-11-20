@@ -1,7 +1,22 @@
-"""Independent Linux network stacks connected by an isolated Ethernet bridge."""
+"""Peer processes and isolated Linux network stacks."""
 
 from contextlib import ExitStack, contextmanager
 import subprocess
+
+
+@contextmanager
+def serving(command, *, env=None, crash=False, ready_prefix=""):
+    with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, text=True) as process:
+        try:
+            ready = process.stdout.readline()
+            if not ready or not ready.startswith(ready_prefix):
+                raise RuntimeError(f"{command} failed to start")
+            yield
+        finally:
+            if crash:
+                process.kill()
+            else:
+                process.terminate()
 
 
 def ip(*args):

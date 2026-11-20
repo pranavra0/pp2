@@ -1,41 +1,27 @@
-# Operating a peer
+# Operate a peer
 
-## Platform and workspace
+## Workspace
 
-The peer and worker require Linux 5.9 or later with seccomp and close_range. Directory grants also require openat2 and a filesystem that reports creation timestamps. The tested build target is x86-64 Linux. Building from source needs Rust/Cargo 1.94.1 and a C build toolchain. Stable-identity workspace initialization invokes the OpenSSL executable. Node.js 24, npm and the locked TypeScript compiler are author tools. SQLite and QuickJS build from the Cargo dependencies.
+The peer needs Linux 5.9 or later with seccomp and `close_range`. Directory grants also need `openat2` and filesystem creation timestamps. First use of stable identity needs the OpenSSL executable.
 
-The ordinary CLI creates a private workspace at `~/.pp2` on first use. Set `PP2_HOME` separately for each test identity. Keep the parent directory accessible only to trusted users. The workspace stores its identity, transport credentials, collections, grants and installations. Stop processes using the workspace before taking a file-level backup of the entire directory. Protect that backup like the identity key. Never run two advertisers with copies of the same identity.
+The CLI creates `~/.pp2` on first use. Set `PP2_HOME` for separate identities and keep its parent private. Stop processes before backing up the whole workspace. Protect the backup like the identity key and run only one advertiser per identity.
 
-Use `pp2 list` to see installation IDs. With exactly one installation, app commands select it automatically. Otherwise set `PP2_APP` to the desired ID. Installation always creates new private state. Update an existing installation to preserve its state. The administrative lifecycle commands are listed in `pp2 app native --help`. `pp2 app --help` covers fixed graph deployments and subscriptions. `pp2 peer --help` covers inspection of blocks, resources, grants, durable jobs, replication and network services.
+`pp2 list` shows installation IDs. Set `PP2_APP` when there is more than one. Choose update to keep private app state. See `pp2 app native --help` for installation management, `pp2 app --help` for fixed graphs and subscriptions, and `pp2 peer --help` for peer administration.
 
 ## Networking
 
-Start the generic host on a reachable TCP port and leave it running while serving resources. On the same IPv4 LAN, discovery uses multicast group 239.255.73.42 on UDP port 47342. Check the listener, multicast interface, firewall and clocks when a request reports peer-unavailable. On multihomed systems select the local IPv4 address with `lan_interface` in the workspace's `discovery.json`.
+Run `pp2 host` on a reachable TCP port. LAN discovery uses UDP multicast at `239.255.73.42:47342`. For `peer-unavailable`, check the listener, multicast interface, firewall, and clocks. Set `lan_interface` in `discovery.json` to select a local IPv4 interface.
 
-Across networks, operators can run a reachable rendezvous service:
-
-```sh
-pp2 peer rendezvous 0.0.0.0:7341 --relay
-```
-
-Set `discovery.json` on both sides, substituting the reachable service address. Restart the peer after changes.
+Across networks, run `pp2 peer rendezvous 0.0.0.0:7341 --relay`. Put the reachable service address in both workspaces' `discovery.json` and restart the peers.
 
 ```json
 {"rendezvous":"192.0.2.10:7341","relay":true}
 ```
 
-Hosts can advertise reachable TCP endpoints with `advertise`. Direct sessions and relayed sessions authenticate the destination identity. A relay can observe metadata and disrupt delivery. Check [discovery limits and identity rotation](architecture.md#peer-identity-and-discovery) when operating outside a LAN.
+Use `advertise` for reachable direct endpoints. Direct and relayed sessions authenticate the destination. [Discovery limits and identity rotation](architecture.md#peer-identity-and-discovery)
 
 ## Authority and recovery
 
-Keep a record of each grant ID and recipient. On the issuing machine withdraw access with the ID printed by the grant command:
+Keep each grant ID and recipient. Run `pp2 revoke "$GRANT_ID"` at the issuer to withdraw future access. Disclosed data can persist in caches. Binding and package changes leave issued grants under the issuer's control.
 
-```sh
-pp2 revoke "$GRANT_ID"
-```
-
-Revocation applies to future authorized operations. Files, paths or cached results already disclosed to the caller cannot be recalled. Connecting a different grant affects the selected installation's binding. Grants previously issued to other holders remain live until revoked. A package update changes what the local installation can invoke. The resource owner manages the lifetime of issued grants separately.
-
-If status reports **awaiting grant**, check that the resource name, program and access in the owner's installation match the client's request. For offline document search, only completed queries are cached. Timeout and unavailable are distinct from permission denial. Ambiguous updates require the same operation ID and expected revision to safely retry. See [commit and retry behavior](architecture.md#evaluation-and-authority).
-
-The process sandbox, bounded execution and identity checks are described in the [architecture reference](architecture.md#isolation-and-limits). There is no published security audit or critical-workload qualification. The documented measurements use controlled workloads. The document workflow has been exercised with two private workspaces on separate Linux network stacks connected by virtual Ethernet. A trial on independently administered physical machines is still pending.
+For **awaiting grant**, check the request name, program, and access. For an ambiguous update, retry with identical arguments and the same operation ID. [Commit and retry rules](architecture.md#evaluation-and-authority)

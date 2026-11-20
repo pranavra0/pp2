@@ -5,7 +5,7 @@ use std::{
     fs,
     io::{BufRead, BufReader},
     net::{SocketAddr, TcpListener},
-    path::{Path, PathBuf},
+    path::Path,
     process::{Child, Command, Stdio},
     sync::Barrier,
     thread,
@@ -19,22 +19,6 @@ use pp2::{
         EvaluationMode, JavaScript, PeerError, PeerIdentity, PeerNetwork, PeerStore, RemoteReport,
     },
 };
-
-struct Temp(PathBuf);
-impl Temp {
-    fn new() -> Self {
-        let mut id = [0; 32];
-        getrandom::fill(&mut id).unwrap();
-        let path = std::env::temp_dir().join(format!("pp2-test-{}", Hash(id)));
-        fs::create_dir(&path).unwrap();
-        Self(path)
-    }
-}
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 struct Daemon(Child, SocketAddr);
 impl Daemon {

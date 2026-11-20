@@ -55,7 +55,6 @@ CREATE VIEW subscription_authority AS
     JOIN grants watch ON watch.id=s.watch_grant
     JOIN grants entry ON entry.id=s.entry_grant
     WHERE s.state=0 AND a.removed=0;
-PRAGMA user_version = 4;
 ";
 
 const ACTIVE: i64 = 0;

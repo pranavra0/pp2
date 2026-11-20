@@ -11,7 +11,7 @@ use crate::{
 };
 use pp2::{
     Hash,
-    peer::{Access, Binding, Client, NativePackage, PeerStore, Server},
+    peer::{Access, Binding, Client, NativeInstallation, NativePackage, PeerStore, Server},
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -67,22 +67,16 @@ pub(crate) fn run(args: &[&str]) -> Result<()> {
             )?;
             println!("{}", serde_json::to_string_pretty(&binding)?);
         }
-        ["install", home, package, sources @ ..] => {
+        ["install", home, package, sources @ ..] | ["update", home, _, package, sources @ ..] => {
             let home = workspace(home)?;
             let mut store = open(home)?;
+            let previous = if args[0] == "update" {
+                Some(store.native_installation(args[2].parse()?)?)
+            } else {
+                None
+            };
             let (manifest, yes) = fetch(home, &mut store, package.parse()?, sources)?;
-            approve(&manifest, package, None, yes)?;
-            println!("{}", store.install_native(&manifest)?);
-        }
-        ["update", home, id, package, sources @ ..] => {
-            let home = workspace(home)?;
-            let mut store = open(home)?;
-            let id = id.parse()?;
-            let installed = store.native_installation(id)?;
-            let (manifest, yes) = fetch(home, &mut store, package.parse()?, sources)?;
-            approve(&manifest, package, Some(&installed.manifest), yes)?;
-            store.update_native(id, installed.package, &manifest)?;
-            println!("{id}");
+            apply_package(&mut store, &manifest, package, previous.as_ref(), yes)?;
         }
         ["grant", home, id, name, file] => {
             bind(
@@ -178,7 +172,25 @@ fn fetch(
     Ok((NativePackage::fetch(store, &clients, package)?, yes))
 }
 
-pub(crate) fn approve(
+pub(crate) fn apply_package(
+    store: &mut PeerStore,
+    manifest: &NativePackage,
+    package: &str,
+    previous: Option<&NativeInstallation>,
+    yes: bool,
+) -> Result<()> {
+    approve(manifest, package, previous.map(|app| &app.manifest), yes)?;
+    let id = if let Some(app) = previous {
+        store.update_native(app.id, app.package, manifest)?;
+        app.id
+    } else {
+        store.install_native(manifest)?
+    };
+    println!("{id}");
+    Ok(())
+}
+
+fn approve(
     manifest: &NativePackage,
     package: &str,
     previous: Option<&NativePackage>,

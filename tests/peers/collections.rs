@@ -5,9 +5,9 @@ fn indexed_effects_are_bounded_and_commit_with_their_receipt() {
     use pp2::peer::{GraphBudget, GraphEvaluation};
     use serde_json::json as j;
 
-    let temp = Temp::new();
-    certificates(&temp.0);
-    let db = temp.0.join("collection.db");
+    let temp = tempfile::tempdir().unwrap();
+    certificates(temp.path());
+    let db = temp.path().join("collection.db");
     let mut store = PeerStore::open(&db).unwrap();
     store
         .create_collection(
@@ -40,15 +40,15 @@ fn indexed_effects_are_bounded_and_commit_with_their_receipt() {
     "#,
         BTreeSet::new(),
     );
-    let holder = Credentials::fingerprint(temp.0.join("writer.pem")).unwrap();
+    let holder = Credentials::fingerprint(temp.path().join("writer.pem")).unwrap();
     let read = store
         .issue("stock", holder, Access::Read, Some(program))
         .unwrap();
     let write = store
         .issue("stock", holder, Access::Write, Some(program))
         .unwrap();
-    let daemon = Daemon::launch(&temp.0, &db);
-    let client = client(&temp.0, &daemon, "writer");
+    let daemon = Daemon::launch(temp.path(), &db);
+    let client = client(temp.path(), &daemon, "writer");
     let invoke = |grant, input, mode, packages| {
         client.run_graph(
             GraphEvaluation {
@@ -114,8 +114,8 @@ fn indexed_effects_are_bounded_and_commit_with_their_receipt() {
     ));
     drop(daemon);
     store.collect().unwrap();
-    let daemon = Daemon::launch(&temp.0, &db);
-    let client = Client::new(daemon.1, "localhost", &credentials(&temp.0, "writer")).unwrap();
+    let daemon = Daemon::launch(temp.path(), &db);
+    let client = Client::new(daemon.1, "localhost", &credentials(temp.path(), "writer")).unwrap();
     let receipt = client
         .run_graph(
             GraphEvaluation {

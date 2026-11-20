@@ -7,7 +7,7 @@ use std::{
 use super::*;
 use crate::peer::{
     Binding, GraphBudget, GraphMetrics,
-    effects::{self, GraphBindings, GraphJob, MAX_JOB_LIFETIME_MS},
+    effects::{self, GraphBindings, MAX_JOB_LIFETIME_MS},
     protocol::{JobState, Submission},
     storage::{JobKey, JobOutcome, QueuedJob},
 };
@@ -114,36 +114,14 @@ impl Client {
             expires_at_ms,
             graph,
         } = submission;
-        graph.budget.validate()?;
-        effects::validate_binding_names(graph.bindings)?;
-        let program = graph.evaluation.program;
-        let job = Submission {
-            id,
-            graph: GraphJob {
-                grant: graph.evaluation.grant,
-                program,
-                mode: graph.evaluation.mode,
-                input: graph.evaluation.input.to_bytes()?,
-                budget: graph.budget,
-                expires_at_ms,
-                delegated_by: None,
-                bindings,
-            },
-        };
+        let job = graph.job(bindings, Some(expires_at_ms))?;
         job_reply(self.exchange_program(
-            program,
-            Request::Submit(job),
+            job.program,
+            Request::Submit(Submission { id, graph: job }),
             Activity::new(Instant::now() + DEADLINE),
             None,
-            &mut graph::Traffic::default(),
-            |hash| {
-                graph
-                    .evaluation
-                    .packages
-                    .map(|store| store.get(hash))
-                    .transpose()
-                    .map(Option::flatten)
-            },
+            &mut Traffic::default(),
+            |hash| graph.evaluation.package_block(hash),
         )?)?
         .try_into()
     }
@@ -159,16 +137,13 @@ impl Client {
     }
 
     fn job_control(&self, request: Request) -> Result<JobStatus> {
-        let mut stream = self.connect(Instant::now())?;
-        protocol::send(&mut stream, &request)?;
-        job_reply(protocol::receive::<Reply>(&mut stream)?.0)?.try_into()
+        job_reply(self.request(request, Activity::new(Instant::now() + DEADLINE))?)?.try_into()
     }
 }
 
 pub(super) fn job_reply(reply: Reply) -> Result<JobState> {
     match reply {
         Reply::Job(state) => Ok(state),
-        Reply::Failed(error) => Err(error.into()),
         _ => Err(unexpected_reply()),
     }
 }

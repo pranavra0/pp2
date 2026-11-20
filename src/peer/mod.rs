@@ -37,6 +37,8 @@ pub use typescript::compile_typescript;
 
 use std::io;
 
+use crate::Hash;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PeerError {
     #[error(transparent)]
@@ -98,6 +100,12 @@ impl From<io::Error> for PeerError {
 }
 
 type Result<T> = std::result::Result<T, PeerError>;
+
+fn random_id() -> Result<Hash> {
+    let mut bytes = [0; 32];
+    getrandom::fill(&mut bytes).map_err(|err| io::Error::other(err.to_string()))?;
+    Ok(Hash(bytes))
+}
 
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()

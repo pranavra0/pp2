@@ -302,6 +302,15 @@ pub struct Evaluation<'a> {
     pub packages: Option<&'a PeerStore>,
 }
 
+impl Evaluation<'_> {
+    fn package_block(&self, hash: Hash) -> Result<Option<Vec<u8>>> {
+        match self.packages {
+            Some(store) => store.get(hash),
+            None => Ok(None),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RemoteReport {
     pub revision: u64,
@@ -356,10 +365,13 @@ impl Client {
         }
     }
 
-    fn connect(&self, started: Instant) -> Result<Outbound> {
-        Ok(self
-            .connect_active(Activity::new(started + DEADLINE), None)?
-            .0)
+    fn request(&self, request: Request, active: Activity) -> Result<Reply> {
+        let (mut stream, _, _) = self.connect_active(active, None)?;
+        protocol::send(&mut stream, &request)?;
+        match protocol::receive::<Reply>(&mut stream)?.0 {
+            Reply::Failed(error) => Err(error.into()),
+            reply => Ok(reply),
+        }
     }
 
     fn connect_active<'a>(
@@ -544,19 +556,14 @@ impl Client {
         access: Access,
         program: Option<Hash>,
     ) -> Result<Hash> {
-        let mut stream = self.connect(Instant::now())?;
-        protocol::send(
-            &mut stream,
-            &Request::Delegate {
-                grant,
-                holder,
-                access,
-                program,
-            },
-        )?;
-        match protocol::receive::<Reply>(&mut stream)?.0 {
+        let request = Request::Delegate {
+            grant,
+            holder,
+            access,
+            program,
+        };
+        match self.request(request, Activity::new(Instant::now() + DEADLINE))? {
             Reply::Delegated(token) => Ok(token),
-            Reply::Failed(error) => Err(error.into()),
             _ => Err(unexpected_reply()),
         }
     }
@@ -589,74 +596,97 @@ impl Client {
         let started = Instant::now();
         let (mut stream, _registration, _) =
             self.connect_active(Activity::new(started + DEADLINE), cancellation)?;
-        let mut sent = protocol::send(
-            &mut stream,
-            &Request::Evaluate(Job {
-                grant: evaluation.grant,
-                program: evaluation.program,
-                mode: evaluation.mode,
-                input: evaluation.input.to_bytes()?,
-            }),
-        )?;
-        let mut received = 0;
-        let mut code = None;
+        let request = Request::Evaluate(Job {
+            grant: evaluation.grant,
+            program: evaluation.program,
+            mode: evaluation.mode,
+            input: evaluation.input.to_bytes()?,
+        });
+        let mut traffic = Traffic::default();
+        let reply = traffic.exchange(&mut stream, &request, evaluation.program, |hash| {
+            evaluation.package_block(hash)
+        })?;
+        let (revision, value, metrics, view) = match reply {
+            Reply::Evaluation {
+                revision,
+                value,
+                metrics,
+            } => (revision, value, metrics, None),
+            Reply::ResourceEvaluation {
+                revision,
+                value,
+                metrics,
+                view,
+            } => (revision, value, metrics, Some(view)),
+            _ => return Err(unexpected_reply()),
+        };
+        Ok(RemoteReport {
+            revision,
+            view,
+            value: Data::from_bytes(&value)?,
+            elapsed_ms: protocol::elapsed_ms(started),
+            request_bytes: traffic.sent,
+            response_bytes: traffic.received,
+            worker_ms: metrics.map(|m| m.elapsed_ms),
+            fuel: metrics.and_then(|m| m.fuel),
+            memory_bytes: metrics.map(|m| m.memory),
+        })
+    }
+}
+
+#[derive(Default)]
+struct Traffic {
+    sent: u64,
+    received: u64,
+    codec_us: u64,
+    requested_modules: usize,
+}
+
+impl Traffic {
+    fn exchange(
+        &mut self,
+        stream: &mut Outbound,
+        request: &Request,
+        program: Hash,
+        get: impl FnMut(Hash) -> Result<Option<Vec<u8>>>,
+    ) -> Result<Reply> {
+        self.send(stream, request)?;
         let mut requested = BTreeSet::new();
+        let mut get = Some(get);
+        let mut code = BTreeMap::new();
         loop {
-            let (reply, bytes) = protocol::receive::<Reply>(&mut stream)?;
-            received += bytes;
-            let (reply, view) = match reply {
-                Reply::ResourceEvaluation {
-                    revision,
-                    value,
-                    metrics,
-                    view,
-                } => (
-                    Reply::Evaluation {
-                        revision,
-                        value,
-                        metrics,
-                    },
-                    Some(view),
-                ),
-                reply => (reply, None),
-            };
-            match reply {
+            match self.receive(stream)? {
                 Reply::NeedProgram(hash) => {
                     if requested.len() >= MAX_MODULES || !requested.insert(hash) {
                         return Err(PeerError::Protocol("invalid program negotiation".into()));
                     }
-                    if code.is_none() {
-                        let mut initial = BTreeMap::new();
-                        if let Some(packages) = evaluation.packages {
-                            initial
-                                .extend(load_code(evaluation.program, true, |h| packages.get(h))?);
-                        }
-                        code = Some(initial);
+                    self.requested_modules = requested.len();
+                    if let Some(get) = get.take() {
+                        code.extend(load_code(program, true, get)?);
                     }
-                    let bytes = code.as_mut().and_then(|blocks| blocks.remove(&hash));
-                    sent += protocol::send(&mut stream, &bytes)?;
-                }
-                Reply::Evaluation {
-                    revision,
-                    value,
-                    metrics,
-                } => {
-                    return Ok(RemoteReport {
-                        revision,
-                        view,
-                        value: Data::from_bytes(&value)?,
-                        elapsed_ms: protocol::elapsed_ms(started),
-                        request_bytes: sent,
-                        response_bytes: received,
-                        worker_ms: metrics.map(|m| m.elapsed_ms),
-                        fuel: metrics.and_then(|m| m.fuel),
-                        memory_bytes: metrics.map(|m| m.memory),
-                    });
+                    self.send(stream, &code.remove(&hash))?;
                 }
                 Reply::Failed(error) => return Err(error.into()),
-                _ => return Err(unexpected_reply()),
+                reply => return Ok(reply),
             }
         }
+    }
+
+    fn send(&mut self, stream: &mut Outbound, value: &impl serde::Serialize) -> Result<()> {
+        let started = Instant::now();
+        let bytes = protocol::encode(value)?;
+        self.codec_us += protocol::elapsed_us(started);
+        self.sent += protocol::write_payload(stream, &bytes)?;
+        Ok(())
+    }
+
+    fn receive(&mut self, stream: &mut Outbound) -> Result<Reply> {
+        let bytes = protocol::read_payload(stream)?;
+        self.received += (8 + bytes.len()) as u64;
+        let started = Instant::now();
+        let decoded = protocol::decode(&bytes)?;
+        self.codec_us += protocol::elapsed_us(started);
+        Ok(decoded)
     }
 }
 
@@ -1000,7 +1030,7 @@ impl Server {
                     receipt.view,
                 ));
             }
-            EvaluationStart::Snapshot(snapshot) => snapshot,
+            EvaluationStart::Ready(snapshot) => snapshot,
         };
         Data::from_bytes(&job.input)?;
         let code = self.receive_code(stream, store, call)?;

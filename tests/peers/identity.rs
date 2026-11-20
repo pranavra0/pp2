@@ -2,8 +2,8 @@ use super::*;
 
 #[test]
 fn database_identity_rejects_unrelated_files() {
-    let dir = Temp::new();
-    let database = dir.0.join("unrelated.db");
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("unrelated.db");
     let existing = rusqlite::Connection::open(&database).unwrap();
     existing
         .execute_batch("CREATE TABLE entries (label TEXT); INSERT INTO entries VALUES ('keep');")
@@ -18,8 +18,8 @@ fn database_identity_rejects_unrelated_files() {
 
 #[test]
 fn stable_grant_survives_transport_certificate_replacement_and_respects_identity_revocation() {
-    let dir = Temp::new();
-    let path = &dir.0;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
     certificates(path);
     let database = path.join("storage.db");
     let server_id = PeerIdentity::generate(path.join("identity.key")).unwrap();
@@ -119,8 +119,8 @@ fn stable_grant_survives_transport_certificate_replacement_and_respects_identity
 
 #[test]
 fn version_one_databases_keep_their_snapshot_references() {
-    let dir = Temp::new();
-    let database = dir.0.join("old.db");
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("old.db");
     let mut store = PeerStore::open(&database).unwrap();
     let revision = store.create_ref("old", &Data::Int(71)).unwrap();
     drop(store);

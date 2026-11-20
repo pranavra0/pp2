@@ -79,8 +79,8 @@ fn autonomous_job_recovers_between_independently_administered_peers() {
         result
     }
 
-    let temp = Temp::new();
-    let path = &temp.0;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path();
     certificates(path);
     let output = Command::new("sh").args(["-eu", "-c", r#"
         for name in a b c; do
@@ -138,22 +138,13 @@ fn autonomous_job_recovers_between_independently_administered_peers() {
         if name == "b" {
             process.arg("b.json");
         }
-        let mut child = process
-            .current_dir(path)
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut line = String::new();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let address = line
-            .strip_prefix("listening on ")
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        Daemon(child, address)
+        Daemon::from_child(
+            process
+                .current_dir(path)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
     };
     let mut a_store = PeerStore::open(path.join("a.db")).unwrap();
     let mut b_store = PeerStore::open(path.join("b.db")).unwrap();

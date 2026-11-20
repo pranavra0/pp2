@@ -3,14 +3,13 @@
 
 import argparse
 import json
-from contextlib import contextmanager
 import os
 import shutil
 from pathlib import Path
 import subprocess
 import tempfile
 
-from peer_topology import topology
+from peer_topology import serving, topology
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -30,17 +29,11 @@ class Peer:
             raise AssertionError(f"{args}: exit {result.returncode}\n{result.stderr}")
         return result.stdout.strip() if success else result.stderr
 
-    @contextmanager
     def host(self):
-        with subprocess.Popen(
-            [*self.command, "host", "0.0.0.0:7340"], env=self.env,
-            stdout=subprocess.PIPE, text=True,
-        ) as child:
-            try:
-                assert child.stdout.readline().startswith("listening on ")
-                yield
-            finally:
-                child.terminate()
+        return serving(
+            [*self.command, "host", "0.0.0.0:7340"],
+            env=self.env, ready_prefix="listening on ",
+        )
 
 
 def check(binary, isolated):

@@ -12,7 +12,7 @@ use super::{
     content::{self, Kind},
     effects::{Effect, GraphBudget, GraphMetrics, MAX_EFFECT_BYTES, Scan},
     protocol::{self, Forward, JobState},
-    unix_ms,
+    random_id, unix_ms,
 };
 
 mod applications;
@@ -50,7 +50,6 @@ CREATE TABLE receipts (grant_id BLOB REFERENCES grants(id) ON DELETE CASCADE, op
                        ref TEXT NOT NULL, request BLOB NOT NULL, revision INTEGER NOT NULL CHECK(revision >= 0),
                        value BLOB NOT NULL, PRIMARY KEY(grant_id, operation)) WITHOUT ROWID;
 CREATE INDEX receipts_ref_revision ON receipts(ref, revision);
-PRAGMA user_version = 1;
 PRAGMA application_id = 0x70703231;
 ";
 
@@ -58,7 +57,6 @@ const COLLECTIONS: &str = "
 CREATE TABLE collections (ref TEXT PRIMARY KEY REFERENCES refs(name)) WITHOUT ROWID;
 CREATE TABLE entries (ref TEXT REFERENCES collections(ref), key BLOB,
                       value BLOB NOT NULL, PRIMARY KEY(ref, key)) WITHOUT ROWID;
-PRAGMA user_version = 2;
 ";
 
 const AUTONOMOUS: &str = "
@@ -95,8 +93,17 @@ CREATE TABLE job_effects (
     child BLOB, result BLOB, PRIMARY KEY(holder, id, ordinal),
     FOREIGN KEY(holder, id) REFERENCES jobs(holder, id)
 ) WITHOUT ROWID;
-PRAGMA user_version = 3;
 ";
+
+const MIGRATIONS: &[&str] = &[
+    SCHEMA,
+    COLLECTIONS,
+    AUTONOMOUS,
+    applications::SCHEMA,
+    native::SCHEMA,
+    replicas::SCHEMA,
+    replicas::RETENTION_SCHEMA,
+];
 
 /// Read permits evaluation against a reference. Write also permits atomic updates.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -162,8 +169,8 @@ pub(super) struct Receipt {
     pub(super) view: Option<ResourceView>,
 }
 
-pub(super) enum EvaluationStart {
-    Snapshot(Snapshot),
+pub(super) enum EvaluationStart<T> {
+    Ready(T),
     Replayed(Receipt),
 }
 
@@ -200,32 +207,14 @@ impl PeerStore {
         }
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        // Bound the main database. Short transactions keep WAL readers from pinning old pages.
         conn.pragma_update(None, "max_page_count", 65_536)?;
-        if version < 7 {
+        if version < MIGRATIONS.len() {
             let tx = conn.transaction_with_behavior(Immediate)?;
             let version = database_version(&tx)?;
-            if version == 0 {
-                tx.execute_batch(SCHEMA)?;
+            for migration in &MIGRATIONS[version..] {
+                tx.execute_batch(migration)?;
             }
-            if version < 2 {
-                tx.execute_batch(COLLECTIONS)?;
-            }
-            if version < 3 {
-                tx.execute_batch(AUTONOMOUS)?;
-            }
-            if version < 4 {
-                tx.execute_batch(applications::SCHEMA)?;
-            }
-            if version < 5 {
-                tx.execute_batch(native::SCHEMA)?;
-            }
-            if version < 6 {
-                tx.execute_batch(replicas::SCHEMA)?;
-            }
-            if version < 7 {
-                tx.execute_batch(replicas::RETENTION_SCHEMA)?;
-            }
+            tx.pragma_update(None, "user_version", MIGRATIONS.len() as i64)?;
             tx.commit()?;
         }
         Ok(Self(conn))
@@ -550,34 +539,24 @@ impl PeerStore {
         Ok(id)
     }
 
-    pub(super) fn begin(&mut self, call: Call) -> Result<EvaluationStart> {
+    pub(super) fn begin(&mut self, call: Call) -> Result<EvaluationStart<Snapshot>> {
         let tx = self.0.transaction()?;
-        let scope = authorize(&tx, call)?;
-        require_kind(&tx, &scope.reference, false)?;
-        let (view, root) = replicas::view(&tx, &scope.reference, call)?;
-        if let Some(update) = call.update
-            && let Some(receipt) = replay(&tx, call.grant, update)?
-        {
-            return Ok(EvaluationStart::Replayed(receipt));
-        }
-        let revision = revision(&tx, &scope.reference)?.ok_or(PeerError::Denied)?;
-        if let Some(update) = call.update
-            && revision.number != update.expected
-        {
-            return Err(PeerError::Conflict(revision.number));
-        }
-        replicas::check_write(&view, call.update)?;
+        let (reference, view, root) = evaluation_view(&tx, call, false)?;
+        let revision = match evaluation_revision(&tx, call, &reference, &view)? {
+            EvaluationStart::Ready(revision) => revision,
+            EvaluationStart::Replayed(receipt) => return Ok(EvaluationStart::Replayed(receipt)),
+        };
         let hash = root.unwrap_or(revision.hash);
         let bytes = get(&tx, hash, false)?.ok_or(PeerError::Missing(hash))?;
         let snapshot = Snapshot {
-            reference: scope.reference,
+            reference,
             revision,
             hash,
             bytes,
             view,
         };
         tx.commit()?;
-        Ok(EvaluationStart::Snapshot(snapshot))
+        Ok(EvaluationStart::Ready(snapshot))
     }
 
     pub(super) fn confirm_access(&self, call: Call) -> Result<()> {
@@ -694,44 +673,32 @@ impl PeerStore {
 
     pub(super) fn probe_collection(&mut self, call: Call) -> Result<Option<Receipt>> {
         let tx = self.0.transaction()?;
-        let scope = authorize(&tx, call)?;
-        require_kind(&tx, &scope.reference, true)?;
-        let (view, _) = replicas::view(&tx, &scope.reference, call)?;
-        if let Some(update) = call.update {
-            if let Some(receipt) = replay(&tx, call.grant, update)? {
-                return Ok(Some(receipt));
-            }
-            let current = revision(&tx, &scope.reference)?.ok_or(PeerError::Denied)?;
-            if update.expected != current.number {
-                return Err(PeerError::Conflict(current.number));
-            }
-            replicas::check_write(&view, call.update)?;
+        let (reference, view, _) = evaluation_view(&tx, call, true)?;
+        if call.update.is_some()
+            && let EvaluationStart::Replayed(receipt) =
+                evaluation_revision(&tx, call, &reference, &view)?
+        {
+            return Ok(Some(receipt));
         }
         Ok(None)
     }
 
-    pub(super) fn scoped(&mut self, call: Call, busy: Duration) -> Result<ScopedStart<'_>> {
+    pub(super) fn scoped(
+        &mut self,
+        call: Call,
+        busy: Duration,
+    ) -> Result<EvaluationStart<Collection<'_>>> {
         self.0.busy_timeout(busy)?;
         let tx = if call.update.is_some() {
             self.0.transaction_with_behavior(Immediate)?
         } else {
             self.0.transaction()?
         };
-        let scope = authorize(&tx, call)?;
-        require_kind(&tx, &scope.reference, true)?;
-        let (view, root) = replicas::view(&tx, &scope.reference, call)?;
-        if let Some(update) = call.update
-            && let Some(receipt) = replay(&tx, call.grant, update)?
-        {
-            return Ok(ScopedStart::Replayed(receipt));
-        }
-        let revision = revision(&tx, &scope.reference)?.ok_or(PeerError::Denied)?;
-        if let Some(update) = call.update
-            && update.expected != revision.number
-        {
-            return Err(PeerError::Conflict(revision.number));
-        }
-        replicas::check_write(&view, call.update)?;
+        let (reference, view, root) = evaluation_view(&tx, call, true)?;
+        let revision = match evaluation_revision(&tx, call, &reference, &view)? {
+            EvaluationStart::Ready(revision) => revision,
+            EvaluationStart::Replayed(receipt) => return Ok(EvaluationStart::Replayed(receipt)),
+        };
         let historical = if matches!(view.consistency, Consistency::Revision(_)) {
             Some(replicas::read_manifest(
                 &tx,
@@ -740,9 +707,9 @@ impl PeerStore {
         } else {
             None
         };
-        Ok(ScopedStart::Collection(Collection {
+        Ok(EvaluationStart::Ready(Collection {
             tx,
-            reference: scope.reference,
+            reference,
             revision: revision.number,
             call: Box::new(call),
             view,
@@ -773,11 +740,6 @@ impl PeerStore {
             [unix_ms() as i64],
         )?)
     }
-}
-
-pub(super) enum ScopedStart<'a> {
-    Collection(Collection<'a>),
-    Replayed(Receipt),
 }
 
 pub(super) struct Collection<'a> {
@@ -1031,6 +993,38 @@ fn create_collection(
     Ok(Revision { number: 0, hash })
 }
 
+fn evaluation_view(
+    conn: &Connection,
+    call: Call,
+    scoped: bool,
+) -> Result<(String, ResourceView, Option<Hash>)> {
+    let reference = authorize(conn, call)?.reference;
+    require_kind(conn, &reference, scoped)?;
+    let (view, root) = replicas::view(conn, &reference, call)?;
+    Ok((reference, view, root))
+}
+
+fn evaluation_revision(
+    conn: &Connection,
+    call: Call,
+    reference: &str,
+    view: &ResourceView,
+) -> Result<EvaluationStart<Revision>> {
+    if let Some(update) = call.update
+        && let Some(receipt) = replay(conn, call.grant, update)?
+    {
+        return Ok(EvaluationStart::Replayed(receipt));
+    }
+    let revision = revision(conn, reference)?.ok_or(PeerError::Denied)?;
+    if let Some(update) = call.update
+        && revision.number != update.expected
+    {
+        return Err(PeerError::Conflict(revision.number));
+    }
+    replicas::check_write(view, call.update)?;
+    Ok(EvaluationStart::Ready(revision))
+}
+
 fn require_kind(conn: &Connection, name: &str, scoped: bool) -> Result<()> {
     let collection: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM collections WHERE ref=?1)",
@@ -1093,9 +1087,8 @@ fn replace(conn: &Connection, name: &str, current: Revision, next: &[u8]) -> Res
     })
 }
 
-fn database_version(conn: &Connection) -> Result<i64> {
-    // Read the identity and version from one SQLite statement so concurrent initialization
-    // cannot leave this connection with a mixture of the old and new schema metadata.
+fn database_version(conn: &Connection) -> Result<usize> {
+    // Read both pragmas in one snapshot during concurrent initialization.
     let (application, version, entries): (i64, i64, i64) = conn.query_row(
         "SELECT application_id, user_version, (SELECT count(*) FROM sqlite_schema)
          FROM pragma_application_id, pragma_user_version",
@@ -1104,7 +1097,7 @@ fn database_version(conn: &Connection) -> Result<i64> {
     )?;
     match (application, version, entries) {
         (0, 0, 0) => Ok(0),
-        (APPLICATION_ID, 1..=7, _) => Ok(version),
+        (APPLICATION_ID, 1.., _) if version <= MIGRATIONS.len() as i64 => Ok(version as usize),
         (APPLICATION_ID, _, _) => Err(PeerError::Unsupported("peer database version")),
         _ => Err(PeerError::Unsupported(
             "expected a pp2 database or an empty file",
@@ -1195,12 +1188,11 @@ fn insert_grant(
     if count >= MAX_GRANTS_PER_REF {
         return Err(PeerError::Limit("grants per reference"));
     }
-    let mut id = [0; 32];
-    getrandom::fill(&mut id).map_err(|err| std::io::Error::other(err.to_string()))?;
+    let id = random_id()?;
     conn.execute(
         "INSERT INTO grants VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
-            &id[..],
+            &id.0[..],
             &holder.0[..],
             scope.reference,
             u8::from(scope.access == Access::Write),
@@ -1210,9 +1202,9 @@ fn insert_grant(
         ],
     )?;
     if scope.reaction_writer {
-        conn.execute("INSERT INTO reaction_writers VALUES (?1)", [&id[..]])?;
+        conn.execute("INSERT INTO reaction_writers VALUES (?1)", [&id.0[..]])?;
     }
-    Ok(Hash(id))
+    Ok(id)
 }
 
 fn prune_graph_grants(conn: &Connection, now: u64) -> Result<()> {

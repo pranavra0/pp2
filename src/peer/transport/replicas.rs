@@ -1,8 +1,5 @@
 use super::*;
-use crate::peer::{
-    SyncReport,
-    replication::{SyncRequest, checked_block},
-};
+use crate::peer::{SyncReport, replication::checked_block};
 
 const SYNC_PASS: Duration = Duration::from_secs(2);
 const BLOCKS_PER_PASS: usize = 32;
@@ -23,7 +20,7 @@ impl Client {
         let (local, peer) = self.replica_identities()?;
         let active = Activity::new(Instant::now() + time);
         let request = store.replica_request(resource, local, peer, None)?;
-        let Reply::Replica(offer) = self.replica_exchange(request, active.clone())? else {
+        let Reply::Replica(offer) = self.request(Request::Replica(request), active.clone())? else {
             return Err(unexpected_reply());
         };
         let tips = store.accept_replica_offer(local, peer, resource, *offer)?;
@@ -39,7 +36,7 @@ impl Client {
                     return Ok(report);
                 }
                 let request = store.replica_request(resource, local, peer, Some(hash))?;
-                let reply = self.replica_exchange(request, active.clone());
+                let reply = self.request(Request::Replica(request), active.clone());
                 if matches!(reply, Err(PeerError::Timeout)) {
                     report.pending = true;
                     return Ok(report);
@@ -67,15 +64,6 @@ impl Client {
             _ => Err(PeerError::Unsupported(
                 "replication requires stable peer identities",
             )),
-        }
-    }
-
-    fn replica_exchange(&self, request: SyncRequest, active: Activity) -> Result<Reply> {
-        let (mut stream, _, _) = self.connect_active(active, None)?;
-        protocol::send(&mut stream, &Request::Replica(request))?;
-        match protocol::receive::<Reply>(&mut stream)?.0 {
-            Reply::Failed(error) => Err(error.into()),
-            reply => Ok(reply),
         }
     }
 }
